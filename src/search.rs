@@ -261,6 +261,7 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                compaction: crate::compaction::CompactionConfig::default(),
             },
         );
 
@@ -298,6 +299,7 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                compaction: crate::compaction::CompactionConfig::default(),
             },
         );
 

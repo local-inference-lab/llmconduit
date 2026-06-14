@@ -454,6 +454,7 @@ async fn uses_configured_upstream_model_override() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: Default::default(),
         },
     );
 
@@ -529,6 +530,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: Default::default(),
         },
     );
 
@@ -869,6 +871,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: Default::default(),
         },
     );
 
@@ -930,6 +933,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: Default::default(),
         },
     );
 
@@ -1526,6 +1530,7 @@ async fn proxies_models_endpoint_with_etag() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1590,6 +1595,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1660,6 +1666,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1733,6 +1740,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1811,6 +1819,7 @@ async fn proxies_completions_endpoint_passthrough() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -2870,6 +2879,7 @@ fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        compaction: Default::default(),
     }
 }
 
@@ -5539,6 +5549,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: Default::default(),
         },
         ReplayStore::new(1000),
         Arc::new(upstream.clone()),
@@ -5706,4 +5717,125 @@ async fn sse_responses_include_connection_keep_alive() {
         .get("connection")
         .and_then(|v| v.to_str().ok());
     assert_eq!(connection, Some("keep-alive"));
+}
+
+// ---- context compaction (opt-in external compactor) -------------------------
+
+fn compaction_test_config(endpoint: String, max_input_tokens: usize) -> Config {
+    Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: Some("test-model".to_string()),
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        system_prompt_prefix: None,
+        upstreams: Vec::new(),
+        fallback_upstreams: Vec::new(),
+        upstream_failure_cooldown_secs: 30,
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+        compaction: llmconduit::compaction::CompactionConfig {
+            enabled: true,
+            mode: "external".to_string(),
+            endpoint: Some(endpoint),
+            max_input_tokens,
+            keep_recent_turns: 1,
+            timeout_ms: 5000,
+        },
+    }
+}
+
+fn upstream_message_blob(requests: &[ChatCompletionRequest]) -> Vec<String> {
+    requests[0]
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_ref().map(|c| c.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn over_budget_request_is_compacted_before_upstream() {
+    let compactor = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "compacted": true,
+            "messages": [ { "role": "user", "content": "COMPACTED_STATE_BLOCK" } ]
+        })))
+        .mount(&compactor)
+        .await;
+
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(
+        upstream.clone(),
+        MockSearch::default(),
+        compaction_test_config(compactor.uri(), 5), // tiny budget -> always triggers
+    );
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message(
+                "this user message is comfortably longer than the tiny budget",
+            )]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let blob = upstream_message_blob(&requests);
+    assert!(
+        blob.iter().any(|c| c.contains("COMPACTED_STATE_BLOCK")),
+        "upstream should receive the COMPACTED messages, got {blob:?}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_failure_forwards_original_request() {
+    let compactor = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/compact"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&compactor)
+        .await;
+
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(
+        upstream.clone(),
+        MockSearch::default(),
+        compaction_test_config(compactor.uri(), 5),
+    );
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message(
+                "ORIGINAL_USER_TEXT that also exceeds the tiny budget for sure",
+            )]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let blob = upstream_message_blob(&requests);
+    assert!(
+        blob.iter().any(|c| c.contains("ORIGINAL_USER_TEXT")),
+        "compactor failure must forward the ORIGINAL request, got {blob:?}"
+    );
 }

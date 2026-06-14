@@ -698,6 +698,19 @@ impl Gateway {
             &reasoning_effort,
         );
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
+
+        // Optional, opt-in context compaction (off by default). Best-effort:
+        // on any failure `current_messages` is returned unchanged, so the
+        // user's request never fails because of compaction.
+        let compaction_session = crate::compaction::derive_session_id(&current_messages);
+        current_messages = crate::compaction::maybe_compact(
+            &self.config.compaction,
+            current_messages,
+            &compaction_session,
+            &upstream_model,
+        )
+        .await;
+
         loop {
             if tx.is_closed() {
                 return Err(AppError::cancelled());

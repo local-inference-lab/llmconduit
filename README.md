@@ -222,6 +222,56 @@ Then inspect prefix stability:
 llmconduit analyze-log
 ```
 
+## Context Compaction (optional, off by default)
+
+llmconduit can keep a long conversation under a model's effective context window
+by compacting older turns before forwarding upstream. This is useful for closed
+harnesses (which can't compact themselves) and for enforcing a local model's real
+window. It is **off by default** and **best-effort**: if compaction is disabled,
+under budget, or fails for any reason, the original request is forwarded
+unchanged — a user request never fails because of compaction.
+
+Compaction is delegated to an **external** HTTP compactor, which keeps the
+gateway a single static binary and lets the compaction strategy (plain summary,
+structured state ledger, etc.) live in any language. Enable it in config:
+
+```yaml
+compaction:
+  enabled: true
+  mode: "external"                 # only "external" today; "builtin" reserved
+  endpoint: "http://127.0.0.1:4100" # your compactor service
+  max_input_tokens: 96000          # compact when the estimated request exceeds this
+  keep_recent_turns: 6             # most-recent turns kept verbatim
+  timeout_ms: 60000
+```
+
+When the lowered chat request is estimated (≈4 chars/token) to exceed
+`max_input_tokens`, llmconduit POSTs it to `{endpoint}/compact` and forwards the
+compacted messages it returns. The contract:
+
+```jsonc
+// POST {endpoint}/compact
+// request
+{
+  "session_id": "sess-…",          // stable per conversation (system + first user)
+  "messages": [ /* OpenAI chat messages */ ],
+  "max_input_tokens": 96000,
+  "keep_recent_turns": 6,
+  "model": "your-model"
+}
+// response
+{
+  "compacted": true,               // false => gateway forwards the original messages
+  "messages": [ /* replacement chat messages */ ]
+}
+```
+
+A correct compactor must keep tool-call/tool-result pairs intact (never start the
+forwarded tail with an orphan `tool` message). A reference implementation
+(event-sourced state-ledger compactor, tuned for coding agents and documents) is
+available at
+[llmconduit-compactor](https://github.com/brandonmmusic-max/llmconduit-compactor).
+
 ## Test
 
 ```bash

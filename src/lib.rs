@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod cli;
+pub mod compaction;
 pub mod config;
 pub mod debug_ui;
 pub mod engine;

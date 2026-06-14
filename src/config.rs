@@ -32,6 +32,7 @@ pub struct Config {
     pub max_web_search_rounds: usize,
     pub flatten_content: bool,
     pub max_replay_entries: usize,
+    pub compaction: crate::compaction::CompactionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +183,8 @@ pub struct PersistedConfig {
     pub flatten_content: bool,
     #[serde(default = "default_max_replay_entries")]
     pub max_replay_entries: usize,
+    #[serde(default)]
+    pub compaction: crate::compaction::CompactionConfig,
 }
 
 fn default_bind_addr() -> String {
@@ -247,6 +250,7 @@ impl Default for PersistedConfig {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         }
     }
 }
@@ -330,6 +334,7 @@ impl Config {
             max_web_search_rounds: config.max_web_search_rounds,
             flatten_content: config.flatten_content,
             max_replay_entries: config.max_replay_entries,
+            compaction: config.compaction.clone(),
         })
     }
 
@@ -1093,6 +1098,7 @@ mod tests {
             max_web_search_rounds: 10,
             flatten_content: false,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -1137,6 +1143,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1196,6 +1203,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1251,6 +1259,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1328,6 +1337,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1397,6 +1407,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1745,6 +1756,7 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
@@ -1789,6 +1801,7 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            compaction: crate::compaction::CompactionConfig::default(),
         })
         .expect("config");
 
