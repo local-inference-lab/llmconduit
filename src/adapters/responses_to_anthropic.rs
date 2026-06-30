@@ -6,6 +6,7 @@ use crate::models::anthropic::AnthropicMessageDeltaBody;
 use crate::models::anthropic::AnthropicMessageResponse;
 use crate::models::anthropic::AnthropicMessageStart;
 use crate::models::anthropic::AnthropicMessageUsage;
+use crate::models::anthropic::AnthropicOutputTokensDetails;
 use crate::models::anthropic::AnthropicResponseContentBlock;
 use crate::models::anthropic::AnthropicServerToolUse;
 use crate::models::anthropic::AnthropicStreamEvent;
@@ -32,7 +33,9 @@ pub struct AnthropicStreamConverter {
     completed: bool,
     pending_input_tokens: Option<u64>,
     estimated_output_bytes: usize,
+    estimated_thinking_bytes: usize,
     last_output_tokens: u64,
+    last_thinking_tokens: u64,
     web_search_count: u64,
     emitted_tool_call_ids: HashSet<String>,
     closed_tool_call_ids: HashSet<String>,
@@ -50,7 +53,9 @@ impl AnthropicStreamConverter {
             completed: false,
             pending_input_tokens: None,
             estimated_output_bytes: 0,
+            estimated_thinking_bytes: 0,
             last_output_tokens: 0,
+            last_thinking_tokens: 0,
             web_search_count: 0,
             emitted_tool_call_ids: HashSet::new(),
             closed_tool_call_ids: HashSet::new(),
@@ -113,6 +118,7 @@ impl AnthropicStreamConverter {
                     usage: AnthropicUsage {
                         input_tokens: Some(self.pending_input_tokens.unwrap_or(0)),
                         output_tokens: Some(0),
+                        output_tokens_details: None,
                         server_tool_use: None,
                     },
                 },
@@ -154,7 +160,7 @@ impl AnthropicStreamConverter {
                         text: delta.to_string(),
                     },
                 });
-                self.record_output_delta(delta, output);
+                self.record_output_delta(delta, false, output);
             }
             _ => {
                 self.close_open_block(output);
@@ -166,7 +172,7 @@ impl AnthropicStreamConverter {
                             text: delta.to_string(),
                         },
                     });
-                    self.record_output_delta(delta, output);
+                    self.record_output_delta(delta, false, output);
                 }
             }
         }
@@ -185,7 +191,7 @@ impl AnthropicStreamConverter {
                         thinking: delta.to_string(),
                     },
                 });
-                self.record_output_delta(delta, output);
+                self.record_output_delta(delta, true, output);
             }
             _ => {
                 self.close_open_block(output);
@@ -197,7 +203,7 @@ impl AnthropicStreamConverter {
                             thinking: delta.to_string(),
                         },
                     });
-                    self.record_output_delta(delta, output);
+                    self.record_output_delta(delta, true, output);
                 }
             }
         }
@@ -252,7 +258,7 @@ impl AnthropicStreamConverter {
                     partial_json: delta.to_string(),
                 },
             });
-            self.record_output_delta(delta, output);
+            self.record_output_delta(delta, false, output);
         }
     }
 
@@ -300,7 +306,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
-            self.record_output_delta(arguments, output);
+            self.record_output_delta(arguments, false, output);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
@@ -362,6 +368,7 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: self.pending_input_tokens,
                 output_tokens: Some(self.last_output_tokens),
+                output_tokens_details: self.output_tokens_details(),
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -376,6 +383,9 @@ impl AnthropicStreamConverter {
         let usage = response_usage(data);
         if let Some(usage) = usage.as_ref() {
             self.pending_input_tokens = Some(usage.input_tokens);
+            if let Some(details) = usage.output_tokens_details.as_ref() {
+                self.last_thinking_tokens = self.last_thinking_tokens.max(details.thinking_tokens);
+            }
         }
         let output_tokens = usage
             .as_ref()
@@ -403,6 +413,7 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
                 output_tokens: Some(output_tokens),
+                output_tokens_details: self.output_tokens_details(),
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -495,7 +506,12 @@ impl AnthropicStreamConverter {
         }
     }
 
-    fn record_output_delta(&mut self, delta: &str, output: &mut Vec<AnthropicStreamEvent>) {
+    fn record_output_delta(
+        &mut self,
+        delta: &str,
+        is_thinking: bool,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
         if delta.is_empty() {
             return;
         }
@@ -503,6 +519,13 @@ impl AnthropicStreamConverter {
         let estimated_tokens = self
             .estimated_output_bytes
             .div_ceil(ESTIMATED_OUTPUT_TOKEN_BYTES) as u64;
+        if is_thinking {
+            self.estimated_thinking_bytes =
+                self.estimated_thinking_bytes.saturating_add(delta.len());
+            self.last_thinking_tokens =
+                self.estimated_thinking_bytes
+                    .div_ceil(ESTIMATED_OUTPUT_TOKEN_BYTES) as u64;
+        }
         if estimated_tokens <= self.last_output_tokens {
             return;
         }
@@ -515,9 +538,20 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: None,
                 output_tokens: Some(estimated_tokens),
+                // Claude Code's live spinner counts progressive
+                // `usage.output_tokens`, but appears to ignore progressive
+                // usage payloads once `output_tokens_details` is present.
+                // Keep the detail on terminal usage; keep live deltas simple.
+                output_tokens_details: None,
                 server_tool_use: None,
             },
         });
+    }
+
+    fn output_tokens_details(&self) -> Option<AnthropicOutputTokensDetails> {
+        (self.last_thinking_tokens > 0).then_some(AnthropicOutputTokensDetails {
+            thinking_tokens: self.last_thinking_tokens,
+        })
     }
 
     fn start_text_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
@@ -603,7 +637,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
-            self.record_output_delta(arguments, output);
+            self.record_output_delta(arguments, false, output);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
@@ -648,6 +682,7 @@ pub struct AnthropicStreamCollector {
     current_block: Option<AccumulatedBlock>,
     input_tokens: u64,
     output_tokens: u64,
+    output_tokens_details: Option<AnthropicOutputTokensDetails>,
     error: Option<AnthropicErrorBody>,
 }
 
@@ -663,6 +698,7 @@ impl AnthropicStreamCollector {
             current_block: None,
             input_tokens: 0,
             output_tokens: 0,
+            output_tokens_details: None,
             error: None,
         }
     }
@@ -671,6 +707,7 @@ impl AnthropicStreamCollector {
         if let Some(usage) = response_usage(&event.data) {
             self.input_tokens = usage.input_tokens;
             self.output_tokens = usage.output_tokens;
+            self.output_tokens_details = usage.output_tokens_details;
         }
         let stream_events = self.inner.convert(event);
         for se in stream_events {
@@ -759,6 +796,9 @@ impl AnthropicStreamCollector {
                     if let Some(output_tokens) = usage.output_tokens {
                         self.output_tokens = output_tokens;
                     }
+                    if let Some(details) = usage.output_tokens_details {
+                        self.output_tokens_details = Some(details);
+                    }
                 }
                 AnthropicStreamEvent::Error { error } => {
                     self.error = Some(error);
@@ -825,6 +865,7 @@ impl AnthropicStreamCollector {
             usage: AnthropicMessageUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                output_tokens_details: self.output_tokens_details,
             },
         })
     }
@@ -835,6 +876,11 @@ fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {
     Some(AnthropicMessageUsage {
         input_tokens: usage.get("input_tokens")?.as_u64()?,
         output_tokens: usage.get("output_tokens")?.as_u64()?,
+        output_tokens_details: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("thinking_tokens"))
+            .and_then(Value::as_u64)
+            .map(|thinking_tokens| AnthropicOutputTokensDetails { thinking_tokens }),
     })
 }
 
@@ -983,6 +1029,29 @@ mod tests {
                     "usage": {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
+                    }
+                }
+            }),
+        }
+    }
+
+    fn completed_event_with_usage_details(
+        input_tokens: u64,
+        output_tokens: u64,
+        thinking_tokens: u64,
+    ) -> SseEvent {
+        SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "output_tokens_details": {
+                            "thinking_tokens": thinking_tokens,
+                        },
                     }
                 }
             }),
@@ -1313,6 +1382,41 @@ mod tests {
             .expect("message_delta");
         assert_eq!(message_delta.input_tokens, Some(12));
         assert_eq!(message_delta.output_tokens, Some(5));
+        assert!(message_delta.output_tokens_details.is_none());
+    }
+
+    #[test]
+    fn emits_completed_response_thinking_token_details() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            completed_event_with_usage_details(12, 20, 7),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let message_delta = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, usage }
+                    if delta.stop_reason.is_some() =>
+                {
+                    Some(usage)
+                }
+                _ => None,
+            })
+            .expect("terminal message_delta");
+
+        assert_eq!(message_delta.input_tokens, Some(12));
+        assert_eq!(message_delta.output_tokens, Some(20));
+        assert_eq!(
+            message_delta
+                .output_tokens_details
+                .as_ref()
+                .map(|details| details.thinking_tokens),
+            Some(7)
+        );
     }
 
     #[test]
@@ -1345,6 +1449,73 @@ mod tests {
                 .iter()
                 .all(|(delta, _)| delta.stop_reason.is_none()),
             "progress usage must not terminate the message"
+        );
+        assert!(
+            message_deltas
+                .iter()
+                .all(|(_, usage)| usage.output_tokens_details.is_none()),
+            "progress usage must not include output token details"
+        );
+    }
+
+    #[test]
+    fn emits_terminal_thinking_token_details_for_reasoning_deltas() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("abcdefgh"),
+            item_done_event("reasoning", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let terminal_usage = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, usage }
+                    if delta.stop_reason.as_deref() == Some("end_turn") =>
+                {
+                    Some(usage)
+                }
+                _ => None,
+            })
+            .expect("terminal message_delta");
+
+        assert_eq!(terminal_usage.output_tokens, Some(2));
+        assert_eq!(
+            terminal_usage
+                .output_tokens_details
+                .as_ref()
+                .map(|details| details.thinking_tokens),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn non_streaming_collector_preserves_terminal_thinking_token_details() {
+        let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+        for event in [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("abcdefgh"),
+            item_done_event("reasoning", json!({})),
+            completed_event(),
+        ] {
+            collector.process(&event);
+        }
+
+        let response = collector.into_response().expect("response");
+        assert_eq!(response.usage.output_tokens, 2);
+        assert_eq!(
+            response
+                .usage
+                .output_tokens_details
+                .as_ref()
+                .map(|details| details.thinking_tokens),
+            Some(2)
         );
     }
 
@@ -1414,9 +1585,7 @@ mod tests {
         let message_delta = events
             .iter()
             .filter_map(|event| match event {
-                AnthropicStreamEvent::MessageDelta { delta, .. }
-                    if delta.stop_reason.is_some() =>
-                {
+                AnthropicStreamEvent::MessageDelta { delta, .. } if delta.stop_reason.is_some() => {
                     Some(delta)
                 }
                 _ => None,
