@@ -31,6 +31,7 @@ pub struct AnthropicStreamConverter {
     started: bool,
     completed: bool,
     pending_input_tokens: Option<u64>,
+    pending_cached_tokens: Option<u64>,
     estimated_output_bytes: usize,
     last_output_tokens: u64,
     web_search_count: u64,
@@ -49,6 +50,7 @@ impl AnthropicStreamConverter {
             started: false,
             completed: false,
             pending_input_tokens: None,
+            pending_cached_tokens: None,
             estimated_output_bytes: 0,
             last_output_tokens: 0,
             web_search_count: 0,
@@ -113,6 +115,8 @@ impl AnthropicStreamConverter {
                     usage: AnthropicUsage {
                         input_tokens: Some(self.pending_input_tokens.unwrap_or(0)),
                         output_tokens: Some(0),
+                        cache_read_input_tokens: self.pending_cached_tokens,
+                        cache_creation_input_tokens: None,
                         server_tool_use: None,
                     },
                 },
@@ -362,6 +366,8 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: self.pending_input_tokens,
                 output_tokens: Some(self.last_output_tokens),
+                cache_read_input_tokens: self.pending_cached_tokens,
+                cache_creation_input_tokens: None,
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -376,6 +382,7 @@ impl AnthropicStreamConverter {
         let usage = response_usage(data);
         if let Some(usage) = usage.as_ref() {
             self.pending_input_tokens = Some(usage.input_tokens);
+            self.pending_cached_tokens = usage.cache_read_input_tokens;
         }
         let output_tokens = usage
             .as_ref()
@@ -403,6 +410,10 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
                 output_tokens: Some(output_tokens),
+                cache_read_input_tokens: usage
+                    .as_ref()
+                    .and_then(|usage| usage.cache_read_input_tokens),
+                cache_creation_input_tokens: None,
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -515,6 +526,8 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: None,
                 output_tokens: Some(estimated_tokens),
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
                 server_tool_use: None,
             },
         });
@@ -648,6 +661,7 @@ pub struct AnthropicStreamCollector {
     current_block: Option<AccumulatedBlock>,
     input_tokens: u64,
     output_tokens: u64,
+    cached_input_tokens: Option<u64>,
     error: Option<AnthropicErrorBody>,
 }
 
@@ -663,6 +677,7 @@ impl AnthropicStreamCollector {
             current_block: None,
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: None,
             error: None,
         }
     }
@@ -671,6 +686,7 @@ impl AnthropicStreamCollector {
         if let Some(usage) = response_usage(&event.data) {
             self.input_tokens = usage.input_tokens;
             self.output_tokens = usage.output_tokens;
+            self.cached_input_tokens = usage.cache_read_input_tokens;
         }
         let stream_events = self.inner.convert(event);
         for se in stream_events {
@@ -825,6 +841,8 @@ impl AnthropicStreamCollector {
             usage: AnthropicMessageUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                cache_read_input_tokens: self.cached_input_tokens,
+                cache_creation_input_tokens: None,
             },
         })
     }
@@ -832,9 +850,19 @@ impl AnthropicStreamCollector {
 
 fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {
     let usage = data.get("response")?.get("usage")?;
+    let total_input = usage.get("input_tokens")?.as_u64()?;
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(total_input);
     Some(AnthropicMessageUsage {
-        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        // Anthropic semantics: input_tokens excludes cache reads.
+        input_tokens: total_input - cached,
         output_tokens: usage.get("output_tokens")?.as_u64()?,
+        cache_read_input_tokens: (cached > 0).then_some(cached),
+        cache_creation_input_tokens: None,
     })
 }
 

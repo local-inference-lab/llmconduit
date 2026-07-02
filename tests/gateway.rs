@@ -4523,7 +4523,10 @@ async fn anthropic_messages_streams_text_response() {
             event["type"] == "message_delta" && event["delta"]["stop_reason"] == "end_turn"
         })
         .expect("message_delta event");
-    assert_eq!(message_delta["usage"]["input_tokens"], 12);
+    // Anthropic semantics: input_tokens excludes cache reads. The mock
+    // upstream reports 12 prompt tokens with 3 cached -> 9 fresh + 3 read.
+    assert_eq!(message_delta["usage"]["input_tokens"], 9);
+    assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 3);
     assert_eq!(message_delta["usage"]["output_tokens"], 5);
 
     // Verify the upstream received a chat completions request

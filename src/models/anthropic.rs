@@ -410,6 +410,13 @@ pub struct AnthropicUsage {
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Prompt tokens served from the upstream prefix cache (vLLM
+    /// `prompt_tokens_details.cached_tokens`). Claude Code's cache indicator
+    /// reads this; per Anthropic semantics `input_tokens` EXCLUDES these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
     /// Server-executed tool usage. Claude Code's "Did N searches" indicator
     /// reads `server_tool_use.web_search_requests`; omitted when no server-side
     /// search ran so token-only turns stay byte-identical.
@@ -496,6 +503,10 @@ pub enum AnthropicResponseContentBlock {
 pub struct AnthropicMessageUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 #[cfg(test)]
