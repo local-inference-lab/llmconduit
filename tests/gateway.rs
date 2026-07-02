@@ -5546,7 +5546,7 @@ async fn anthropic_messages_relaxes_forced_web_search_when_brave_is_disabled() {
 }
 
 #[tokio::test]
-async fn anthropic_messages_lifts_claude_code_skill_listing_before_user_prompt() {
+async fn anthropic_messages_keeps_claude_code_skill_listing_in_place() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
@@ -5593,26 +5593,28 @@ async fn anthropic_messages_lifts_claude_code_skill_listing_before_user_prompt()
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    assert_eq!(roles, vec!["system", "user"]);
-    let system = messages[0]
-        .content
-        .as_ref()
-        .and_then(|value| value.as_str())
-        .expect("system content");
-    assert!(system.contains("skill listing"));
-    assert!(system.contains("security-review"));
-    assert!(system.contains("Do not quote"));
+    // In-place: the guarded skill listing stays at its original position so
+    // mid-session reminders never rewrite the prompt head (prefix caching).
+    assert_eq!(roles, vec!["user", "user"]);
     assert_eq!(
-        messages[1]
+        messages[0]
             .content
             .as_ref()
             .and_then(|value| value.as_str()),
         Some("hello")
     );
+    let guarded = messages[1]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .expect("guarded content");
+    assert!(guarded.contains("skill listing"));
+    assert!(guarded.contains("security-review"));
+    assert!(guarded.contains("Do not quote"));
 }
 
 #[tokio::test]
-async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt() {
+async fn anthropic_messages_keeps_late_system_skill_listing_in_place() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
@@ -5661,16 +5663,15 @@ async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt()
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    assert_eq!(roles, vec!["system", "user"]);
+    // The system prompt stays byte-stable; the late system-role skill
+    // listing becomes a guarded user turn at its original position.
+    assert_eq!(roles, vec!["system", "user", "user"]);
     let system = messages[0]
         .content
         .as_ref()
         .and_then(|value| value.as_str())
         .expect("system content");
-    assert!(system.contains("You are Claude Code."));
-    assert!(system.contains("skill listing"));
-    assert!(system.contains("security-review"));
-    assert!(system.contains("Do not quote"));
+    assert_eq!(system, "You are Claude Code.");
     assert_eq!(
         messages[1]
             .content
@@ -5678,6 +5679,14 @@ async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt()
             .and_then(|value| value.as_str()),
         Some("hello")
     );
+    let guarded = messages[2]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .expect("guarded content");
+    assert!(guarded.contains("skill listing"));
+    assert!(guarded.contains("security-review"));
+    assert!(guarded.contains("Do not quote"));
 }
 
 #[tokio::test]

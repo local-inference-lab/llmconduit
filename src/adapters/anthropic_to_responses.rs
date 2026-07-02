@@ -28,11 +28,13 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         ));
     }
     let converted_messages = convert_messages(&request.messages)?;
-    let instructions = join_instruction_parts(
-        [extract_system_text(&request.system)]
-            .into_iter()
-            .chain(converted_messages.private_context),
-    );
+    // Private context (system reminders, command caveats, skill listings)
+    // stays IN PLACE in the message stream instead of being hoisted into
+    // instructions. Instructions render at the very top of the upstream
+    // prompt, so a mid-session reminder used to rewrite the prompt head and
+    // invalidate the entire prefix cache; in-place keeps histories
+    // append-only and cache-friendly.
+    let instructions = join_instruction_parts([extract_system_text(&request.system)]);
     let input = converted_messages.input;
     let tools = convert_tools(&request.tools);
     let (reasoning, mut extra_body) = convert_thinking(&request.thinking);
@@ -251,36 +253,25 @@ fn normalize_reasoning_effort(effort: &str) -> AppResult<Option<String>> {
 
 struct ConvertedMessages {
     input: Vec<ResponseItem>,
-    private_context: Vec<String>,
 }
 
 fn convert_messages(
     messages: &[crate::models::anthropic::AnthropicMessage],
 ) -> AppResult<ConvertedMessages> {
     let mut items = Vec::new();
-    let mut private_context = Vec::new();
     for message in messages {
-        convert_message(
-            &message.role,
-            &message.content,
-            &mut items,
-            &mut private_context,
-        )?;
+        convert_message(&message.role, &message.content, &mut items)?;
     }
-    Ok(ConvertedMessages {
-        input: items,
-        private_context,
-    })
+    Ok(ConvertedMessages { input: items })
 }
 
 fn convert_message(
     role: &str,
     content: &AnthropicContent,
     items: &mut Vec<ResponseItem>,
-    private_context: &mut Vec<String>,
 ) -> AppResult<()> {
     if is_private_instruction_role(role) {
-        lift_private_instruction_content(content, private_context);
+        emit_private_instruction_content(content, items);
         return Ok(());
     }
 
@@ -295,7 +286,9 @@ fn convert_message(
                                 items.push(text_message_item(role, &text));
                             }
                         }
-                        UserTextSegment::PrivateContext(text) => private_context.push(text),
+                        UserTextSegment::PrivateContext(text) => {
+                            items.push(text_message_item(role, &text));
+                        }
                     }
                 }
             } else {
@@ -332,8 +325,7 @@ fn convert_message(
                                         }
                                     }
                                     UserTextSegment::PrivateContext(text) => {
-                                        flush_message(items, &mut content_items);
-                                        private_context.push(text);
+                                        content_items.push(ContentItem::InputText { text });
                                     }
                                 }
                             }
@@ -421,7 +413,7 @@ fn is_private_instruction_role(role: &str) -> bool {
     matches!(role, "system" | "developer")
 }
 
-fn lift_private_instruction_content(content: &AnthropicContent, private_context: &mut Vec<String>) {
+fn emit_private_instruction_content(content: &AnthropicContent, items: &mut Vec<ResponseItem>) {
     let text = match content {
         AnthropicContent::Text(text) => strip_billing_nonce(text),
         AnthropicContent::Blocks(blocks) => blocks
@@ -443,7 +435,8 @@ fn lift_private_instruction_content(content: &AnthropicContent, private_context:
     } else {
         "system message"
     };
-    private_context.push(wrap_private_context(label, text));
+    // Emit in place as a guarded user turn (position-stable for prefix caching).
+    items.push(text_message_item("user", &wrap_private_context(label, text)));
 }
 
 enum UserTextSegment {
@@ -896,16 +889,24 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("Base instructions."));
-        assert!(result.instructions.contains("skill listing"));
-        assert!(result.instructions.contains("deep-research"));
-        assert!(result.instructions.contains("Do not quote"));
-        assert_eq!(result.input.len(), 1);
+        // In-place: the skill listing stays a guarded user turn at its
+        // original position instead of rewriting the instruction head.
+        assert_eq!(result.instructions, "Base instructions.");
+        assert_eq!(result.input.len(), 2);
         assert!(matches!(
             &result.input[0],
             ResponseItem::Message { role, content, .. }
                 if role == "user"
                     && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
+        ));
+        assert!(matches!(
+            &result.input[1],
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && matches!(&content[0], ContentItem::InputText { text }
+                        if text.contains("skill listing")
+                            && text.contains("deep-research")
+                            && text.contains("Do not quote"))
         ));
     }
 
@@ -946,16 +947,26 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("Base instructions."));
-        assert!(result.instructions.contains("skill listing"));
-        assert!(result.instructions.contains("deep-research"));
-        assert!(result.instructions.contains("Do not quote"));
-        assert_eq!(result.input.len(), 1);
+        // System text stays the sole instruction source; the skill listing is
+        // kept in place (position-stable) so mid-session reminders cannot
+        // rewrite the prompt head and break prefix caching.
+        assert_eq!(result.instructions, "Base instructions.");
+        assert!(!result.instructions.contains("skill listing"));
+        assert_eq!(result.input.len(), 2);
         assert!(matches!(
             &result.input[0],
             ResponseItem::Message { role, content, .. }
                 if role == "user"
                     && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
+        ));
+        assert!(matches!(
+            &result.input[1],
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && matches!(&content[0], ContentItem::InputText { text }
+                        if text.contains("skill listing")
+                            && text.contains("deep-research")
+                            && text.contains("Do not quote"))
         ));
     }
 
@@ -1001,22 +1012,29 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("local command caveat"));
-        assert!(
-            result
-                .instructions
-                .contains("Do not answer local command output.")
-        );
-        assert!(result.instructions.contains("system reminder"));
-        assert!(result.instructions.contains("Prefer concise answers."));
-        assert!(!result.instructions.contains("<command-name>"));
-        assert_eq!(result.input.len(), 1);
-        assert!(matches!(
-            &result.input[0],
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
-        ));
+        // Nothing is hoisted into instructions anymore: guarded context stays
+        // in place, /clear command echoes are still dropped entirely.
+        assert_eq!(result.instructions, "");
+        let texts: Vec<&str> = result
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    match &content[0] {
+                        ContentItem::InputText { text } => Some(text.as_str()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].contains("local command caveat"));
+        assert!(texts[0].contains("Do not answer local command output."));
+        assert!(texts[1].contains("system reminder"));
+        assert!(texts[1].contains("Prefer concise answers."));
+        assert_eq!(texts[2], "hello");
+        assert!(texts.iter().all(|t| !t.contains("<command-name>")));
     }
 
     #[test]
