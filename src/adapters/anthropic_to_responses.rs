@@ -436,7 +436,10 @@ fn emit_private_instruction_content(content: &AnthropicContent, items: &mut Vec<
         "system message"
     };
     // Emit in place as a guarded user turn (position-stable for prefix caching).
-    items.push(text_message_item("user", &wrap_private_context(label, text)));
+    items.push(text_message_item(
+        "user",
+        &wrap_private_context(label, text),
+    ));
 }
 
 enum UserTextSegment {

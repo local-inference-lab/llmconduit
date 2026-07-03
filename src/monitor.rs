@@ -186,6 +186,11 @@ pub struct DebugTimelineEvent {
     pub images: Vec<DebugEventImage>,
 }
 
+/// Metadata about an image found in a request/response preview, surfaced to the
+/// debug UI over `/debug/ws`. Carries ONLY non-sensitive descriptors — never the
+/// raw image bytes or URL (G4 round-4 #4): `data:`/signed URLs must not leave the
+/// process via the monitor broadcast. The UI renders a redacted placeholder card
+/// from this metadata, not the image itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct DebugEventImage {
     pub id: String,
@@ -193,7 +198,6 @@ pub struct DebugEventImage {
     pub path: String,
     pub mime_type: String,
     pub size_bytes: Option<usize>,
-    pub src: String,
 }
 
 #[derive(Clone)]
@@ -264,11 +268,19 @@ impl MonitorHub {
         };
         let mut messages = state.apply_event(&event);
         messages.extend(state.prune_expired(event.timestamp_ms));
+        drop(state);
+        // Round-6 #1: redact image `data:`/signed URLs from EVERY outgoing
+        // `/debug/ws` message at this single broadcast choke point, so no raw
+        // image data/URL ever leaves the process via the monitor. This is on the
+        // active-debug path only (`emit` early-returns when disabled), so the
+        // production `MonitorHub::disabled()` path keeps zero overhead.
+        for message in &mut messages {
+            redact_ws_message_image_uris(message);
+        }
         let update = DebugUpdate {
             sequence: event.sequence,
             messages,
         };
-        drop(state);
         let _ = self.tx.send(update);
     }
 
@@ -308,10 +320,60 @@ impl MonitorHub {
             });
         }
         messages.push(DebugWsMessage::SnapshotDone);
+        // Round-6 #1: the snapshot replays accumulated segments/events over
+        // `/debug/ws`; redact image URIs from every message just like the live
+        // `emit` path. Snapshot segments hold the FULL accumulated text, so this
+        // also catches any image URL split across live delta chunks.
+        for message in &mut messages {
+            redact_ws_message_image_uris(message);
+        }
         DebugSnapshot {
             last_sequence: state.last_sequence,
             messages,
         }
+    }
+}
+
+/// Redact image `data:`/signed URLs from a single outgoing `/debug/ws` message
+/// (round-6 #1), via the shared [`crate::vision::redact_image_uris`] utility, so
+/// the whole monitor/debug class is covered at one boundary. Covers every
+/// text-bearing field: segment text, timeline summary/preview, model id, and
+/// error strings. (`DebugEventImage` already carries no raw bytes.)
+///
+/// Residual edge: a `SegmentAppend` carries a single LIVE delta chunk, so an
+/// image URL split ACROSS delta-chunk boundaries is only partially matched in
+/// the per-chunk live message; the SNAPSHOT (full accumulated segment text)
+/// redacts it completely, and the engine already redacts the request/response
+/// PAYLOAD previews at their source — model output rarely emits raw image URLs.
+fn redact_ws_message_image_uris(message: &mut DebugWsMessage) {
+    let redact = |text: &mut String| {
+        let redacted = crate::vision::redact_image_uris(text);
+        if redacted != *text {
+            *text = redacted;
+        }
+    };
+    match message {
+        DebugWsMessage::SegmentAppend { segment, .. } => redact(&mut segment.text),
+        DebugWsMessage::EventAppend { event, .. } => {
+            redact(&mut event.summary);
+            if let Some(preview) = event.payload_preview.as_mut() {
+                redact(preview);
+            }
+        }
+        DebugWsMessage::RequestUpsert { request } => {
+            redact(&mut request.model);
+            if let Some(error) = request.error.as_mut() {
+                redact(error);
+            }
+        }
+        DebugWsMessage::RequestStatus { error, .. } => {
+            if let Some(error) = error.as_mut() {
+                redact(error);
+            }
+        }
+        DebugWsMessage::Hello { .. }
+        | DebugWsMessage::RequestRemove { .. }
+        | DebugWsMessage::SnapshotDone => {}
     }
 }
 
@@ -1054,10 +1116,13 @@ fn tool_phase_line(phase: &str, detail: &str) -> Option<String> {
 
 fn short_id(response_id: &str) -> String {
     const LIMIT: usize = 18;
-    if response_id.len() <= LIMIT {
-        response_id.to_string()
-    } else {
-        format!("{}...", &response_id[..LIMIT])
+    // `response_id` is an upstream-controlled tool-call id; truncate on a CHAR
+    // boundary so a non-ASCII id >18 bytes cannot panic the debug monitor
+    // (round-6 #2). `char_indices().nth(LIMIT)` gives the byte offset of the
+    // LIMIT-th char (a valid boundary); `None` means the id has <= LIMIT chars.
+    match response_id.char_indices().nth(LIMIT) {
+        Some((byte_idx, _)) => format!("{}...", &response_id[..byte_idx]),
+        None => response_id.to_string(),
     }
 }
 
@@ -1150,6 +1215,113 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "first\nsecond\nthird");
+    }
+
+    #[test]
+    fn debug_ws_segments_redact_image_uris_in_snapshot() {
+        // Round-6 #1: output/tool segment text echoing a data:/signed image URL
+        // must be redacted in the /debug/ws snapshot (and broadcast).
+        let hub = MonitorHub::new(8);
+        hub.emit("resp_1", started("model-a"));
+        hub.emit(
+            "resp_1",
+            MonitorEventKind::OutputTextDelta {
+                delta:
+                    "see data:image/png;base64,SEGLEAKDATA and https://signed.x/i?sig=SEGSIGLEAK"
+                        .to_string(),
+            },
+        );
+        hub.emit(
+            "resp_1",
+            MonitorEventKind::ToolPhase {
+                phase: "provider_tool_running".to_string(),
+                detail: "fetched data:image/jpeg;base64,TOOLLEAK".to_string(),
+            },
+        );
+        hub.emit("resp_1", MonitorEventKind::Completed);
+
+        let snapshot = hub.snapshot();
+        let dumped = serde_json::to_string(&snapshot.messages).expect("serialize");
+        assert!(
+            !dumped.contains("SEGLEAKDATA"),
+            "output data: payload redacted"
+        );
+        assert!(
+            !dumped.contains("SEGSIGLEAK"),
+            "output signed-url token redacted"
+        );
+        assert!(!dumped.contains("TOOLLEAK"), "tool data: payload redacted");
+        assert!(dumped.contains("<redacted uri>"));
+        // Non-image text survives.
+        assert!(dumped.contains("see "));
+    }
+
+    #[test]
+    fn debug_ws_broadcast_redacts_image_uris_live() {
+        // Round-6 #1: the LIVE broadcast (not just snapshot) is redacted too.
+        let hub = MonitorHub::new(8);
+        let mut rx = hub.subscribe();
+        hub.emit("resp_live", started("model-a"));
+        hub.emit(
+            "resp_live",
+            MonitorEventKind::OutputTextDelta {
+                delta: "x data:image/png;base64,LIVELEAK y".to_string(),
+            },
+        );
+        let mut saw_redaction = false;
+        // Drain the queued updates and assert no raw payload appears anywhere.
+        while let Ok(update) = rx.try_recv() {
+            let dumped = serde_json::to_string(&update.messages).expect("serialize");
+            assert!(
+                !dumped.contains("LIVELEAK"),
+                "live broadcast must redact data:"
+            );
+            if dumped.contains("<redacted uri>") {
+                saw_redaction = true;
+            }
+        }
+        assert!(
+            saw_redaction,
+            "expected a redacted segment in the live broadcast"
+        );
+    }
+
+    #[test]
+    fn short_id_truncates_multibyte_ids_without_panic() {
+        // Round-6 #2: an upstream tool-call id with multibyte chars >18 bytes
+        // must truncate on a CHAR boundary, not panic on a byte slice.
+        let multibyte = "café_☕_tool_call_überlang_id_0123456789"; // many bytes, >18 chars
+        let short = super::short_id(multibyte);
+        assert!(short.ends_with("..."));
+        assert!(short.is_char_boundary(short.len()));
+        // First 18 CHARS preserved.
+        let expected: String = multibyte.chars().take(18).collect();
+        assert_eq!(short, format!("{expected}..."));
+
+        // A short ascii id is returned unchanged.
+        assert_eq!(super::short_id("call_123"), "call_123");
+
+        // An id with EXACTLY 18 multibyte chars is returned unchanged (no panic).
+        let exactly_18: String = "é".repeat(18);
+        assert_eq!(super::short_id(&exactly_18), exactly_18);
+    }
+
+    #[test]
+    fn function_call_delta_with_multibyte_id_does_not_panic() {
+        // End-to-end: a function-call delta whose call_id is a long multibyte id
+        // flows through append_function_call_delta -> short_id without panic.
+        let hub = MonitorHub::new(8);
+        hub.emit("resp_1", started("model-a"));
+        hub.emit(
+            "resp_1",
+            MonitorEventKind::FunctionCallArgumentsDelta {
+                call_id: "café_☕_überlang_call_id_9876543210".to_string(),
+                delta: "{\"q\":1}".to_string(),
+            },
+        );
+        hub.emit("resp_1", MonitorEventKind::Completed);
+        // Snapshot must build without panicking.
+        let _ = hub.snapshot();
     }
 
     #[test]

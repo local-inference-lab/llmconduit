@@ -59,6 +59,21 @@ pub trait UpstreamClient: Send + Sync {
         Ok(None)
     }
     async fn supported_model_ids(&self) -> AppResult<Vec<String>>;
+
+    /// Every backend model `requested_model` could ACTUALLY be served by
+    /// pre-first-chunk, after any routing/route/exposed-alias + per-provider
+    /// `upstream_model` rewrite (G4 review #2 + round-2 #1). This enumerates the
+    /// full candidate set — the primary AND all eligible failover providers (and
+    /// the routing target) — because failover happens before the first chunk, so
+    /// the model that ultimately serves may be any of them. Native-vision gating
+    /// uses the SAFE invariant over this set (passthrough only if EVERY candidate
+    /// is native-vision), so it can never disagree with the provider that serves.
+    ///
+    /// The default impl (single `ReqwestUpstreamClient`) sends the request model
+    /// unchanged, so the only candidate is `requested_model` itself.
+    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
+        vec![requested_model.to_string()]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +167,15 @@ impl RoutingUpstreamProvider {
             client: FailoverUpstreamClient::new(providers, cooldown),
         }
     }
+
+    /// The effective backend model of one of this routing provider's nested
+    /// failover providers (its `upstream_model` rewrite, if any). Used by G4
+    /// native-vision gating for an exposed-alias/fallback target that serves from
+    /// exactly one provider. `None` when the index is out of range or the
+    /// provider sends the request model through unchanged.
+    fn failover_provider_model(&self, failover_provider_index: usize) -> Option<String> {
+        self.client.provider_upstream_model(failover_provider_index)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +228,14 @@ struct ProviderCooldownState {
     last_error: Option<String>,
 }
 
+/// Cheap case-insensitive scan for a potential image-URI marker (`data:` /
+/// `http`) in serialized request bytes, so the log fast-path only pays the
+/// redaction round-trip when an image URL might be present (G4 round-4 #3).
+fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
+    bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"data:"))
+        || bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"http"))
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamRequestLogger {
     path: PathBuf,
@@ -219,7 +251,20 @@ impl UpstreamRequestLogger {
     }
 
     async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
+        // G4 round-4 #3: the JSONL request log is written to DISK and would
+        // otherwise serialize raw `data:` image bytes / signed `image_url`s for
+        // native-vision-passthrough / disabled-agent / missing-url /
+        // tool_choice:"none" image requests (any path that does NOT strip). The
+        // common no-image request serializes directly (format unchanged); only
+        // when the serialized bytes contain an image-URI marker do we re-redact
+        // via a CLONED JSON value through the shared redactor, so the on-disk log
+        // never carries request image content.
         let mut payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
+        if bytes_contain_image_uri(&payload) {
+            let mut value = serde_json::to_value(request).map_err(std::io::Error::other)?;
+            crate::vision::redact_image_uris_in_value(&mut value);
+            payload = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
+        }
         payload.push(b'\n');
         let path = self.path.clone();
         let write_lock = self.write_lock.clone();
@@ -328,7 +373,8 @@ impl UpstreamClient for ReqwestUpstreamClient {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(AppError::upstream(format!(
-                "upstream /models failed with {status}: {body}"
+                "upstream /models failed with {status}: {}",
+                redact_and_truncate_error_body(&body, 500)
             )));
         }
         Ok(response)
@@ -388,6 +434,15 @@ impl FailoverUpstreamClient {
             cooldown,
             states: Arc::new(Mutex::new(states)),
         }
+    }
+
+    /// The configured `upstream_model` rewrite of provider `index`, if any.
+    /// `None` when out of range or the provider sends the request model
+    /// unchanged. Used by G4 native-vision gating (round-2 #1).
+    fn provider_upstream_model(&self, index: usize) -> Option<String> {
+        self.providers
+            .get(index)
+            .and_then(|provider| provider.upstream_model.clone())
     }
 
     fn available_provider_indices(&self) -> Vec<usize> {
@@ -677,7 +732,8 @@ impl FailoverUpstreamClient {
                     }
                     let body = response.text().await.unwrap_or_default();
                     let err = AppError::upstream(format!(
-                        "upstream completions failed with {status}: {body}"
+                        "upstream completions failed with {status}: {}",
+                        redact_and_truncate_error_body(&body, 500)
                     ));
                     self.mark_failure(provider_index, &err);
                     last_error = Some(err);
@@ -989,6 +1045,24 @@ impl UpstreamClient for FailoverUpstreamClient {
         let response = self.list_models().await?;
         collect_supported_model_ids(response).await
     }
+
+    /// Every configured provider is a pre-first-chunk failover candidate, so the
+    /// candidate model set is each provider's effective model — its
+    /// `upstream_model` rewrite (matching `request_for_provider`) or the request
+    /// model when it sends through unchanged (G4 round-2 #1). We enumerate ALL
+    /// providers (not just currently-available ones): cooldown is transient, so
+    /// a fallback that is non-native must still force strip+offload.
+    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| requested_model.to_string())
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -999,6 +1073,42 @@ impl UpstreamClient for RoutingUpstreamClient {
     ) -> AppResult<UpstreamStream> {
         self.stream_chat_completion_with_timeout(request, Duration::from_secs(60))
             .await
+    }
+
+    /// Candidate backend models for `requested_model` using the SAME route/
+    /// catalog resolution as `stream_chat_completion` (G4 review #2 + round-2
+    /// #1). A route resolves to one backend model. A catalog match dispatches to
+    /// a routing provider: the PRIMARY target may fail over across that
+    /// provider's whole failover chain (so all of its candidate models count),
+    /// while a fallback/exposed-alias target serves only that single provider's
+    /// model. A catalog-load failure yields an empty set, which the safe
+    /// invariant treats as "unknown → strip+offload".
+    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
+        let Ok(catalog) = self.load_catalog().await else {
+            return Vec::new();
+        };
+        let Some(candidate) = catalog.resolve(requested_model) else {
+            return Vec::new();
+        };
+        let Some(provider) = self.providers.get(candidate.provider_index) else {
+            return Vec::new();
+        };
+        match candidate.target {
+            // Primary: the whole nested failover chain may serve.
+            RoutingModelTarget::Primary => {
+                provider
+                    .client
+                    .candidate_backend_models(&candidate.model_id)
+                    .await
+            }
+            // Fallback/exposed-alias: only this one provider serves.
+            RoutingModelTarget::Fallback {
+                failover_provider_index,
+            } => provider
+                .failover_provider_model(failover_provider_index)
+                .map(|model| vec![model])
+                .unwrap_or_else(|| vec![candidate.model_id.clone()]),
+        }
     }
 
     async fn stream_chat_completion_with_timeout(
@@ -1522,6 +1632,17 @@ fn truncate_for_error(s: &str, max: usize) -> String {
         Some((byte_idx, _)) => format!("{}...[truncated]", &s[..byte_idx]),
         None => s.to_string(),
     }
+}
+
+/// Redact image `data:`/signed URLs from an upstream RESPONSE error body, then
+/// truncate it for an `AppError`/log message (G4 round-9 #2). A provider that
+/// echoes a native-vision-passthrough / disabled-agent image request can mirror
+/// the submitted `data:` bytes or a signed image URL back in its 4xx/5xx body;
+/// without this they would leak through `response.failed` and failover logs
+/// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
+/// URI cannot survive at the truncation boundary.
+fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
+    truncate_for_error(&crate::vision::redact_image_uris(body), max)
 }
 
 fn stringify_json_value(value: Value) -> Value {

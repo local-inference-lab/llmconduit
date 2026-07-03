@@ -12,6 +12,7 @@ pub mod replay;
 pub mod request_log;
 pub mod search;
 pub mod upstream;
+pub mod vision;
 
 use crate::config::Config;
 use crate::engine::Gateway;
@@ -26,6 +27,8 @@ use crate::upstream::FailoverUpstreamProvider;
 use crate::upstream::ReqwestUpstreamClient;
 use crate::upstream::RoutingUpstreamClient;
 use crate::upstream::RoutingUpstreamProvider;
+use crate::vision::ImageCache;
+use crate::vision::ReqwestVisionClient;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,12 +148,21 @@ pub fn build_app_with_gateway_and_options(
             ))
         }
     };
-    let search = Arc::new(BraveSearchClient::new(http_client, config.clone()));
+    let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
+    // G4 image agent: a vision client + a shared per-session image cache. The
+    // cache is constructed once and shared so the strip seam (in
+    // `stream_responses`) and the executor (`run_image_analysis`) see the same
+    // store. Construction is unconditional and cheap; gating happens per-turn.
+    let vision: Arc<dyn crate::vision::VisionClient> =
+        Arc::new(ReqwestVisionClient::new(http_client, &config));
+    let image_cache = Arc::new(ImageCache::from_config(&config));
     let gateway = Arc::new(Gateway::new(
         config,
         replay_store,
         upstream,
         search,
+        vision,
+        image_cache,
         monitor,
         raw_output,
     ));

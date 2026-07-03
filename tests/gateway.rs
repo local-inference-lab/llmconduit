@@ -455,6 +455,11 @@ async fn uses_configured_upstream_model_override() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
         },
     );
 
@@ -531,6 +536,11 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
         },
     );
 
@@ -872,6 +882,11 @@ async fn forwards_configured_upstream_chat_kwargs() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
         },
     );
 
@@ -933,6 +948,11 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
         },
     );
 
@@ -1529,6 +1549,11 @@ async fn proxies_models_endpoint_with_etag() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1594,6 +1619,11 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1665,6 +1695,11 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1739,6 +1774,11 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1818,6 +1858,11 @@ async fn proxies_completions_endpoint_passthrough() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -2881,11 +2926,17 @@ fn test_gateway_with_config_and_raw_output(
     config: Config,
     raw_output: Option<RawOutput>,
 ) -> Arc<Gateway> {
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
+        vision,
+        image_cache,
         MonitorHub::new(128),
         raw_output,
     ))
@@ -2913,6 +2964,11 @@ fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
     }
 }
 
@@ -5696,32 +5752,44 @@ async fn anthropic_messages_keeps_late_system_skill_listing_in_place() {
 async fn cancels_mid_stream_when_client_disconnects() {
     let upstream = PendingChunkUpstream::new();
     let stream_polled = upstream.stream_polled.notified();
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
+        system_prompt_prefix: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        upstreams: Vec::new(),
+        fallback_upstreams: Vec::new(),
+        upstream_failure_cooldown_secs: 30,
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
+    };
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     let gateway = Arc::new(Gateway::new(
-        Config {
-            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            default_reasoning_effort: "max".to_string(),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::new(),
-            brave_base_url: "https://example.com/".parse().expect("url"),
-            brave_api_key: None,
-            brave_max_results: 5,
-            request_timeout: std::time::Duration::from_secs(30),
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-        },
+        config,
         ReplayStore::new(1000),
         Arc::new(upstream.clone()),
         Arc::new(MockSearch::default()),
+        vision,
+        image_cache,
         MonitorHub::new(128),
         None,
     ));

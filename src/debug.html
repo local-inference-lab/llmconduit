@@ -2715,11 +2715,12 @@
       for (const image of event.images) {
         const item = document.createElement("figure");
         item.className = "event-image";
-        const img = document.createElement("img");
-        img.src = image.src;
-        img.alt = image.label || image.path || "input image";
-        img.loading = "lazy";
-        item.appendChild(img);
+        // Raw image bytes/URLs are NEVER broadcast over /debug/ws (server-side
+        // redaction); render a metadata-only placeholder card, not the image.
+        const placeholder = document.createElement("div");
+        placeholder.className = "image-redacted";
+        placeholder.textContent = "[image redacted]";
+        item.appendChild(placeholder);
         const caption = document.createElement("figcaption");
         caption.className = "image-caption";
         caption.textContent = `${image.label || "image"} | ${image.mime_type || "image"} | ${formatBytes(image.size_bytes)} | ${image.path || ""}`;

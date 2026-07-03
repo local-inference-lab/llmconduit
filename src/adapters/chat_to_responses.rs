@@ -339,6 +339,23 @@ impl StreamState {
                         queries: None,
                     }),
                 },
+                // G4: the `analyzeImage` call is a server-side tool. We carry it
+                // as a FunctionCall public_item so the engine's executor can read
+                // its arguments and `internal_call`, but the engine keeps it OUT
+                // of `response_output`/`public_history` and suppresses its
+                // streamed deltas — exactly like `web_search` is never surfaced
+                // to the client.
+                ToolKind::ImageAnalysis => ResponseItem::FunctionCall {
+                    id: None,
+                    name: crate::vision::ANALYZE_IMAGE_TOOL_NAME.to_string(),
+                    namespace: None,
+                    arguments: serde_json::to_string(&arguments).map_err(|err| {
+                        AppError::internal(format!(
+                            "failed to serialize analyzeImage arguments: {err}"
+                        ))
+                    })?,
+                    call_id: call_id.clone(),
+                },
             };
             let internal_call = ChatToolCall {
                 id: Some(call_id.clone()),

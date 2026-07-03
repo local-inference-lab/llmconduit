@@ -262,6 +262,11 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                image_agent_enabled: false,
+                vision_url: None,
+                vision_model: None,
+                image_cache_max_size: 100,
+                image_cache_ttl_secs: 300,
             },
         );
 
@@ -300,6 +305,11 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                image_agent_enabled: false,
+                vision_url: None,
+                vision_model: None,
+                image_cache_max_size: 100,
+                image_cache_ttl_secs: 300,
             },
         );
 

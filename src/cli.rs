@@ -184,6 +184,11 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         max_web_search_rounds: existing.max_web_search_rounds,
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,
+        image_agent_enabled: existing.image_agent_enabled,
+        vision_url: existing.vision_url.clone(),
+        vision_model: existing.vision_model.clone(),
+        image_cache_max_size: existing.image_cache_max_size,
+        image_cache_ttl_secs: existing.image_cache_ttl_secs,
     };
 
     let should_write = Confirm::with_theme(&theme)

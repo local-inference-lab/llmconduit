@@ -698,6 +698,12 @@ fn reasoning_item_text(item: &Value) -> String {
 fn tool_call_from_function_args_done(data: &Value) -> Option<ChatToolCall> {
     let call_id = data.get("call_id")?.as_str()?.to_string();
     let name = data.get("name")?.as_str()?.to_string();
+    // NOTE (round-7 #2): we do NOT hide `analyzeImage` by name here. On an active
+    // image-agent turn the engine classifies it as the server-side ImageAnalysis
+    // tool and never emits its delta/done/item events to the stream at all, so
+    // this converter never sees them. On an INACTIVE turn `analyzeImage` is a
+    // legitimate CLIENT tool and must flow through normally — a name-only hide
+    // would wrongly swallow it.
     let arguments = data
         .get("arguments")
         .and_then(Value::as_str)
