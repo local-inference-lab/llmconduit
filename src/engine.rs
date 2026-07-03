@@ -515,11 +515,24 @@ impl Gateway {
         if !self.config.image_agent_enabled || self.config.vision_url.is_none() {
             return None;
         }
-        if request.tool_choice == Value::String("none".to_string()) {
-            return None;
-        }
-        if !crate::vision::latest_user_message_has_images(&request.input) {
-            return None;
+        // Always-active mode: inject the analyzeImage tool + IMAGE HANDLING
+        // instruction on EVERY eligible turn, not just when the latest user turn
+        // carries images. The injected head (tools block + system prefix) is then
+        // byte-identical across a session's turns, so an image arriving
+        // mid-session no longer rewrites the prompt head and re-prefills the
+        // whole history (GPU prefix cache / LMCache). It also re-strips images
+        // sitting in OLDER history turns (clients replay full history, and the
+        // stock latest-turn gate would pass those through raw to a text-only
+        // backend). Costs a constant few hundred prompt tokens per request; the
+        // `tool_choice: "none"` skip is also bypassed so that such turns keep the
+        // identical head (the model simply cannot call the tool on them).
+        if !self.config.image_agent_always_active {
+            if request.tool_choice == Value::String("none".to_string()) {
+                return None;
+            }
+            if !crate::vision::latest_user_message_has_images(&request.input) {
+                return None;
+            }
         }
         // Native-vision gating decides passthrough vs strip+offload. Candidates
         // are enumerated from the RESOLVED model (where the request lands,

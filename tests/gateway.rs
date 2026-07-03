@@ -456,6 +456,7 @@ async fn uses_configured_upstream_model_override() {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -537,6 +538,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -883,6 +885,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -949,6 +952,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1550,6 +1554,7 @@ async fn proxies_models_endpoint_with_etag() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -1620,6 +1625,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -1696,6 +1702,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -1775,6 +1782,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -1859,6 +1867,7 @@ async fn proxies_completions_endpoint_passthrough() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -2965,6 +2974,7 @@ fn test_config() -> Config {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -5774,6 +5784,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         flatten_content: true,
         max_replay_entries: 1000,
         image_agent_enabled: false,
+        image_agent_always_active: false,
         vision_url: None,
         vision_model: None,
         image_cache_max_size: 100,
@@ -6230,4 +6241,113 @@ async fn anthropic_models_advertise_glm_capabilities_for_alias_targeting_upstrea
         .find(|model| model["id"] == "qwen3")
         .expect("qwen3 entry");
     assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
+}
+
+#[tokio::test]
+async fn always_active_image_agent_injects_tool_and_prompt_on_text_only_turn() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.image_agent_enabled = true;
+    config.image_agent_always_active = true;
+    config.vision_url = Some(
+        "http://127.0.0.1:9/v1/chat/completions"
+            .parse()
+            .expect("url"),
+    );
+    config.vision_model = Some("test-vision".to_string());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("hello")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0].tools.as_ref().expect("tools injected");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.function.name.eq_ignore_ascii_case("analyzeImage")),
+        "analyzeImage must be injected on a text-only turn in always-active mode"
+    );
+    let system = &requests[0].messages[0];
+    assert_eq!(system.role, "system");
+    assert!(
+        system
+            .content
+            .as_ref()
+            .and_then(|content| content.as_str())
+            .unwrap_or_default()
+            .starts_with("CRITICAL INSTRUCTION — IMAGE HANDLING:"),
+        "image-handling prompt must prefix the system message"
+    );
+}
+
+#[tokio::test]
+async fn always_active_image_agent_strips_history_images() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.image_agent_enabled = true;
+    config.image_agent_always_active = true;
+    config.vision_url = Some(
+        "http://127.0.0.1:9/v1/chat/completions"
+            .parse()
+            .expect("url"),
+    );
+    config.vision_model = Some("test-vision".to_string());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    // Image lives in an OLDER user turn; the LATEST user turn is text-only. The
+    // stock latest-turn gate would skip the agent here and pass the raw image
+    // through to the text-only backend.
+    let history_image = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,AAAA".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            ContentItem::InputText {
+                text: "what is this?".to_string(),
+            },
+        ],
+        phase: None,
+    };
+    let assistant_reply = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "a picture".to_string(),
+        }],
+        phase: None,
+    };
+    let _ = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![
+                history_image,
+                assistant_reply,
+                user_message("thanks, another question"),
+            ]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !serialized.contains("data:image"),
+        "raw image bytes must never reach the upstream"
+    );
+    assert!(
+        serialized.contains("[Image #1]"),
+        "history image must be stripped to a placeholder"
+    );
 }

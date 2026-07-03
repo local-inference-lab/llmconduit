@@ -286,6 +286,12 @@ pub struct Config {
     /// strip/cache seam and `analyzeImage` tool injection are skipped entirely
     /// and images flow to the upstream unchanged.
     pub image_agent_enabled: bool,
+    /// Always inject the `analyzeImage` tool + image-handling system prefix on
+    /// every eligible turn (not just when the latest user turn has images), so
+    /// the prompt head stays byte-identical across a session and an image
+    /// arriving mid-session cannot invalidate the whole prefix cache. Also
+    /// re-strips images in older history turns.
+    pub image_agent_always_active: bool,
     /// OpenAI-compatible chat-completions endpoint of the vision backend the
     /// image agent forwards stripped images to. `None` disables the agent even
     /// when `image_agent_enabled` is true (no endpoint to call), matching
@@ -475,6 +481,10 @@ pub struct PersistedConfig {
     /// the gateway's text-first design is preserved unless explicitly opted in.
     #[serde(default)]
     pub image_agent_enabled: bool,
+    /// Always-on tool injection for prompt-head/prefix-cache stability; see
+    /// `Config::image_agent_always_active`.
+    #[serde(default)]
+    pub image_agent_always_active: bool,
     /// OpenAI-compatible chat-completions endpoint of the vision backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_url: Option<String>,
@@ -570,6 +580,7 @@ impl Default for PersistedConfig {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: default_image_cache_max_size(),
@@ -667,6 +678,7 @@ impl Config {
             flatten_content: config.flatten_content,
             max_replay_entries: config.max_replay_entries,
             image_agent_enabled: config.image_agent_enabled,
+            image_agent_always_active: config.image_agent_always_active,
             vision_url,
             vision_model: trim_nonempty(config.vision_model.as_deref()),
             // Floor the capacity at 1 so a misconfigured zero does not make the
@@ -1154,6 +1166,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.image_agent_enabled = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_IMAGE_AGENT_ALWAYS_ACTIVE")
+        && let Ok(parsed) = value.trim().parse::<bool>()
+    {
+        config.image_agent_always_active = parsed;
+    }
     if let Ok(value) = env::var("LLMCONDUIT_VISION_URL")
         && !value.trim().is_empty()
     {
@@ -1570,6 +1587,7 @@ mod tests {
             flatten_content: false,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1618,6 +1636,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1675,6 +1694,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1738,6 +1758,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1798,6 +1819,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1858,6 +1880,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -1939,6 +1962,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -2014,6 +2038,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -2356,6 +2381,7 @@ model_profiles:
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
@@ -2404,6 +2430,7 @@ model_profiles:
             flatten_content: true,
             max_replay_entries: 1000,
             image_agent_enabled: false,
+            image_agent_always_active: false,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,

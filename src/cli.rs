@@ -185,6 +185,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,
         image_agent_enabled: existing.image_agent_enabled,
+        image_agent_always_active: existing.image_agent_always_active,
         vision_url: existing.vision_url.clone(),
         vision_model: existing.vision_model.clone(),
         image_cache_max_size: existing.image_cache_max_size,
