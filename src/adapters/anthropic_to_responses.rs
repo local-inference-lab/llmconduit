@@ -3,7 +3,6 @@ use crate::error::AppResult;
 use crate::models::anthropic::AnthropicContent;
 use crate::models::anthropic::AnthropicContentBlock;
 use crate::models::anthropic::AnthropicImageSource;
-use crate::models::anthropic::AnthropicMessage;
 use crate::models::anthropic::AnthropicRequest;
 use crate::models::anthropic::AnthropicSystemContent;
 use crate::models::anthropic::AnthropicThinking;
@@ -30,17 +29,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         ));
     }
     let instructions = extract_system_text(&request.system);
-    // Claude Code injects hook output + system-reminders as standalone
-    // `role:"system"` items scattered through `messages[]`. Interleaved system
-    // turns break OpenAI-style chat templates (DeepSeek-V4-Flash: tool calling
-    // stops, a raw `</think>` leaks) because they expect ONE system message at
-    // position 0. Forward-merge them into the next user turn so the upstream
-    // sees a single leading system message (top-level `system` -> instructions).
-    // Forward-only (never backward) merge avoids rewriting already-sent prefix
-    // tokens, keeping KV-prefix growth append-only for the common case where a
-    // reminder precedes the next user prompt.
-    let messages = normalize_system_messages(&request.messages);
-    let input = convert_messages(&messages)?;
+    let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
     let thinking_on = matches!(
         request.thinking.as_ref(),
@@ -249,152 +238,6 @@ fn convert_messages(
         convert_message(&message.role, &message.content, &mut items)?;
     }
     Ok(items)
-}
-
-/// Forward-merge mid-conversation `system` messages into the next `user`
-/// message so the upstream chat template sees a single leading system message.
-///
-/// Claude Code injects hook output and system-reminders as standalone
-/// `role:"system"` items scattered through `messages[]`. Most chat templates
-/// (DeepSeek-V4-Flash included) only tolerate one system message at position 0;
-/// interleaved system turns corrupt tool-call and `<think>` token structure.
-///
-/// Rules:
-/// - Consecutive system messages are buffered and merged into the *next* real
-///   user turn (forward merge -> stays inside the newly appended suffix, so the
-///   already-cached KV prefix is not rewritten for the common case where a
-///   reminder is injected right before the next user prompt).
-/// - Tool-result user turns are NOT merge targets: an OpenAI tool message must
-///   immediately follow its assistant `tool_calls`, so injected context is
-///   carried *past* them (never wedged between a tool call and its result) and
-///   attached to the next real user prompt or assistant turn instead.
-/// - A system run that reaches an assistant turn (or end of transcript) with no
-///   real user to merge into is emitted as a synthetic `user` note in place.
-/// - Backward merge (into a prior user message) is deliberately avoided: it
-///   would mutate already-sent prefix tokens and bust the vLLM prefix cache.
-fn normalize_system_messages(messages: &[AnthropicMessage]) -> Vec<AnthropicMessage> {
-    let mut out: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
-    let mut pending: Vec<String> = Vec::new();
-    for message in messages {
-        match message.role.as_str() {
-            "system" => {
-                let text = system_message_text(&message.content);
-                if !text.trim().is_empty() {
-                    pending.push(text);
-                }
-            }
-            // Tool-result turns must stay adjacent to their assistant tool_call.
-            // Pass them through untouched and keep the reminder buffered so it
-            // lands *after* the tool exchange, not inside it.
-            "user" if message_has_tool_result(&message.content) => {
-                out.push(message.clone());
-            }
-            "user" if !pending.is_empty() => {
-                out.push(prepend_injected_context(message, &pending));
-                pending.clear();
-            }
-            _ => {
-                if !pending.is_empty() {
-                    // Assistant boundary (or a plain user turn with nothing
-                    // pending falls through here harmlessly): keep the reminder
-                    // at its position as a synthetic user turn.
-                    out.push(synthetic_user_note(&pending));
-                    pending.clear();
-                }
-                out.push(message.clone());
-            }
-        }
-    }
-    if !pending.is_empty() {
-        // Trailing system run (or one carried past trailing tool results).
-        out.push(synthetic_user_note(&pending));
-    }
-    out
-}
-
-/// True when a user turn carries tool-result output (a replayed `tool_result` or
-/// web-search result). Such turns must remain adjacent to the assistant
-/// `tool_calls` they answer, so injected context is never merged into them.
-fn message_has_tool_result(content: &AnthropicContent) -> bool {
-    match content {
-        AnthropicContent::Text(_) => false,
-        AnthropicContent::Blocks(blocks) => blocks.iter().any(|block| {
-            matches!(
-                block,
-                AnthropicContentBlock::ToolResult { .. }
-                    | AnthropicContentBlock::WebSearchToolResult { .. }
-            )
-        }),
-    }
-}
-
-/// Concatenate the text blocks of a `system` message (reminders are text-only).
-fn system_message_text(content: &AnthropicContent) -> String {
-    match content {
-        AnthropicContent::Text(text) => text.clone(),
-        AnthropicContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-/// Prepend buffered injected-context to a user message as a leading text block.
-fn prepend_injected_context(message: &AnthropicMessage, pending: &[String]) -> AnthropicMessage {
-    let mut blocks = match &message.content {
-        AnthropicContent::Text(text) => vec![AnthropicContentBlock::Text { text: text.clone() }],
-        AnthropicContent::Blocks(blocks) => blocks.clone(),
-    };
-    blocks.insert(
-        0,
-        AnthropicContentBlock::Text {
-            text: format_injected_context(pending),
-        },
-    );
-    AnthropicMessage {
-        role: "user".to_string(),
-        content: AnthropicContent::Blocks(blocks),
-    }
-}
-
-/// Emit buffered injected-context as a standalone synthetic `user` turn.
-fn synthetic_user_note(pending: &[String]) -> AnthropicMessage {
-    AnthropicMessage {
-        role: "user".to_string(),
-        content: AnthropicContent::Blocks(vec![AnthropicContentBlock::Text {
-            text: format_injected_context(pending),
-        }]),
-    }
-}
-
-/// Render demoted system content as user-role text.
-///
-/// Each reminder is wrapped PER-REMINDER in `<system-reminder>` tags -- Claude
-/// Code's own convention for harness-injected context, which the model already
-/// sees inline in user turns -- so it reads as injected operational context, not
-/// the user's own words (e.g. "CAVEMAN MODE ACTIVE", "tools haven't been used").
-/// Per-reminder (not one blob) preserves provenance boundaries between unrelated
-/// injections. Already-wrapped payloads pass through unchanged (no double-wrap).
-fn format_injected_context(pending: &[String]) -> String {
-    pending
-        .iter()
-        .filter_map(|text| {
-            let text = text.trim();
-            if text.is_empty() {
-                None
-            } else if text.starts_with("<system-reminder>") && text.ends_with("</system-reminder>")
-            {
-                Some(text.to_string())
-            } else {
-                Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn convert_message(
@@ -860,12 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn demotes_trailing_standalone_system_message_to_user() {
-        // A standalone `role:"system"` message in `messages[]` (CC hook/reminder
-        // injection) must NOT reach the upstream as a system-role turn -- that
-        // breaks DeepSeek's chat template. With no following user turn, it is
-        // emitted as a synthetic `user` note in place. Top-level `system` still
-        // maps to `instructions` (the single leading system message).
+    fn preserves_claude_code_system_history_role() {
         let skill_listing = concat!(
             "The following skills are available for use with the Skill tool:\n\n",
             "- deep-research: Deep research harness. Use when the user wants research.\n",
@@ -906,181 +744,8 @@ mod tests {
         assert!(matches!(
             &result.input[1],
             ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text }
-                        if text.contains("deep-research") && text.contains("<system-reminder>"))
-        ));
-    }
-
-    #[test]
-    fn forward_merges_system_into_following_user() {
-        // The dominant CC pattern: a reminder is injected right before the next
-        // user prompt. Merge forward into that user turn so we get clean
-        // user/assistant alternation and stay inside the appended suffix
-        // (append-only -> KV prefix cache preserved).
-        let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: Some(1024),
-            system: None,
-            messages: vec![
-                AnthropicMessage {
-                    role: "system".to_string(),
-                    content: AnthropicContent::Text("REMINDER-TEXT".to_string()),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: AnthropicContent::Text("real prompt".to_string()),
-                },
-            ],
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: None,
-            metadata: None,
-            thinking: None,
-            output_config: None,
-        };
-
-        let result = convert_request(request).expect("convert");
-        // Single user turn: injected context prepended, real prompt after.
-        assert_eq!(result.input.len(), 1);
-        assert!(matches!(
-            &result.input[0],
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("REMINDER-TEXT"))
-                    && matches!(&content[1], ContentItem::InputText { text } if text == "real prompt")
-        ));
-    }
-
-    #[test]
-    fn system_before_assistant_stays_in_place_as_user() {
-        // A system run followed by a non-user turn is NOT floated across the
-        // boundary (semantic drift) -- it becomes a synthetic user note in place,
-        // preserving user/assistant order.
-        let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: Some(1024),
-            system: None,
-            messages: vec![
-                AnthropicMessage {
-                    role: "system".to_string(),
-                    content: AnthropicContent::Text("SESSION-HOOK".to_string()),
-                },
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: AnthropicContent::Text("ok".to_string()),
-                },
-            ],
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: None,
-            metadata: None,
-            thinking: None,
-            output_config: None,
-        };
-
-        let result = convert_request(request).expect("convert");
-        assert_eq!(result.input.len(), 2);
-        assert!(matches!(
-            &result.input[0],
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("SESSION-HOOK"))
-        ));
-        assert!(matches!(
-            &result.input[1],
-            ResponseItem::Message { role, .. } if role == "assistant"
-        ));
-    }
-
-    #[test]
-    fn format_injected_context_wraps_per_reminder_and_guards_double_wrap() {
-        // Raw payload -> wrapped.
-        assert_eq!(
-            format_injected_context(&["raw text".to_string()]),
-            "<system-reminder>\nraw text\n</system-reminder>"
-        );
-        // Already-tagged payload -> passed through, not double-wrapped.
-        assert_eq!(
-            format_injected_context(&["<system-reminder>hi</system-reminder>".to_string()]),
-            "<system-reminder>hi</system-reminder>"
-        );
-        // Multiple reminders -> per-reminder wrap, boundaries preserved.
-        let out = format_injected_context(&["one".to_string(), "two".to_string()]);
-        assert_eq!(
-            out,
-            "<system-reminder>\none\n</system-reminder>\n<system-reminder>\ntwo\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn reminder_never_splits_assistant_tool_call_from_tool_result() {
-        // A reminder injected between an assistant tool_call and its tool_result
-        // must NOT be wedged between them (OpenAI requires the tool message to
-        // immediately follow the tool_calls). It is carried past the tool result
-        // and emitted afterward.
-        let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: Some(1024),
-            system: None,
-            messages: vec![
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: AnthropicContent::Blocks(vec![AnthropicContentBlock::ToolUse {
-                        id: "toolu_1".to_string(),
-                        name: "get_weather".to_string(),
-                        input: json!({"location": "Seattle"}),
-                    }]),
-                },
-                AnthropicMessage {
-                    role: "system".to_string(),
-                    content: AnthropicContent::Text("REMINDER-TEXT".to_string()),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: AnthropicContent::Blocks(vec![AnthropicContentBlock::ToolResult {
-                        tool_use_id: "toolu_1".to_string(),
-                        content: Some(AnthropicContent::Text("72F sunny".to_string())),
-                        is_error: None,
-                    }]),
-                },
-            ],
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: None,
-            metadata: None,
-            thinking: None,
-            output_config: None,
-        };
-
-        let result = convert_request(request).expect("convert");
-        // function_call, function_call_output (adjacent!), then the reminder.
-        assert_eq!(result.input.len(), 3);
-        assert!(matches!(
-            &result.input[0],
-            ResponseItem::FunctionCall { call_id, .. } if call_id == "toolu_1"
-        ));
-        assert!(matches!(
-            &result.input[1],
-            ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "toolu_1"
-        ));
-        assert!(matches!(
-            &result.input[2],
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("REMINDER-TEXT"))
+                if role == "system"
+                    && matches!(&content[0], ContentItem::OutputText { text } if text.contains("deep-research"))
         ));
     }
 

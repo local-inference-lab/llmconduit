@@ -10035,7 +10035,7 @@ async fn anthropic_messages_preserves_claude_code_skill_listing_as_user_input() 
 }
 
 #[tokio::test]
-async fn anthropic_messages_demotes_late_system_skill_listing_to_user() {
+async fn anthropic_messages_preserves_late_system_skill_listing_position() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
@@ -10084,11 +10084,7 @@ async fn anthropic_messages_demotes_late_system_skill_listing_to_user() {
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    // Leading system = top-level `system` -> instructions. The standalone
-    // `role:"system"` skill listing is demoted to a synthetic `user` turn in
-    // place (no following user to forward-merge into) so the upstream template
-    // sees a single leading system message.
-    assert_eq!(roles, vec!["system", "user", "user"]);
+    assert_eq!(roles, vec!["system", "user", "system"]);
     let system = messages[0]
         .content
         .as_ref()
