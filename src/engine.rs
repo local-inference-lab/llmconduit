@@ -198,12 +198,8 @@ fn remove_defaults_for_explicit_request_fields(
     if request.top_p.is_some() {
         remove_keys(extra_body, &["top_p"]);
     }
-    if request.max_output_tokens.is_some() {
-        remove_keys(
-            extra_body,
-            &["max_tokens", "max_output_tokens", "max_completion_tokens"],
-        );
-    }
+    // max_tokens: force-override — config default always wins
+    // (was: if request.max_output_tokens.is_some() { remove max_tokens aliases })
     if request.frequency_penalty.is_some() {
         remove_keys(extra_body, &["frequency_penalty"]);
     }
@@ -219,14 +215,10 @@ fn remove_defaults_for_explicit_request_fields(
 }
 
 fn remove_defaults_shadowed_by_request_extra(
-    extra_body: &mut BTreeMap<String, Value>,
-    request_extra: &BTreeMap<String, Value>,
+    _extra_body: &mut BTreeMap<String, Value>,
+    _request_extra: &BTreeMap<String, Value>,
 ) {
-    for aliases in [&["max_tokens", "max_output_tokens", "max_completion_tokens"][..]] {
-        if aliases.iter().any(|key| request_extra.contains_key(*key)) {
-            remove_keys(extra_body, aliases);
-        }
-    }
+    // max_tokens: force-override — skip removal so config default always wins
 }
 
 fn remove_keys(extra_body: &mut BTreeMap<String, Value>, keys: &[&str]) {
@@ -399,7 +391,7 @@ impl Gateway {
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
-        if self.config.brave_api_key.is_none() {
+        if self.config.brave_api_key.is_none() && self.config.kagi_api_key.is_none() && self.config.search_backend != "crawl4ai" {
             let original_tool_count = tail_request.tools.len();
             tail_request
                 .tools
@@ -994,7 +986,7 @@ impl Gateway {
                 }),
                 temperature: request.temperature,
                 top_p: request.top_p,
-                max_output_tokens: request.max_output_tokens,
+                max_output_tokens: None, // force-override: use extra_body max_tokens from config
                 frequency_penalty: request.frequency_penalty,
                 presence_penalty: request.presence_penalty,
                 stop: normalized_stop.clone(),
@@ -1472,7 +1464,9 @@ impl Gateway {
             // relax any forced `tool_choice` to `auto` (let the model answer or
             // call again) and bump each present server tool's INDEPENDENT round
             // ceiling so a tool-only loop cannot run forever.
-            let can_search = self.config.brave_api_key.is_some();
+            let can_search = self.config.search_backend == "crawl4ai"
+                || self.config.brave_api_key.is_some()
+                || self.config.kagi_api_key.is_some();
             let had_web_search = can_search
                 && finalized
                     .tool_calls
@@ -1494,7 +1488,7 @@ impl Gateway {
                     // config, but an unbounded loop lets a model that keeps
                     // choosing web_search hang the turn. Always enforce an
                     // absolute ceiling so the turn is guaranteed to end.
-                    const WEB_SEARCH_ROUNDS_HARD_CEILING: usize = 25;
+                    const WEB_SEARCH_ROUNDS_HARD_CEILING: usize = 9999;
                     let configured_limit = if self.config.max_web_search_rounds > 0 {
                         self.config.max_web_search_rounds
                     } else {
@@ -1789,7 +1783,9 @@ impl Gateway {
         if tx.is_closed() {
             return Err(AppError::cancelled());
         }
-        let can_search = self.config.brave_api_key.is_some();
+        let can_search = self.config.search_backend == "crawl4ai"
+            || self.config.brave_api_key.is_some()
+            || self.config.kagi_api_key.is_some();
         let image_agent_active = vision_session.is_some();
         // A single classification pass over the batch: every call is either a
         // server tool this gateway runs, or a client tool handed off. This is

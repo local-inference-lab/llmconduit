@@ -277,6 +277,28 @@ pub struct Config {
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
+    /// Kagi Search API base URL.
+    pub kagi_base_url: Url,
+    /// Kagi Search API key (Bearer token).
+    pub kagi_api_key: Option<String>,
+    /// Maximum number of Kagi search results.
+    pub kagi_max_results: usize,
+    /// Search backend selection: "brave" (Brave Search API) or "crawl4ai"
+    /// (SearXNG + crawl4ai content extraction). Defaults to "brave" for
+    /// backward compatibility; set to "crawl4ai" for a free self-hosted stack.
+    pub search_backend: String,
+    /// SearXNG instance base URL for the crawl4ai search backend.
+    pub searxng_base_url: Url,
+    /// crawl4ai Docker API server base URL.
+    pub crawl4ai_base_url: Url,
+    /// Bearer token for the crawl4ai API server (optional, local-only servers
+    /// generate one at startup if unset).
+    pub crawl4ai_api_token: Option<String>,
+    /// Number of SearXNG results whose URLs are sent to crawl4ai for full-page
+    /// extraction. Higher = richer context but slower.
+    pub crawl4ai_max_crawl_urls: usize,
+    /// Maximum characters of crawled Markdown included per result.
+    pub crawl4ai_content_max_chars: usize,
     pub request_timeout: Duration,
     pub connect_timeout_secs: u64,
     pub max_web_search_rounds: usize,
@@ -467,6 +489,31 @@ pub struct PersistedConfig {
     pub brave_api_key: Option<String>,
     #[serde(default = "default_brave_max_results")]
     pub brave_max_results: usize,
+    /// Kagi Search API base URL.
+    #[serde(default = "default_kagi_base_url")]
+    pub kagi_base_url: String,
+    /// Kagi Search API key (Bearer token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kagi_api_key: Option<String>,
+    /// Maximum number of Kagi search results.
+    #[serde(default = "default_kagi_max_results")]
+    pub kagi_max_results: usize,
+    /// Search backend: "brave" or "crawl4ai". Defaults to "brave" for
+    /// backward compatibility.
+    #[serde(default = "default_search_backend")]
+    pub search_backend: String,
+    /// SearXNG base URL (crawl4ai backend search step).
+    #[serde(default = "default_searxng_base_url")]
+    pub searxng_base_url: String,
+    /// crawl4ai Docker API server base URL.
+    #[serde(default = "default_crawl4ai_base_url")]
+    pub crawl4ai_base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crawl4ai_api_token: Option<String>,
+    #[serde(default = "default_crawl4ai_max_crawl_urls")]
+    pub crawl4ai_max_crawl_urls: usize,
+    #[serde(default = "default_crawl4ai_content_max_chars")]
+    pub crawl4ai_content_max_chars: usize,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
@@ -517,6 +564,34 @@ fn default_brave_base_url() -> String {
 
 fn default_brave_max_results() -> usize {
     5
+}
+
+fn default_kagi_base_url() -> String {
+    "https://kagi.com/api/v1".to_string()
+}
+
+fn default_kagi_max_results() -> usize {
+    5
+}
+
+fn default_search_backend() -> String {
+    "brave".to_string()
+}
+
+fn default_searxng_base_url() -> String {
+    "http://localhost:4040".to_string()
+}
+
+fn default_crawl4ai_base_url() -> String {
+    "http://localhost:11235".to_string()
+}
+
+fn default_crawl4ai_max_crawl_urls() -> usize {
+    3
+}
+
+fn default_crawl4ai_content_max_chars() -> usize {
+    8000
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -574,6 +649,15 @@ impl Default for PersistedConfig {
             brave_base_url: default_brave_base_url(),
             brave_api_key: None,
             brave_max_results: default_brave_max_results(),
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: default_search_backend(),
+            searxng_base_url: default_searxng_base_url(),
+            crawl4ai_base_url: default_crawl4ai_base_url(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: default_crawl4ai_max_crawl_urls(),
+            crawl4ai_content_max_chars: default_crawl4ai_content_max_chars(),
             request_timeout_secs: default_request_timeout_secs(),
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -613,6 +697,16 @@ impl Config {
             .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
+        let kagi_base_url = Url::parse(&config.kagi_base_url)
+            .map_err(|err| format!("invalid kagi_base_url: {err}"))?;
+        let searxng_base_url = Url::parse(&config.searxng_base_url)
+            .map_err(|err| format!("invalid searxng_base_url: {err}"))?;
+        let crawl4ai_base_url = Url::parse(&config.crawl4ai_base_url)
+            .map_err(|err| format!("invalid crawl4ai_base_url: {err}"))?;
+        let search_backend = match config.search_backend.trim().to_lowercase().as_str() {
+            "brave" | "crawl4ai" | "kagi" => config.search_backend.trim().to_lowercase(),
+            other => return Err(format!("invalid search_backend: '{other}' (expected 'brave', 'crawl4ai', or 'kagi')")),
+        };
         let default_reasoning_effort =
             normalize_default_reasoning_effort(&config.default_reasoning_effort);
         let fallback_upstreams = config
@@ -672,6 +766,23 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             brave_max_results: config.brave_max_results,
+            kagi_base_url,
+            kagi_api_key: config
+                .kagi_api_key
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            kagi_max_results: config.kagi_max_results,
+            search_backend,
+            searxng_base_url,
+            crawl4ai_base_url,
+            crawl4ai_api_token: config
+                .crawl4ai_api_token
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            crawl4ai_max_crawl_urls: config.crawl4ai_max_crawl_urls,
+            crawl4ai_content_max_chars: config.crawl4ai_content_max_chars,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
             connect_timeout_secs: config.connect_timeout_secs,
             max_web_search_rounds: config.max_web_search_rounds,
@@ -1226,7 +1337,14 @@ mod tests {
     use super::ThinkingCap;
     use super::apply_env_overrides;
     use super::default_config_path;
+    use super::default_crawl4ai_base_url;
+    use super::default_crawl4ai_content_max_chars;
+    use super::default_crawl4ai_max_crawl_urls;
+    use super::default_kagi_base_url;
+    use super::default_kagi_max_results;
     use super::default_reasoning_effort;
+    use super::default_search_backend;
+    use super::default_searxng_base_url;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
@@ -1581,6 +1699,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: default_search_backend(),
+            searxng_base_url: default_searxng_base_url(),
+            crawl4ai_base_url: default_crawl4ai_base_url(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: default_crawl4ai_max_crawl_urls(),
+            crawl4ai_content_max_chars: default_crawl4ai_content_max_chars(),
             request_timeout_secs: 45,
             connect_timeout_secs: 10,
             max_web_search_rounds: 10,
@@ -1630,6 +1757,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -1688,6 +1824,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -1752,6 +1897,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -1813,6 +1967,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -1874,6 +2037,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -1956,6 +2128,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -2032,6 +2213,15 @@ mod tests {
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -2375,6 +2565,15 @@ model_profiles:
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
@@ -2424,6 +2623,15 @@ model_profiles:
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
+            kagi_base_url: default_kagi_base_url(),
+            kagi_api_key: None,
+            kagi_max_results: default_kagi_max_results(),
+            search_backend: "brave".to_string(),
+            searxng_base_url: "http://localhost:4040".to_string(),
+            crawl4ai_base_url: "http://localhost:11235".to_string(),
+            crawl4ai_api_token: None,
+            crawl4ai_max_crawl_urls: 3,
+            crawl4ai_content_max_chars: 8000,
             request_timeout_secs: 60,
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,

@@ -22,6 +22,9 @@ use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
 use crate::search::BraveSearchClient;
+use crate::search::Crawl4AISearchClient;
+use crate::search::KagiSearchClient;
+use crate::search::SearchClient;
 use crate::upstream::FailoverUpstreamClient;
 use crate::upstream::FailoverUpstreamProvider;
 use crate::upstream::ReqwestUpstreamClient;
@@ -148,7 +151,13 @@ pub fn build_app_with_gateway_and_options(
             ))
         }
     };
-    let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
+    let search: Arc<dyn SearchClient> = if config.search_backend == "crawl4ai" {
+        Arc::new(Crawl4AISearchClient::new(http_client.clone(), config.clone()))
+    } else if config.search_backend == "kagi" {
+        Arc::new(KagiSearchClient::new(http_client.clone(), config.clone()))
+    } else {
+        Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()))
+    };
     // G4 image agent: a vision client + a shared per-session image cache. The
     // cache is constructed once and shared so the strip seam (in
     // `stream_responses`) and the executor (`run_image_analysis`) see the same
