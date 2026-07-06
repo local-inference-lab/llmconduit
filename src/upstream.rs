@@ -1583,7 +1583,58 @@ pub(crate) fn sanitize_chat_request(
             }
         }
     }
+    canonicalize_chat_request_json_values(&mut request);
     request
+}
+
+fn canonicalize_chat_request_json_values(request: &mut ChatCompletionRequest) {
+    for message in &mut request.messages {
+        if let Some(content) = &mut message.content {
+            canonicalize_json_value(content);
+        }
+        if let Some(tool_calls) = &mut message.tool_calls {
+            for tool_call in tool_calls {
+                if let Some(arguments) = &mut tool_call.function.arguments {
+                    canonicalize_json_value(arguments);
+                }
+            }
+        }
+    }
+    if let Some(tools) = &mut request.tools {
+        for tool in tools {
+            if let Some(parameters) = &mut tool.function.parameters {
+                canonicalize_json_value(parameters);
+            }
+        }
+    }
+    if let Some(tool_choice) = &mut request.tool_choice {
+        canonicalize_json_value(tool_choice);
+    }
+    if let Some(response_format) = &mut request.response_format {
+        canonicalize_json_value(response_format);
+    }
+    for value in request.extra_body.values_mut() {
+        canonicalize_json_value(value);
+    }
+}
+
+fn canonicalize_json_value(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_json_value(item);
+            }
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<_> = std::mem::take(map).into_iter().collect();
+            for (_, entry_value) in &mut entries {
+                canonicalize_json_value(entry_value);
+            }
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            map.extend(entries);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Value> {
@@ -1645,7 +1696,8 @@ fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
     truncate_for_error(&crate::vision::redact_image_uris(body), max)
 }
 
-fn stringify_json_value(value: Value) -> Value {
+fn stringify_json_value(mut value: Value) -> Value {
+    canonicalize_json_value(&mut value);
     Value::String(serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()))
 }
 
@@ -1657,7 +1709,11 @@ mod tests {
     use super::extract_supported_model_ids;
     use super::sanitize_chat_request;
     use crate::models::chat::ChatCompletionRequest;
+    use crate::models::chat::ChatFunctionCall;
     use crate::models::chat::ChatMessage;
+    use crate::models::chat::ChatTool;
+    use crate::models::chat::ChatToolCall;
+    use crate::models::chat::ChatToolDefinition;
     use serde_json::Value;
     use std::collections::BTreeMap;
 
@@ -1768,6 +1824,160 @@ mod tests {
                 "{\"file_path\": \"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
             )
         );
+    }
+
+    fn ordered_object(entries: Vec<(&str, Value)>) -> Value {
+        let mut map = serde_json::Map::new();
+        for (key, value) in entries {
+            map.insert(key.to_string(), value);
+        }
+        Value::Object(map)
+    }
+
+    #[test]
+    fn sanitize_chat_request_canonicalizes_preserve_order_sensitive_json_values() {
+        let make_request = |reverse: bool| {
+            let prop_a = ordered_object(vec![("type", Value::String("string".to_string()))]);
+            let prop_z = ordered_object(vec![("type", Value::String("number".to_string()))]);
+            let properties = if reverse {
+                ordered_object(vec![("z", prop_z.clone()), ("a", prop_a.clone())])
+            } else {
+                ordered_object(vec![("a", prop_a.clone()), ("z", prop_z.clone())])
+            };
+            let parameters = if reverse {
+                ordered_object(vec![
+                    ("required", serde_json::json!(["a", "z"])),
+                    ("type", Value::String("object".to_string())),
+                    ("properties", properties),
+                ])
+            } else {
+                ordered_object(vec![
+                    ("type", Value::String("object".to_string())),
+                    ("properties", properties),
+                    ("required", serde_json::json!(["a", "z"])),
+                ])
+            };
+            let tool_choice = if reverse {
+                ordered_object(vec![
+                    (
+                        "function",
+                        ordered_object(vec![("name", Value::String("lookup".to_string()))]),
+                    ),
+                    ("type", Value::String("function".to_string())),
+                ])
+            } else {
+                ordered_object(vec![
+                    ("type", Value::String("function".to_string())),
+                    (
+                        "function",
+                        ordered_object(vec![("name", Value::String("lookup".to_string()))]),
+                    ),
+                ])
+            };
+            let message_content = if reverse {
+                ordered_object(vec![
+                    ("z", Value::String("last".to_string())),
+                    ("a", Value::String("first".to_string())),
+                ])
+            } else {
+                ordered_object(vec![
+                    ("a", Value::String("first".to_string())),
+                    ("z", Value::String("last".to_string())),
+                ])
+            };
+            let tool_arguments = if reverse {
+                ordered_object(vec![
+                    ("z", Value::String("last".to_string())),
+                    ("a", Value::String("first".to_string())),
+                ])
+            } else {
+                ordered_object(vec![
+                    ("a", Value::String("first".to_string())),
+                    ("z", Value::String("last".to_string())),
+                ])
+            };
+            let mut extra_body = BTreeMap::new();
+            extra_body.insert(
+                "chat_template_kwargs".to_string(),
+                if reverse {
+                    ordered_object(vec![
+                        ("enable_thinking", Value::Bool(true)),
+                        ("clear_thinking", Value::Bool(false)),
+                    ])
+                } else {
+                    ordered_object(vec![
+                        ("clear_thinking", Value::Bool(false)),
+                        ("enable_thinking", Value::Bool(true)),
+                    ])
+                },
+            );
+            ChatCompletionRequest {
+                model: "grok-4".to_string(),
+                messages: vec![
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(message_content),
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                        thinking: None,
+                        tool_calls: None,
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                        thinking: None,
+                        tool_calls: Some(vec![ChatToolCall {
+                            id: Some("call_1".to_string()),
+                            index: Some(0),
+                            kind: "function".to_string(),
+                            function: ChatFunctionCall {
+                                name: Some("lookup".to_string()),
+                                arguments: Some(tool_arguments),
+                            },
+                        }]),
+                    },
+                ],
+                stream: true,
+                tools: Some(vec![ChatTool {
+                    kind: "function".to_string(),
+                    function: ChatToolDefinition {
+                        name: "lookup".to_string(),
+                        description: String::new(),
+                        parameters: Some(parameters),
+                        strict: false,
+                    },
+                }]),
+                tool_choice: Some(tool_choice),
+                parallel_tool_calls: false,
+                reasoning_effort: None,
+                response_format: None,
+                stream_options: None,
+                temperature: None,
+                top_p: None,
+                max_output_tokens: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop: None,
+                extra_body,
+            }
+        };
+
+        let canonical_a = sanitize_chat_request(make_request(false), true);
+        let canonical_b = sanitize_chat_request(make_request(true), true);
+
+        assert_eq!(
+            serde_json::to_string(&canonical_a).expect("serialize canonical request A"),
+            serde_json::to_string(&canonical_b).expect("serialize canonical request B"),
+            "preserve_order-sensitive Value insertion order must not leak to upstream bytes"
+        );
+        let body = serde_json::to_string(&canonical_a).expect("serialize body");
+        assert!(body.contains(r#""parameters":{"properties":{"a":"#));
+        assert!(body.contains(r#""chat_template_kwargs":{"clear_thinking":false,"enable_thinking":true}"#));
+        assert!(body.contains(r#""arguments":"{\"a\":\"first\",\"z\":\"last\"}""#));
     }
 
     #[test]
