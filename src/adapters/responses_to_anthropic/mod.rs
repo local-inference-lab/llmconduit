@@ -133,14 +133,17 @@ impl AnthropicStreamConverter {
             "response.output_item.added" => self.handle_item_added(&event.data, &mut output),
             "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                if !self.suppress_reasoning {
+                if self.suppress_reasoning {
+                    self.ensure_started(&mut output);
+                    if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
+                        self.record_output_delta(delta);
+                    }
+                } else {
                     self.handle_reasoning_delta(&event.data, &mut output);
                 }
             }
-            "response.reasoning_summary_text.signature_delta" => {
-                if !self.suppress_reasoning {
-                    self.handle_reasoning_signature_delta(&event.data, &mut output);
-                }
+            "response.reasoning_summary_text.signature_delta" if !self.suppress_reasoning => {
+                self.handle_reasoning_signature_delta(&event.data, &mut output);
             }
             "response.function_call_arguments.delta" => {
                 self.handle_function_call_arguments_delta(&event.data, &mut output);

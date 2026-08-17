@@ -686,6 +686,41 @@ fn terminal_delta_carries_reasoning_output_tokens() {
 }
 
 #[test]
+fn suppressed_reasoning_contributes_to_fallback_output_tokens() {
+    let mut converter =
+        AnthropicStreamConverter::with_reasoning_suppression("claude-3".to_string(), true);
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event(),
+        item_added_event("reasoning", ""),
+        reasoning_delta_event("abcdefgh"),
+        reasoning_signature_delta_event("signature-is-not-output-text"),
+        item_done_event("reasoning", json!({})),
+        completed_event(),
+    ]
+    .iter()
+    .flat_map(|event| converter.convert(event))
+    .collect();
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AnthropicStreamEvent::ContentBlockStart { .. }
+                | AnthropicStreamEvent::ContentBlockDelta { .. }
+                | AnthropicStreamEvent::ContentBlockStop { .. }
+        )),
+        "suppressed reasoning must not produce content blocks"
+    );
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            AnthropicStreamEvent::MessageDelta { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .expect("terminal message_delta");
+    assert_eq!(usage.output_tokens, Some(2));
+}
+
+#[test]
 fn completed_without_upstream_usage_uses_bookkeeping_output_tokens() {
     // When upstream never reports usage (no `response.usage` on the terminal
     // event), the terminal `output_tokens` must still be non-zero -- sourced
