@@ -55,8 +55,15 @@ pub struct AnthropicStreamCollector {
 
 impl AnthropicStreamCollector {
     pub fn new(model: String) -> Self {
+        Self::with_reasoning_suppression(model, false)
+    }
+
+    pub fn with_reasoning_suppression(model: String, suppress_reasoning: bool) -> Self {
         Self {
-            inner: AnthropicStreamConverter::new(model.clone()),
+            inner: AnthropicStreamConverter::with_reasoning_suppression(
+                model.clone(),
+                suppress_reasoning,
+            ),
             message_id: None,
             model: Some(model),
             stop_reason: None,

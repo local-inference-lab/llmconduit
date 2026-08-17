@@ -27,6 +27,7 @@ use crate::engine::Gateway;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::anthropic::AnthropicRequest;
+use crate::models::anthropic::AnthropicThinking;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::chat::normalize_stop;
 use crate::models::responses::ResponsesRequest;
@@ -1467,15 +1468,19 @@ async fn handle_post_messages(
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
+    let suppress_reasoning = !matches!(
+        request.thinking.as_ref(),
+        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. })
+    );
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway
         .stream_responses_with_api_call_id(responses_request, api_call_id)
         .await?;
 
     let response = if wants_stream {
-        stream_anthropic_response(model.clone(), stream)?
+        stream_anthropic_response(model.clone(), suppress_reasoning, stream)?
     } else {
-        collect_anthropic_response(model.clone(), stream).await?
+        collect_anthropic_response(model.clone(), suppress_reasoning, stream).await?
     };
     Ok(with_model_headers(response, &requested, &model))
 }
@@ -1705,11 +1710,13 @@ fn stream_chat_completions_response(
 
 fn stream_anthropic_response(
     model: String,
+    suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> AppResult<Response> {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
-        let mut converter = AnthropicStreamConverter::new(model);
+        let mut converter =
+            AnthropicStreamConverter::with_reasoning_suppression(model, suppress_reasoning);
         let mut stream = std::pin::pin!(stream);
         while let Some(event) = stream.next().await {
             let anthropic_events = converter.convert(&event);
@@ -1880,9 +1887,11 @@ async fn collect_chat_completions_response(
 
 async fn collect_anthropic_response(
     model: String,
+    suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> AppResult<Response> {
-    let mut collector = AnthropicStreamCollector::new(model);
+    let mut collector =
+        AnthropicStreamCollector::with_reasoning_suppression(model, suppress_reasoning);
     let mut stream = std::pin::pin!(stream);
     while let Some(event) = stream.next().await {
         collector.process(&event);

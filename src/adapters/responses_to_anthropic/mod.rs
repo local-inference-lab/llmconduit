@@ -88,10 +88,17 @@ pub struct AnthropicStreamConverter {
     // (it owns block indices + `open_block`); the converter delegates the
     // buffer/hold/promote DECISIONS to `self.reasoning`.
     reasoning: ReasoningEgressState,
+    /// Keep backend reasoning available to the parser while omitting it from an
+    /// Anthropic response whose request did not enable thinking.
+    suppress_reasoning: bool,
 }
 
 impl AnthropicStreamConverter {
     pub fn new(model: String) -> Self {
+        Self::with_reasoning_suppression(model, false)
+    }
+
+    pub fn with_reasoning_suppression(model: String, suppress_reasoning: bool) -> Self {
         Self {
             model,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -106,6 +113,7 @@ impl AnthropicStreamConverter {
             emitted_tool_call_ids: HashSet::new(),
             closed_tool_call_ids: HashSet::new(),
             reasoning: ReasoningEgressState::default(),
+            suppress_reasoning,
         }
     }
 
@@ -125,10 +133,14 @@ impl AnthropicStreamConverter {
             "response.output_item.added" => self.handle_item_added(&event.data, &mut output),
             "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                self.handle_reasoning_delta(&event.data, &mut output);
+                if !self.suppress_reasoning {
+                    self.handle_reasoning_delta(&event.data, &mut output);
+                }
             }
             "response.reasoning_summary_text.signature_delta" => {
-                self.handle_reasoning_signature_delta(&event.data, &mut output);
+                if !self.suppress_reasoning {
+                    self.handle_reasoning_signature_delta(&event.data, &mut output);
+                }
             }
             "response.function_call_arguments.delta" => {
                 self.handle_function_call_arguments_delta(&event.data, &mut output);

@@ -818,6 +818,32 @@ fn collector_preserves_thinking_signature() {
 }
 
 #[test]
+fn collector_suppresses_unrequested_reasoning() {
+    let mut collector =
+        AnthropicStreamCollector::with_reasoning_suppression("claude-3".to_string(), true);
+    for event in [
+        created_event(),
+        item_added_event("reasoning", ""),
+        reasoning_delta_event("private chain"),
+        reasoning_signature_delta_event("sig_123"),
+        item_done_event("reasoning", json!({})),
+        item_added_event("message", "assistant"),
+        text_delta_event("OK"),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ] {
+        collector.process(&event);
+    }
+
+    let response = collector.into_response().expect("response");
+    assert_eq!(response.content.len(), 1);
+    assert!(matches!(
+        &response.content[0],
+        AnthropicResponseContentBlock::Text { text } if text == "OK"
+    ));
+}
+
+#[test]
 fn skips_web_search_call_events() {
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
     let events: Vec<AnthropicStreamEvent> = [
