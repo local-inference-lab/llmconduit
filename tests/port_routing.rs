@@ -428,6 +428,18 @@ async fn chat_kimi_reasoning_surfaces_when_client_requested() {
     );
 }
 
+/// `reasoning_effort: none` keeps Kimi reasoning enabled upstream for parser
+/// correctness while omitting the reasoning channel from Chat output.
+#[tokio::test]
+async fn chat_kimi_reasoning_effort_none_suppresses_reasoning_output() {
+    let (body, reasoning) = run_chat_path(chat_request("kimi-k2-instruct", Some("none"))).await;
+    assert_eq!(body["chat_template_kwargs"]["thinking"], json!(true));
+    assert!(
+        reasoning.is_empty(),
+        "reasoning_effort=none surfaced reasoning_content: {reasoning:?}"
+    );
+}
+
 /// A NON-family (non-Kimi/non-DeepSeek) backend: a Chat client that did NOT
 /// request reasoning sees NO reasoning_content. Suppression is family-
 /// independent — it fires off the inbound request alone, not the backend family.

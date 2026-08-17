@@ -562,23 +562,26 @@ fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'stat
     }
 }
 
-/// Whether a Chat-Completions inbound request asked for reasoning, either via
-/// the top-level `reasoning_effort` field or an explicit thinking knob in
-/// `chat_template_kwargs` (`thinking` / `enable_thinking`). When true, forced
-/// family reasoning is NOT considered "unrequested" and Chat output is left
-/// untouched.
+/// Whether a Chat-Completions inbound request asked to receive reasoning.
+/// `reasoning_effort: none` keeps the backend reasoning parser active but
+/// suppresses its reasoning channel at the client boundary. Other explicit
+/// effort values and explicit thinking knobs request the reasoning channel.
 fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
-    if request.reasoning_effort.is_some() {
-        return true;
+    if let Some(effort) = request.reasoning_effort.as_deref() {
+        return !effort.trim().eq_ignore_ascii_case("none");
     }
     request
         .extra_body
         .get("chat_template_kwargs")
         .and_then(Value::as_object)
         .is_some_and(|kwargs| {
+            let reasoning_effort_requested = kwargs
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .is_some_and(|effort| !effort.trim().eq_ignore_ascii_case("none"));
             kwargs.contains_key("thinking")
                 || kwargs.contains_key("enable_thinking")
-                || kwargs.contains_key("reasoning_effort")
+                || reasoning_effort_requested
         })
 }
 
@@ -1035,10 +1038,11 @@ impl Gateway {
     /// never asked for reasoning must never receive server-side chain-of-thought
     /// (AGENTS.md: do not leak server-side internals to Chat).
     ///
-    /// The client is considered to have requested reasoning if it sent
-    /// `reasoning_effort` OR explicitly set a thinking knob (`thinking` /
-    /// `enable_thinking`) in its `chat_template_kwargs` — in those cases
-    /// `reasoning_content` is surfaced unchanged.
+    /// The client is considered to have requested reasoning if it sent a
+    /// non-`none` `reasoning_effort` value OR explicitly set a thinking knob
+    /// (`thinking` / `enable_thinking`) in its `chat_template_kwargs`. A
+    /// `reasoning_effort` value of `none` keeps forced backend reasoning out of
+    /// `reasoning_content`.
     pub fn chat_reasoning_suppressed(&self, request: &ChatCompletionRequest) -> bool {
         !chat_request_requested_reasoning(request)
     }
