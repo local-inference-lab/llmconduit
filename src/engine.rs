@@ -562,10 +562,13 @@ fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'stat
     }
 }
 
-/// Whether a Chat-Completions inbound request asked to receive reasoning.
-/// `reasoning_effort: none` keeps the backend reasoning parser active but
-/// suppresses its reasoning channel at the client boundary. Other explicit
-/// effort values and explicit thinking knobs request the reasoning channel.
+/// Whether a Chat-Completions request asked to receive reasoning output.
+///
+/// The typed `reasoning_effort` field is authoritative when present. In
+/// particular, `reasoning_effort: none` suppresses the client-visible reasoning
+/// channel even if provider-specific `chat_template_kwargs` keep thinking
+/// enabled for backend parser correctness. Provider-specific thinking controls
+/// determine output visibility only when the typed field is absent.
 fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
     if let Some(effort) = request.reasoning_effort.as_deref() {
         return !effort.trim().eq_ignore_ascii_case("none");
@@ -1038,11 +1041,12 @@ impl Gateway {
     /// never asked for reasoning must never receive server-side chain-of-thought
     /// (AGENTS.md: do not leak server-side internals to Chat).
     ///
-    /// The client is considered to have requested reasoning if it sent a
-    /// non-`none` `reasoning_effort` value OR explicitly set a thinking knob
-    /// (`thinking` / `enable_thinking`) in its `chat_template_kwargs`. A
-    /// `reasoning_effort` value of `none` keeps forced backend reasoning out of
-    /// `reasoning_content`.
+    /// A present top-level `reasoning_effort` value is authoritative: `none`
+    /// suppresses output and every other value requests it. When the typed
+    /// field is absent, an explicit `thinking`, `enable_thinking`, or non-`none`
+    /// `reasoning_effort` value in `chat_template_kwargs` requests reasoning.
+    /// This precedence lets a backend keep thinking enabled for parser
+    /// correctness without overriding the client's output-visibility choice.
     pub fn chat_reasoning_suppressed(&self, request: &ChatCompletionRequest) -> bool {
         !chat_request_requested_reasoning(request)
     }

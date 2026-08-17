@@ -440,6 +440,25 @@ async fn chat_kimi_reasoning_effort_none_suppresses_reasoning_output() {
     );
 }
 
+/// The typed output-control field has precedence over provider-specific
+/// backend controls. A Kimi client may explicitly keep backend thinking on
+/// while forbidding the reasoning channel in the returned Chat response.
+#[tokio::test]
+async fn chat_reasoning_effort_none_overrides_explicit_thinking_knob() {
+    let mut request = chat_request("kimi-k2-instruct", Some("none"));
+    request.extra_body.insert(
+        "chat_template_kwargs".to_string(),
+        json!({"thinking": true}),
+    );
+
+    let (body, reasoning) = run_chat_path(request).await;
+    assert_eq!(body["chat_template_kwargs"]["thinking"], json!(true));
+    assert!(
+        reasoning.is_empty(),
+        "reasoning_effort=none must override the backend thinking knob: {reasoning:?}"
+    );
+}
+
 /// A NON-family (non-Kimi/non-DeepSeek) backend: a Chat client that did NOT
 /// request reasoning sees NO reasoning_content. Suppression is family-
 /// independent — it fires off the inbound request alone, not the backend family.
