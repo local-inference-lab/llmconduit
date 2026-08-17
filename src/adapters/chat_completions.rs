@@ -365,14 +365,18 @@ impl ChatSseEvent {
     }
 }
 
+struct ChatToolStreamState {
+    index: usize,
+    name_emitted: bool,
+}
+
 pub struct ChatCompletionStreamConverter {
     id: Option<String>,
     model: String,
     created: i64,
     include_usage: bool,
     role_sent: bool,
-    emitted_tool_calls: HashMap<String, usize>,
-    pending_tool_arguments: HashMap<String, String>,
+    emitted_tool_calls: HashMap<String, ChatToolStreamState>,
     /// When true, drop `reasoning_content` deltas: reasoning was FORCED by
     /// family injection (e.g. Kimi `thinking=true`) for a Chat client that did
     /// NOT request it, and must not leak server-side internals (G2, Finding 2).
@@ -397,7 +401,6 @@ impl ChatCompletionStreamConverter {
             include_usage,
             role_sent: false,
             emitted_tool_calls: HashMap::new(),
-            pending_tool_arguments: HashMap::new(),
             suppress_reasoning,
         }
     }
@@ -450,10 +453,12 @@ impl ChatCompletionStreamConverter {
                     event.data.get("call_id").and_then(Value::as_str),
                     event.data.get("delta").and_then(Value::as_str),
                 ) {
-                    self.pending_tool_arguments
-                        .entry(call_id.to_string())
-                        .or_default()
-                        .push_str(delta);
+                    self.emit_tool_argument_delta(
+                        call_id,
+                        event.data.get("name").and_then(Value::as_str),
+                        delta,
+                        &mut output,
+                    );
                 }
             }
             "response.function_call_arguments.done" => {
@@ -513,21 +518,88 @@ impl ChatCompletionStreamConverter {
         }])));
     }
 
+    fn emit_tool_argument_delta(
+        &mut self,
+        call_id: &str,
+        name: Option<&str>,
+        delta: &str,
+        output: &mut Vec<ChatSseEvent>,
+    ) {
+        let (index, first_delta) = self.register_tool_call(call_id);
+        let name = self.take_unemitted_tool_name(call_id, name);
+        self.push_tool_call(
+            ChatToolCall {
+                id: first_delta.then(|| call_id.to_string()),
+                index: Some(index),
+                kind: "function".to_string(),
+                function: ChatFunctionCall {
+                    name,
+                    arguments: Some(Value::String(delta.to_string())),
+                },
+            },
+            output,
+        );
+    }
+
     fn emit_tool_call(&mut self, mut tool_call: ChatToolCall, output: &mut Vec<ChatSseEvent>) {
         let Some(call_id) = tool_call.id.clone() else {
             return;
         };
-        if self.emitted_tool_calls.contains_key(&call_id) {
+
+        if let Some(state) = self.emitted_tool_calls.get_mut(&call_id) {
+            let Some(name) = tool_call.function.name.take() else {
+                return;
+            };
+            if state.name_emitted {
+                return;
+            }
+            state.name_emitted = true;
+            tool_call.id = None;
+            tool_call.index = Some(state.index);
+            tool_call.function.name = Some(name);
+            tool_call.function.arguments = None;
+            self.push_tool_call(tool_call, output);
             return;
         }
-        if tool_call.function.arguments.is_none()
-            && let Some(arguments) = self.pending_tool_arguments.remove(&call_id)
-        {
-            tool_call.function.arguments = Some(Value::String(arguments));
-        }
+
         let next_index = self.emitted_tool_calls.len();
-        let index = *self.emitted_tool_calls.entry(call_id).or_insert(next_index);
-        tool_call.index = Some(index);
+        self.emitted_tool_calls.insert(
+            call_id,
+            ChatToolStreamState {
+                index: next_index,
+                name_emitted: tool_call.function.name.is_some(),
+            },
+        );
+        tool_call.index = Some(next_index);
+        self.push_tool_call(tool_call, output);
+    }
+
+    fn register_tool_call(&mut self, call_id: &str) -> (usize, bool) {
+        if let Some(state) = self.emitted_tool_calls.get(call_id) {
+            return (state.index, false);
+        }
+        let index = self.emitted_tool_calls.len();
+        self.emitted_tool_calls.insert(
+            call_id.to_string(),
+            ChatToolStreamState {
+                index,
+                name_emitted: false,
+            },
+        );
+        (index, true)
+    }
+
+    fn take_unemitted_tool_name(&mut self, call_id: &str, name: Option<&str>) -> Option<String> {
+        let name = name?;
+        let state = self.emitted_tool_calls.get_mut(call_id)?;
+        if state.name_emitted {
+            return None;
+        }
+        state.name_emitted = true;
+        Some(name.to_string())
+    }
+
+    fn push_tool_call(&mut self, tool_call: ChatToolCall, output: &mut Vec<ChatSseEvent>) {
         self.ensure_role_chunk(output);
         output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
             index: 0,
@@ -1143,5 +1215,125 @@ mod tests {
     #[test]
     fn collected_keeps_reasoning_when_not_suppressed() {
         assert_eq!(collected_reasoning(false), Some("hidden".to_string()));
+    }
+
+    fn function_arguments_delta(call_id: &str, name: Option<&str>, delta: &str) -> SseEvent {
+        SseEvent {
+            event: "response.function_call_arguments.delta".to_string(),
+            data: json!({
+                "call_id": call_id,
+                "name": name,
+                "delta": delta,
+            }),
+        }
+    }
+
+    fn function_arguments_done(call_id: &str, name: &str, arguments: &str) -> SseEvent {
+        SseEvent {
+            event: "response.function_call_arguments.done".to_string(),
+            data: json!({
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }),
+        }
+    }
+
+    fn function_output_item_done(call_id: &str, name: &str, arguments: &str) -> SseEvent {
+        SseEvent {
+            event: "response.output_item.done".to_string(),
+            data: json!({
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }),
+        }
+    }
+
+    fn streamed_tool_calls(events: &[SseEvent]) -> Vec<Value> {
+        let mut converter = ChatCompletionStreamConverter::new("model".to_string(), false);
+        events
+            .iter()
+            .flat_map(|event| converter.convert(event))
+            .filter_map(|event| match event {
+                ChatSseEvent::Data(value) => value["choices"][0]["delta"]["tool_calls"][0]
+                    .as_object()
+                    .map(|_| value["choices"][0]["delta"]["tool_calls"][0].clone()),
+                ChatSseEvent::Done => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_forwards_each_function_argument_delta_without_terminal_duplication() {
+        let calls = streamed_tool_calls(&[
+            function_arguments_delta("call_1", Some("write_file"), r#"{"path":"#),
+            function_arguments_delta("call_1", Some("write_file"), r#"/tmp/x"}"#),
+            function_arguments_done("call_1", "write_file", r#"{"path":"/tmp/x"}"#),
+            function_output_item_done("call_1", "write_file", r#"{"path":"/tmp/x"}"#),
+        ]);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "write_file");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"#);
+        assert_eq!(calls[1]["index"], 0);
+        assert!(calls[1].get("id").is_none());
+        assert!(calls[1]["function"].get("name").is_none());
+        assert_eq!(calls[1]["function"]["arguments"], r#"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn stream_accepts_argument_fragments_before_the_function_name() {
+        let calls = streamed_tool_calls(&[
+            function_arguments_delta("call_1", None, r#"{"path":"#),
+            function_arguments_delta("call_1", Some("write_file"), r#"/tmp/x"}"#),
+            function_arguments_done("call_1", "write_file", r#"{"path":"/tmp/x"}"#),
+        ]);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert!(calls[0]["function"].get("name").is_none());
+        assert_eq!(calls[1]["index"], 0);
+        assert!(calls[1].get("id").is_none());
+        assert_eq!(calls[1]["function"]["name"], "write_file");
+    }
+
+    #[test]
+    fn stream_assigns_stable_indices_to_interleaved_tool_calls() {
+        let calls = streamed_tool_calls(&[
+            function_arguments_delta("call_a", Some("first"), "{"),
+            function_arguments_delta("call_b", Some("second"), "{"),
+            function_arguments_delta("call_a", Some("first"), "}"),
+            function_arguments_delta("call_b", Some("second"), "}"),
+            function_arguments_done("call_a", "first", "{}"),
+            function_arguments_done("call_b", "second", "{}"),
+        ]);
+
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[1]["index"], 1);
+        assert_eq!(calls[2]["index"], 0);
+        assert_eq!(calls[3]["index"], 1);
+    }
+
+    #[test]
+    fn stream_preserves_done_only_function_calls() {
+        let calls = streamed_tool_calls(&[function_arguments_done(
+            "call_1",
+            "write_file",
+            r#"{"path":"/tmp/x"}"#,
+        )]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "write_file");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"/tmp/x"}"#);
     }
 }
