@@ -377,23 +377,10 @@ pub struct ChatCompletionStreamConverter {
     include_usage: bool,
     role_sent: bool,
     emitted_tool_calls: HashMap<String, ChatToolStreamState>,
-    /// When true, drop `reasoning_content` deltas: reasoning was FORCED by
-    /// family injection (e.g. Kimi `thinking=true`) for a Chat client that did
-    /// NOT request it, and must not leak server-side internals (G2, Finding 2).
-    /// Normal Chat reasoning (client asked, or non-forced) is unaffected.
-    suppress_reasoning: bool,
 }
 
 impl ChatCompletionStreamConverter {
     pub fn new(model: String, include_usage: bool) -> Self {
-        Self::with_reasoning_suppression(model, include_usage, false)
-    }
-
-    pub fn with_reasoning_suppression(
-        model: String,
-        include_usage: bool,
-        suppress_reasoning: bool,
-    ) -> Self {
         Self {
             id: None,
             model,
@@ -401,7 +388,6 @@ impl ChatCompletionStreamConverter {
             include_usage,
             role_sent: false,
             emitted_tool_calls: HashMap::new(),
-            suppress_reasoning,
         }
     }
 
@@ -431,11 +417,6 @@ impl ChatCompletionStreamConverter {
                 }
             }
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                // Suppress forced-but-unrequested reasoning so it does not leak
-                // to a Chat client (G2, Finding 2). Normal reasoning still flows.
-                if self.suppress_reasoning {
-                    return output;
-                }
                 if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
                     self.ensure_role_chunk(&mut output);
                     output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
@@ -650,23 +631,14 @@ pub struct ChatCompletionCollector {
     model: String,
     final_response: Option<Value>,
     error: Option<String>,
-    /// See `ChatCompletionStreamConverter::suppress_reasoning` (G2, Finding 2):
-    /// drop forced-but-unrequested `reasoning_content` from the assembled
-    /// non-streaming Chat response.
-    suppress_reasoning: bool,
 }
 
 impl ChatCompletionCollector {
     pub fn new(model: String) -> Self {
-        Self::with_reasoning_suppression(model, false)
-    }
-
-    pub fn with_reasoning_suppression(model: String, suppress_reasoning: bool) -> Self {
         Self {
             model,
             final_response: None,
             error: None,
-            suppress_reasoning,
         }
     }
 
@@ -692,20 +664,12 @@ impl ChatCompletionCollector {
         Ok(chat_completion_response_from_response(
             &self.model,
             &response,
-            self.suppress_reasoning,
         ))
     }
 }
 
-fn chat_completion_response_from_response(
-    model_hint: &str,
-    response: &Value,
-    suppress_reasoning: bool,
-) -> Value {
-    let (content, mut reasoning_content, tool_calls) = message_from_response_output(response);
-    if suppress_reasoning {
-        reasoning_content.clear();
-    }
+fn chat_completion_response_from_response(model_hint: &str, response: &Value) -> Value {
+    let (content, reasoning_content, tool_calls) = message_from_response_output(response);
     let has_tool_calls = !tool_calls.is_empty();
     let message = ChatCompletionMessage {
         role: "assistant",
@@ -1122,7 +1086,8 @@ mod tests {
         assert_eq!(converted.extra_body, extra_body);
     }
 
-    // --- G2 Finding 2: forced-but-unrequested reasoning suppression (Chat) ---
+    // Reasoning is protocol data, so Chat conversion must preserve it whether
+    // or not the inbound request carried a reasoning-control knob.
 
     use super::ChatCompletionCollector;
     use super::ChatCompletionStreamConverter;
@@ -1144,12 +1109,8 @@ mod tests {
     }
 
     /// Collect the streamed Chat deltas' `reasoning_content` strings.
-    fn streamed_reasoning(suppress: bool) -> Vec<String> {
-        let mut converter = ChatCompletionStreamConverter::with_reasoning_suppression(
-            "kimi-k2".to_string(),
-            false,
-            suppress,
-        );
+    fn streamed_reasoning() -> Vec<String> {
+        let mut converter = ChatCompletionStreamConverter::new("kimi-k2".to_string(), false);
         let mut out = Vec::new();
         for event in [reasoning_delta_event(), text_delta_event()] {
             for chat_event in converter.convert(&event) {
@@ -1164,20 +1125,9 @@ mod tests {
         out
     }
 
-    /// Forced-but-unrequested reasoning is dropped from the streamed Chat output.
     #[test]
-    fn stream_suppresses_forced_unrequested_reasoning() {
-        assert!(
-            streamed_reasoning(true).is_empty(),
-            "forced reasoning must not surface to a Chat client that did not ask"
-        );
-    }
-
-    /// When NOT suppressed (client requested, or non-forced), reasoning still
-    /// surfaces exactly as today — normal Chat behavior is unchanged.
-    #[test]
-    fn stream_keeps_reasoning_when_not_suppressed() {
-        assert_eq!(streamed_reasoning(false), vec!["secret chain of thought"]);
+    fn stream_preserves_reasoning() {
+        assert_eq!(streamed_reasoning(), vec!["secret chain of thought"]);
     }
 
     fn response_with_reasoning() -> SseEvent {
@@ -1196,9 +1146,8 @@ mod tests {
         }
     }
 
-    fn collected_reasoning(suppress: bool) -> Option<String> {
-        let mut collector =
-            ChatCompletionCollector::with_reasoning_suppression("kimi-k2".to_string(), suppress);
+    fn collected_reasoning() -> Option<String> {
+        let mut collector = ChatCompletionCollector::new("kimi-k2".to_string());
         collector.process(&response_with_reasoning());
         let value = collector.into_response().expect("response");
         value["choices"][0]["message"]["reasoning_content"]
@@ -1206,15 +1155,9 @@ mod tests {
             .map(ToString::to_string)
     }
 
-    /// Non-streaming Chat: suppression drops `reasoning_content`; content stays.
     #[test]
-    fn collected_suppresses_forced_unrequested_reasoning() {
-        assert_eq!(collected_reasoning(true), None);
-    }
-
-    #[test]
-    fn collected_keeps_reasoning_when_not_suppressed() {
-        assert_eq!(collected_reasoning(false), Some("hidden".to_string()));
+    fn collected_preserves_reasoning() {
+        assert_eq!(collected_reasoning(), Some("hidden".to_string()));
     }
 
     fn function_arguments_delta(call_id: &str, name: Option<&str>, delta: &str) -> SseEvent {

@@ -4099,8 +4099,8 @@ fn write_family_kwargs(
             // request reasoning. With `thinking=false` the vLLM kimi parser
             // falls through to the identity parser and leaks the raw chain of
             // thought (plus a stray `</think>`) into `content`. `thinking=true`
-            // routes it to `delta.reasoning`, where the response-side handling
-            // decides whether the client actually sees it. This intentionally
+            // routes it to `delta.reasoning`, which response adapters forward in
+            // their protocol-native reasoning shape. This intentionally
             // OVERRIDES a configured default; an explicit request
             // `chat_template_kwargs.thinking` still wins (re-overlaid after).
             kwargs.insert("thinking".to_string(), Value::Bool(true));

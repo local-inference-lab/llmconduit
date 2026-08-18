@@ -1691,11 +1691,6 @@ async fn post_chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    // Decide BEFORE converting (which consumes the inbound request) whether the
-    // Chat output converter must suppress `reasoning_content`. Suppression is
-    // family-independent: a Chat client that did not request reasoning never
-    // receives server-side chain-of-thought from ANY model (G2, Finding 1).
-    let suppress_reasoning = gateway.chat_reasoning_suppressed(&request);
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway
         .stream_responses_with_api_call_id(
@@ -1705,9 +1700,9 @@ async fn post_chat_completions(
         .await?;
 
     let response = if wants_stream {
-        stream_chat_completions_response(model.clone(), include_usage, suppress_reasoning, stream)
+        stream_chat_completions_response(model.clone(), include_usage, stream)
     } else {
-        collect_chat_completions_response(model.clone(), suppress_reasoning, stream).await?
+        collect_chat_completions_response(model.clone(), stream).await?
     };
     Ok(with_model_headers(response, &requested, &model))
 }
@@ -1930,16 +1925,11 @@ fn tee_served_body(
 fn stream_chat_completions_response(
     model: String,
     include_usage: bool,
-    suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> Response {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
-        let mut converter = ChatCompletionStreamConverter::with_reasoning_suppression(
-            model,
-            include_usage,
-            suppress_reasoning,
-        );
+        let mut converter = ChatCompletionStreamConverter::new(model, include_usage);
         let mut stream = std::pin::pin!(stream);
         'streaming: while let Some(event) = stream.next().await {
             let chat_events = converter.convert(&event);
@@ -2137,11 +2127,9 @@ async fn collect_responses_response(
 
 async fn collect_chat_completions_response(
     model: String,
-    suppress_reasoning: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> AppResult<Response> {
-    let mut collector =
-        ChatCompletionCollector::with_reasoning_suppression(model, suppress_reasoning);
+    let mut collector = ChatCompletionCollector::new(model);
     let mut stream = std::pin::pin!(stream);
     while let Some(event) = stream.next().await {
         collector.process(&event);

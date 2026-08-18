@@ -562,32 +562,6 @@ fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'stat
     }
 }
 
-/// Whether a Chat-Completions request asked to receive reasoning output.
-///
-/// The typed `reasoning_effort` field is authoritative when present. In
-/// particular, `reasoning_effort: none` suppresses the client-visible reasoning
-/// channel even if provider-specific `chat_template_kwargs` keep thinking
-/// enabled for backend parser correctness. Provider-specific thinking controls
-/// determine output visibility only when the typed field is absent.
-fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
-    if let Some(effort) = request.reasoning_effort.as_deref() {
-        return !effort.trim().eq_ignore_ascii_case("none");
-    }
-    request
-        .extra_body
-        .get("chat_template_kwargs")
-        .and_then(Value::as_object)
-        .is_some_and(|kwargs| {
-            let reasoning_effort_requested = kwargs
-                .get("reasoning_effort")
-                .and_then(Value::as_str)
-                .is_some_and(|effort| !effort.trim().eq_ignore_ascii_case("none"));
-            kwargs.contains_key("thinking")
-                || kwargs.contains_key("enable_thinking")
-                || reasoning_effort_requested
-        })
-}
-
 fn build_upstream_extra_body(
     defaults: serde_json::Map<String, Value>,
     request: &ResponsesRequest,
@@ -1029,26 +1003,6 @@ impl Gateway {
     pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
         let configured_model = self.config.resolve_upstream_model(request_model);
         self.normalize_upstream_model(&configured_model).await
-    }
-
-    /// Decide whether the Chat output converter must suppress
-    /// `reasoning_content` for this inbound request. We suppress whenever the
-    /// inbound Chat client did NOT request reasoning, for ALL models and
-    /// independent of the backend family (G2, Finding 1). Cross-family
-    /// routing/failover means the engine-resolved family is not a reliable proxy
-    /// for what the backend will actually emit, so the decision is computed
-    /// purely from the inbound request at the HTTP boundary: a Chat client that
-    /// never asked for reasoning must never receive server-side chain-of-thought
-    /// (AGENTS.md: do not leak server-side internals to Chat).
-    ///
-    /// A present top-level `reasoning_effort` value is authoritative: `none`
-    /// suppresses output and every other value requests it. When the typed
-    /// field is absent, an explicit `thinking`, `enable_thinking`, or non-`none`
-    /// `reasoning_effort` value in `chat_template_kwargs` requests reasoning.
-    /// This precedence lets a backend keep thinking enabled for parser
-    /// correctness without overriding the client's output-visibility choice.
-    pub fn chat_reasoning_suppressed(&self, request: &ChatCompletionRequest) -> bool {
-        !chat_request_requested_reasoning(request)
     }
 
     pub fn subscribe_monitor(
