@@ -46,6 +46,10 @@ use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::Request;
 use axum::extract::State;
+use axum::extract::ws::Message;
+use axum::extract::ws::WebSocket;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
@@ -60,6 +64,7 @@ use axum::routing::MethodFilter;
 use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
+use futures::SinkExt;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body::SizeHint;
@@ -108,7 +113,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     // silent framework default.
     let max_request_body_bytes = gateway.config().max_request_body_bytes;
     let router = Router::new()
-        .route("/v1/responses", post(post_responses))
+        .route("/v1/responses", post(post_responses).get(get_responses))
         .route("/v1/messages", post(post_messages))
         .route("/v1/messages/count_tokens", post(post_count_tokens))
         .route("/v1/messages", on(MethodFilter::HEAD, probe_messages))
@@ -1398,6 +1403,183 @@ async fn post_responses(
         collect_responses_response(stream).await?
     };
     Ok(with_model_headers(response, &requested, &served))
+}
+
+/// `GET /v1/responses` — the OpenAI Responses WebSockets beta
+/// (`openai-beta: responses_websockets=2026-02-06`). codex-tui 0.145+ attempts a
+/// WS upgrade here FIRST; on any non-101 it falls back to HTTPS POST (above), so
+/// the existing SSE path remains the fallback.
+///
+/// Protocol (best-effort, reverse-engineered from the codex binary — the beta is
+/// undocumented): after the 101, the client sends ONE frame carrying the
+/// `ResponsesRequest` JSON — either a text frame (plain JSON) or a binary frame
+/// (zstd-compressed JSON, mirroring codex's `enable_request_compression` HTTP
+/// path). The server then streams `response.*` events as text frames, each a
+/// single JSON object whose `type` field names the event (identical to the SSE
+/// `data:` payload of the HTTP path), terminating on `response.completed`/
+/// `failed`/`incomplete`/`error` and closing the socket.
+///
+/// The stream reuses the SAME engine path as `post_responses`
+/// (`stream_responses_with_api_call_id`), so model resolution, failover, and the
+/// tool loop are unchanged. WS turns are NOT instrumented in the dashboard
+/// FlowStore/turn-capture (those gate on POST); the api_call_id passed here is
+/// `None` — extend by minting a flow record off the GET if dashboard visibility
+/// for WS turns is needed.
+async fn get_responses(
+    State(gateway): State<Arc<Gateway>>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    match upgrade {
+        Ok(upgrade) => upgrade
+            .on_upgrade(move |socket| responses_ws_serve(socket, gateway))
+            .into_response(),
+        Err(_) => {
+            // Plain GET without an `Upgrade: websocket` header. 426 tells the
+            // client it must upgrade (or use POST); codex's WS attempt always
+            // sends the upgrade header, so it takes the 101 branch.
+            let mut resp = StatusCode::UPGRADE_REQUIRED.into_response();
+            resp.headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("POST, GET"));
+            resp
+        }
+    }
+}
+
+/// zstd magic number (`28 b5 2f fd`) — codex's compressed WS request frames
+/// start with this. Used to decide whether a binary frame is zstd-compressed
+/// JSON or raw JSON bytes.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// The Responses-WS socket loop. See [`get_responses`] for the protocol rationale.
+async fn responses_ws_serve(socket: WebSocket, gateway: Arc<Gateway>) {
+    // `split` so the inbound `recv` and outbound `send` can be raced in the same
+    // `select!` without a double-`&mut` borrow conflict (the dashboard/debug WS
+    // loops use the same pattern).
+    let (mut sink, mut ws_rx) = socket.split();
+
+    // 1. Read the request frame. Respond to Ping; ignore Pong; bail on
+    //    Close/EOF. codex sends a single Text (JSON) or Binary (zstd JSON).
+    let request_bytes: Bytes = loop {
+        match ws_rx.next().await {
+            Some(Ok(Message::Text(t))) => break Bytes::copy_from_slice(t.as_bytes()),
+            Some(Ok(Message::Binary(b))) => {
+                break if b.starts_with(&ZSTD_MAGIC) {
+                    match zstd::decode_all(&b[..]) {
+                        Ok(decoded) => Bytes::from(decoded),
+                        // Not actually zstd — let JSON parsing produce the error.
+                        Err(_) => b,
+                    }
+                } else {
+                    b
+                };
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sink.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+        }
+    };
+
+    // 2. Parse + force streaming (WS is inherently streaming; a non-stream
+    //    `ResponsesRequest` would make the engine emit only the terminal
+    //    `response.completed`, which is legal but not what a WS client expects).
+    let mut request: ResponsesRequest = match serde_json::from_slice(&request_bytes) {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = send_responses_ws_error(
+                &mut sink,
+                "invalid_request",
+                &format!("invalid request body: {err}"),
+            )
+            .await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    request.stream = true;
+
+    // 3. Run the turn through the SAME engine path as the HTTP POST.
+    let event_stream = match gateway
+        .stream_responses_with_api_call_id(request, None)
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = send_responses_ws_error(&mut sink, "internal_error", &err.to_string()).await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    // 4. Forward each `SseEvent` as a WS text frame (the JSON `data` object,
+    //    which already carries `"type": "<event>"`). Race the engine stream
+    //    against the client side so a client hang-up / Close cancels the turn
+    //    promptly — mirrors the engine's `tx.closed()` cancellation invariant.
+    let mut events = std::pin::pin!(event_stream);
+    loop {
+        tokio::select! {
+            ev = events.next() => {
+                match ev {
+                    Some(event) => {
+                        let terminal = matches!(
+                            event.event.as_str(),
+                            "response.completed"
+                                | "response.failed"
+                                | "response.incomplete"
+                                | "response.error"
+                        );
+                        let payload = responses_wire_event_data(&event);
+                        if sink.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                        if terminal {
+                            let _ = sink.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    None => {
+                        // Engine stream ended without a terminal event (shouldn't
+                        // happen for a well-formed turn, but don't hang).
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    // A mid-turn Text/Binary frame from the client is unexpected;
+                    // ignore it rather than tearing down a working turn.
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Emit a `response.failed` text frame on the WS socket. codex treats
+/// `response.failed` as terminal and stops, so a parse/engine-setup error
+/// surfaces as a normal failure rather than a silent socket close.
+async fn send_responses_ws_error(
+    sink: &mut futures::stream::SplitSink<WebSocket, Message>,
+    code: &str,
+    message: &str,
+) -> bool {
+    let payload = serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "error": { "code": code, "message": message }
+        }
+    });
+    let Ok(text) = serde_json::to_string(&payload) else {
+        return true;
+    };
+    sink.send(Message::Text(text.into())).await.is_ok()
 }
 
 async fn post_messages(

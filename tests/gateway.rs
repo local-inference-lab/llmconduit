@@ -2622,6 +2622,154 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
     server.abort();
 }
 
+/// Write ONE masked client→server WS text frame (RFC 6455 §5.3: client frames
+/// MUST be masked). Used to send the Responses request frame after the /v1/responses
+/// upgrade. A fixed masking key is fine — the server accepts any 32-bit key; only
+/// the mask BIT + masked payload matter.
+async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
+    use tokio::io::AsyncWriteExt;
+    let payload = text.as_bytes();
+    let len = payload.len();
+    let masking_key = [0x11u8, 0x22, 0x33, 0x44];
+    let mut masked = Vec::with_capacity(len);
+    for (i, byte) in payload.iter().enumerate() {
+        masked.push(byte ^ masking_key[i % 4]);
+    }
+    let mut frame = Vec::new();
+    // FIN=1, opcode=1 (text).
+    frame.push(0x81);
+    // Mask bit set (0x80) + length form.
+    if len < 126 {
+        frame.push(0x80 | len as u8);
+    } else if len < 65536 {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&masking_key);
+    frame.extend_from_slice(&masked);
+    stream.write_all(&frame).await.expect("write masked frame");
+}
+
+/// Open a REAL `/v1/responses` WebSocket (the `responses_websockets=2026-02-06`
+/// beta path) over an ephemeral TCP server — same `axum::serve` posture as
+/// [`ws_connect`] so hyper injects the `OnUpgrade` the WS extractor needs. No
+/// cookie/Origin (the Responses endpoint is not dashboard-gated). Panics if the
+/// upgrade is not `101`.
+async fn responses_ws_connect(
+    router: axum::Router,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service()).await;
+    });
+    let request = format!(
+        "GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await.unwrap();
+        assert!(
+            n == 1,
+            "connection closed before the upgrade response completed"
+        );
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(code, 101, "expected a 101 WS upgrade, got {code}: {head}");
+    (stream, server)
+}
+
+/// The `/v1/responses` WebSocket beta path upgrades (101), accepts a single
+/// JSON request frame, and streams the SAME `response.*` events the HTTP SSE
+/// path emits — terminating on `response.completed` and closing the socket.
+/// This proves the upgrade + frame loop end-to-end against the real engine +
+/// `axum::serve` (the protocol-REVERSE-ENGINEERED frame shape — one JSON request
+/// frame in, `response.*` text frames out — is what codex-tui 0.145+ speaks).
+#[tokio::test]
+async fn responses_ws_upgrades_and_streams_response_events() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let (mut stream, server) = responses_ws_connect(app).await;
+
+    // Send the request as one masked text frame — a streaming `ResponsesRequest`
+    // identical to what `post_responses` accepts, so the WS path exercises the
+    // SAME engine entry point (`stream_responses_with_api_call_id`).
+    let request = base_request(vec![user_message("hello")]);
+    let request_json = serde_json::to_string(&request).expect("serialize request");
+    ws_write_text_frame(&mut stream, &request_json).await;
+
+    // Collect server text frames until Close/EOF. Expect at least
+    // `response.created` and a terminal `response.completed`.
+    let mut types = Vec::new();
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut stream).await {
+            Some((0x1, payload)) => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("event frame is JSON");
+                let ty = value["type"].as_str().unwrap_or("").to_string();
+                types.push(ty);
+            }
+            Some((0x8, _)) => break, // Close — the handler closes after the terminal event.
+            Some((_op, _)) => {}     // ignore pong/other control frames.
+            None => break,
+        }
+    }
+    drop(stream);
+    server.abort();
+
+    assert!(
+        types.iter().any(|t| t == "response.created"),
+        "expected a response.created event, got: {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "response.completed"),
+        "expected a terminal response.completed event, got: {types:?}"
+    );
+}
+
+/// A plain GET `/v1/responses` (no `Upgrade: websocket` header) returns 426
+/// Upgrade Required (codex's WS attempt always sends the upgrade header, so it
+/// takes the 101 branch; this guards the fallback the `Result<WebSocketUpgrade,
+/// _>` extractor rejection maps to).
+#[tokio::test]
+async fn responses_ws_plain_get_returns_upgrade_required() {
+    let app = llmconduit::build_app(test_config());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/responses")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 426);
+}
+
 /// The core codex-tui fix: a POST `/v1/responses` with `Content-Encoding: zstd`
 /// (codex-tui 0.145+ with `enable_request_compression`) is decompressed by the
 /// inbound middleware BEFORE the `Json` extractor runs, so the turn executes
