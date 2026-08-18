@@ -122,6 +122,7 @@ pub async fn debug_ws(
 async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let mut receiver = gateway.subscribe_monitor();
     let snapshot = gateway.debug_snapshot();
+    let mut last_sequence = snapshot.last_sequence;
 
     // Arm the expiry timer BEFORE replaying the retained snapshot. The socket
     // must close at the cookie `exp` even mid-snapshot — under backpressure a
@@ -155,7 +156,7 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
             }
             received = receiver.recv() => {
                 match received {
-                    Ok(update) if update.sequence <= snapshot.last_sequence => {}
+                    Ok(update) if update.sequence <= last_sequence => {}
                     Ok(update) => {
                         // Race the expiry future around EVERY send in the live
                         // batch (not just at the top of the loop): a backpressured
@@ -171,7 +172,31 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                             ReplayOutcome::SendFailed => return,
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => return,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Rebuild the client from authoritative retained state on
+                        // the SAME socket. Closing here made the browser reconnect,
+                        // clear a more complete live transcript, and provide no
+                        // indication that the replacement snapshot had retention
+                        // omissions. Protocol-v2 RequestUpsert/EventAppend frames
+                        // carry explicit omission counters and payload metadata.
+                        let replacement = gateway.debug_snapshot();
+                        match replay_snapshot(
+                            &replacement.messages,
+                            expiry.as_mut(),
+                            &mut socket,
+                        )
+                        .await
+                        {
+                            ReplayOutcome::Completed => {
+                                last_sequence = replacement.last_sequence;
+                            }
+                            ReplayOutcome::Expired => {
+                                let _ = socket.send(Message::Close(None)).await;
+                                return;
+                            }
+                            ReplayOutcome::SendFailed => return,
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -276,6 +301,7 @@ async fn send_message(socket: &mut WebSocket, message: &DebugWsMessage) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
@@ -284,6 +310,25 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn debug_app_turn_reconstruction_regressions() {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node is unavailable; skipping debug_app.js behavior test");
+            return;
+        }
+        let output = Command::new("node")
+            .arg("tests/debug_app.test.cjs")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("run debug_app.js behavior test");
+        assert!(
+            output.status.success(),
+            "debug_app.js behavior test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]

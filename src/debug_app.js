@@ -4,6 +4,11 @@
 
   const DASHBOARD_KEY = "__dashboard__";
   const TILE_LINGER_MS = 30_000; // must match CSS opacity transition on request-tile
+  const CLIENT_PAYLOAD_PREVIEW_CHAR_LIMIT = 24 * 1024 * 1024;
+  const CLIENT_TOTAL_PAYLOAD_PREVIEW_CHAR_LIMIT = 128 * 1024 * 1024;
+  const CLIENT_SEGMENT_TEXT_CHAR_LIMIT = 128 * 1024;
+  const TILE_REQUEST_TEXT_CHAR_LIMIT = 64 * 1024;
+  const TILE_TOTAL_TEXT_CHAR_LIMIT = 256 * 1024;
 
   const escapeHtml = (value) => String(value ?? "")
           .replaceAll("&", "&amp;")
@@ -42,18 +47,27 @@
     return String(n);
   };
 
-  // Segments index where the current round's live stream begins, derived from
-  // timestamps: the first run starting at/after the newest payload event.
-  // Used after snapshot replay, where event-vs-segment ordering is lost.
+  // Segments index where the current round's live stream begins. Protocol v2
+  // carries the exact payload event sequence on each segment; timestamps remain
+  // only as a protocol-v1 fallback.
   function computeLiveSegmentsFrom(request) {
+    let lastPayloadSequence = 0;
     let lastPayloadTs = 0;
     for (const event of request.events || []) {
-      if (!event || !event.payload_preview) continue;
+      if (!event) continue;
       if (event.kind !== "upstream_request" && event.kind !== "request_payload") continue;
+      const sequence = Number(event.sequence || 0);
+      if (sequence > lastPayloadSequence) lastPayloadSequence = sequence;
       const ts = Number(event.timestamp_ms || 0);
       if (ts > lastPayloadTs) lastPayloadTs = ts;
     }
     const segments = request.segments || [];
+    if (lastPayloadSequence) {
+      for (let i = 0; i < segments.length; i++) {
+        if (Number(segments[i].payload_sequence || 0) >= lastPayloadSequence) return i;
+      }
+      return segments.length;
+    }
     if (!lastPayloadTs) return 0;
     for (let i = 0; i < segments.length; i++) {
       if (Number(segments[i].timestamp_ms || 0) >= lastPayloadTs) return i;
@@ -172,12 +186,14 @@
     const client = [];
     for (let i = events.length - 1; i >= 0; i--) {
       const event = events[i];
-      if (!event || !event.payload_preview) continue;
+      if (!event) continue;
       if (event.kind === "upstream_request") upstream.push(event);
       else if (event.kind === "request_payload") client.push(event);
     }
-    // Newest upstream payloads first (they carry the full lowered history),
-    // then client payloads as fallback.
+    // Include explicit body-omission records: they cannot be parsed, but they
+    // must invalidate the cache and prevent an older body from masquerading as
+    // the newest complete transcript. Upstream payloads still rank first
+    // because they carry the full lowered multi-round history.
     return [...upstream, ...client];
   }
 
@@ -187,29 +203,14 @@
     if (!value || typeof value !== "object") return null;
     const convo = conversationFromPayload(value);
     if (!convo) return null;
-    convo.truncated = truncated;
+    const expectedEntries = Number(event.payload_entry_count);
+    const hasExpectedEntries = Number.isFinite(expectedEntries) && expectedEntries >= 0;
+    const entryCountMatches = !hasExpectedEntries || convo.sourceEntryCount === expectedEntries;
+    convo.structurallyComplete = !truncated && entryCountMatches;
+    convo.truncated = truncated || Boolean(event.payload_truncated);
+    convo.expectedEntries = hasExpectedEntries ? expectedEntries : null;
     convo.event = event;
     return convo;
-  }
-
-  function flattenTextDeep(value) {
-    if (value === null || value === undefined) return "";
-    if (typeof value === "string") return value;
-    if (!Array.isArray(value)) {
-      if (typeof value === "object" && typeof value.text === "string") return value.text;
-      return "";
-    }
-    let out = "";
-    const push = (s) => {
-      if (!s) return;
-      if (out && !out.endsWith("\n")) out += "\n";
-      out += s;
-    };
-    for (const item of value) {
-      if (typeof item === "string") push(item);
-      else if (item && typeof item === "object" && typeof item.text === "string") push(item.text);
-    }
-    return out;
   }
 
   // Reasoning text from a Responses `type:"reasoning"` item: summary parts
@@ -230,14 +231,8 @@
   }
 
   function conversationFromPayload(parsed) {
-    let system = "";
-    if (typeof parsed.system === "string") {
-      system = parsed.system;
-    } else if (Array.isArray(parsed.system)) {
-      system = flattenTextDeep(parsed.system);
-    }
-
     const items = [];
+    let sourceEntryCount = 0;
     const pushReasoning = (text) => {
       items.push({ kind: "message", role: "reasoning", content: text || "[encrypted reasoning]" });
     };
@@ -298,18 +293,19 @@
       flushText();
     };
 
+    // Anthropic carries system content outside messages[]. Keep it as an
+    // ordinary ordered entry rather than collapsing all privileged context into
+    // one singleton that discards subsequent system/developer messages.
+    if (typeof parsed.system === "string" || Array.isArray(parsed.system)) {
+      pushFromContent("system", parsed.system);
+    }
+
     if (Array.isArray(parsed.messages)) {
       // Anthropic and OpenAI Chat Completions: top-level messages[].
+      sourceEntryCount = parsed.messages.length;
       for (const msg of parsed.messages) {
         if (!msg) continue;
         const role = typeof msg.role === "string" ? msg.role : "user";
-        if (role === "system" || role === "developer") {
-          if (!system) {
-            const text = typeof msg.content === "string" ? msg.content : flattenTextDeep(msg.content);
-            if (text) system = text;
-          }
-          continue;
-        }
         if (role === "tool") {
           // Chat Completions tool result message.
           items.push({
@@ -346,7 +342,11 @@
       }
     } else if (parsed.input !== undefined) {
       // OpenAI Responses: `input` is a string or an array of typed items.
+      if (typeof parsed.instructions === "string" && parsed.instructions) {
+        pushFromContent("instructions", parsed.instructions);
+      }
       if (Array.isArray(parsed.input)) {
+        sourceEntryCount = parsed.input.length;
         for (const item of parsed.input) {
           if (!item) continue;
           if (typeof item === "string") {
@@ -378,6 +378,46 @@
               call_id: item.call_id || "",
               output: out,
             });
+          } else if (t === "custom_tool_call") {
+            items.push({
+              kind: "tool_call",
+              name: item.name || "custom_tool",
+              call_id: item.call_id || item.id || "",
+              arguments: item.input,
+            });
+          } else if (t === "custom_tool_call_output") {
+            items.push({
+              kind: "tool_result",
+              call_id: item.call_id || "",
+              output: item.output,
+            });
+          } else if (t === "tool_search_call") {
+            items.push({
+              kind: "tool_call",
+              name: "tool_search",
+              call_id: item.call_id || item.id || "",
+              arguments: {
+                execution: item.execution,
+                arguments: item.arguments,
+              },
+            });
+          } else if (t === "tool_search_output") {
+            items.push({
+              kind: "tool_result",
+              call_id: item.call_id || "",
+              output: {
+                status: item.status,
+                execution: item.execution,
+                tools: item.tools,
+              },
+            });
+          } else if (t === "local_shell_call") {
+            items.push({
+              kind: "tool_call",
+              name: "local_shell",
+              call_id: item.call_id || item.id || "",
+              arguments: item.action,
+            });
           } else if (t === "web_search_call") {
             items.push({
               kind: "tool_call",
@@ -385,34 +425,37 @@
               call_id: item.id || "",
               arguments: item.action !== undefined ? item.action : item.query,
             });
+          } else if (t === "image_generation_call") {
+            items.push({
+              kind: "tool_result",
+              call_id: item.id || "",
+              output: {
+                status: item.status,
+                revised_prompt: item.revised_prompt,
+                result: item.result,
+              },
+            });
           } else if (typeof item.role === "string") {
-            if (item.role === "system" || item.role === "developer") {
-              if (!system) {
-                const text = typeof item.content === "string" ? item.content : flattenTextDeep(item.content);
-                if (text) system = text;
-              }
-            } else {
-              pushFromContent(item.role, item.content);
-            }
+            pushFromContent(item.role, item.content);
           } else if (typeof item.text === "string") {
             items.push({ kind: "message", role: "user", content: item.text });
           } else {
-            // Unknown typed item: surface it rather than silently dropping a
-            // turn — this is a debugging tool.
-            items.push({ kind: "message", role: "meta", content: `[${t || "item"}]` });
+            // Preserve the complete already-redacted preview for future typed
+            // items instead of reducing an unknown debugging surface to a label.
+            let detail;
+            try { detail = JSON.stringify(item, null, 2); } catch (_) { detail = String(item); }
+            items.push({ kind: "message", role: "meta", content: detail });
           }
         }
       } else if (typeof parsed.input === "string") {
+        sourceEntryCount = 1;
         if (parsed.input) items.push({ kind: "message", role: "user", content: parsed.input });
-      }
-      if (typeof parsed.instructions === "string" && parsed.instructions && !system) {
-        system = parsed.instructions;
       }
     } else {
       return null;
     }
 
-    return { system, items };
+    return { system: "", items, sourceEntryCount };
   }
 
   // ------------------------------------------------------------------------
@@ -441,6 +484,17 @@
 
     _append(request, kind, text) {
       if (!text) return;
+      if (kind === "request") {
+        const retained = Number(request.tileRequestChars || 0);
+        if (retained >= TILE_REQUEST_TEXT_CHAR_LIMIT) return;
+        const remaining = TILE_REQUEST_TEXT_CHAR_LIMIT - retained;
+        if (text.length > remaining) {
+          text = `${text.slice(0, remaining)}\n[request text elided from live tile]`;
+          request.tileRequestChars = TILE_REQUEST_TEXT_CHAR_LIMIT;
+        } else {
+          request.tileRequestChars = retained + text.length;
+        }
+      }
       const last = request.tileSpans[request.tileSpans.length - 1];
       if (last && last.kind === kind) {
         last.text += text;
@@ -448,6 +502,26 @@
         request.tileSpans.push({ kind, text });
       }
       request.tileLastKind = kind;
+      this._trim(request);
+    },
+
+    _trim(request) {
+      let retained = 0;
+      for (const span of request.tileSpans) retained += span.text.length;
+      if (retained <= TILE_TOTAL_TEXT_CHAR_LIMIT) return;
+      let excess = retained - TILE_TOTAL_TEXT_CHAR_LIMIT;
+      const spans = [...request.tileSpans];
+      while (excess > 0 && spans.length) {
+        if (excess >= spans[0].text.length) {
+          excess -= spans[0].text.length;
+          spans.shift();
+        } else {
+          spans[0] = { ...spans[0], text: spans[0].text.slice(excess) };
+          excess = 0;
+        }
+      }
+      request.tileSpans = spans;
+      request.tileLastKind = spans.at(-1)?.kind || null;
     },
 
     _ensureNewlineBefore(request, kind) {
@@ -520,6 +594,78 @@
     }
   };
 
+  function omitPayloadPreview(request, event) {
+    const chars = event.payload_preview?.length || 0;
+    if (!chars) return 0;
+    event.payload_original_chars ||= chars;
+    event.payload_preview = null;
+    event.payload_retention_omitted = true;
+    request.local_payload_previews_omitted =
+            Number(request.local_payload_previews_omitted || 0) + 1;
+    request.payload_budget_version = Number(request.payload_budget_version || 0) + 1;
+    return chars;
+  }
+
+  function enforcePayloadPreviewBudget(request) {
+    let retained = 0;
+    for (const event of request.events || []) {
+      if (event?.payload_preview) retained += event.payload_preview.length;
+    }
+    if (retained <= CLIENT_PAYLOAD_PREVIEW_CHAR_LIMIT) return;
+
+    for (const event of request.events || []) {
+      if (retained <= CLIENT_PAYLOAD_PREVIEW_CHAR_LIMIT) break;
+      if (!event?.payload_preview) continue;
+      retained -= omitPayloadPreview(request, event);
+    }
+  }
+
+  function enforceTotalPayloadPreviewBudget(store) {
+    const changed = new Set();
+    let retained = 0;
+    for (const request of store.requests.values()) {
+      for (const event of request.events || []) {
+        if (event?.payload_preview) retained += event.payload_preview.length;
+      }
+    }
+    if (retained <= CLIENT_TOTAL_PAYLOAD_PREVIEW_CHAR_LIMIT) return changed;
+
+    // Oldest requests and oldest payloads yield first, matching the server's
+    // global retained-preview policy while preserving the newest transcript.
+    for (const id of [...store.order].reverse()) {
+      const request = store.requests.get(id);
+      if (!request) continue;
+      for (const event of request.events || []) {
+        if (retained <= CLIENT_TOTAL_PAYLOAD_PREVIEW_CHAR_LIMIT) return changed;
+        const omitted = omitPayloadPreview(request, event);
+        if (omitted) changed.add(id);
+        retained -= omitted;
+      }
+    }
+    return changed;
+  }
+
+  function enforceSegmentTextBudget(request) {
+    let retained = 0;
+    for (const segment of request.segments || []) retained += segment.text.length;
+    let excess = retained - CLIENT_SEGMENT_TEXT_CHAR_LIMIT;
+    while (excess > 0 && request.segments.length) {
+      const first = request.segments[0];
+      if (excess >= first.text.length) {
+        excess -= first.text.length;
+        request.local_segments_omitted_chars =
+                Number(request.local_segments_omitted_chars || 0) + first.text.length;
+        request.segments.shift();
+        request.liveSegmentsFrom = Math.max(0, Number(request.liveSegmentsFrom || 0) - 1);
+      } else {
+        first.text = first.text.slice(excess);
+        request.local_segments_omitted_chars =
+                Number(request.local_segments_omitted_chars || 0) + excess;
+        excess = 0;
+      }
+    }
+  }
+
   // ------------------------------------------------------------------------
   // Store: holds all request records and broadcasts change events. Custom
   // elements subscribe via the document-level event bus on `store`.
@@ -570,6 +716,7 @@
           events: [],
           tileSpans: [],
           tileLastKind: null,
+          tileRequestChars: 0,
           temperature: null,
           reasoningUserToggles: new Map(),
           // Detail-view local state: accordion open/close choices the user made
@@ -578,7 +725,9 @@
           // represented structurally in the latest payload event).
           detailToggles: new Map(),
           liveSegmentsFrom: 0,
-          breakNextSegmentMerge: false
+          breakNextSegmentMerge: false,
+          local_payload_previews_omitted: 0,
+          local_segments_omitted_chars: 0,
         });
         this.order.unshift(id);
       }
@@ -636,10 +785,10 @@
             const rb = this.requests.get(b);
             return Number(rb?.started_at_ms || 0) - Number(ra?.started_at_ms || 0);
           });
-          // The snapshot replays ALL segments before ALL events, so the live
-          // event-order watermark couldn't be tracked during replay; recompute
-          // it from timestamps (server-side merged segments keep their FIRST
-          // chunk's timestamp, so run starts are comparable to event times).
+          enforceTotalPayloadPreviewBudget(this);
+          // Recompute the current-round watermark from protocol-v2 payload
+          // sequence ids. This also supports protocol-v1 snapshots through the
+          // timestamp fallback in computeLiveSegmentsFrom.
           for (const request of this.requests.values()) {
             request.liveSegmentsFrom = computeLiveSegmentsFrom(request);
           }
@@ -656,10 +805,11 @@
           const exists = this.requests.has(id);
           const request = this.ensureRequest(id);
           // Don't clobber locally-tracked tile fields.
-          const { tileSpans, tileLastKind, temperature, reasoningUserToggles } = request;
+          const { tileSpans, tileLastKind, tileRequestChars, temperature, reasoningUserToggles } = request;
           Object.assign(request, message.request);
           request.tileSpans = tileSpans;
           request.tileLastKind = tileLastKind;
+          request.tileRequestChars = tileRequestChars;
           request.temperature = temperature;
           request.reasoningUserToggles = reasoningUserToggles;
           request.segments ||= [];
@@ -684,7 +834,9 @@
           const request = this.ensureRequest(id);
           request.updated_at_ms = message.segment.timestamp_ms || Date.now();
           const last = request.segments[request.segments.length - 1];
-          if (last && last.kind === message.segment.kind && !request.breakNextSegmentMerge) {
+          if (last && last.kind === message.segment.kind
+                  && Number(last.payload_sequence || 0) === Number(message.segment.payload_sequence || 0)
+                  && !request.breakNextSegmentMerge) {
             // Merge into the run but KEEP the run's first-chunk timestamp —
             // the detail view compares run starts against payload-event times.
             last.text += message.segment.text;
@@ -692,6 +844,7 @@
             request.breakNextSegmentMerge = false;
             request.segments.push(message.segment);
           }
+          enforceSegmentTextBudget(request);
           tileBuffer.appendSegment(request, message.segment.kind, message.segment.text);
           if (this._snapshotLoading) return;
           this._emit("request-changed", { id });
@@ -703,13 +856,16 @@
           const request = this.ensureRequest(id);
           request.updated_at_ms = message.event.timestamp_ms || Date.now();
           request.events.push(message.event);
+          enforcePayloadPreviewBudget(request);
+          const globallyChanged = this._snapshotLoading
+                  ? new Set()
+                  : enforceTotalPayloadPreviewBudget(this);
           const kind = message.event.kind;
           if (kind === "upstream_request" || kind === "request_payload") {
             // Payload boundary: stream content after this point belongs to the
             // new round; everything before it is represented structurally in
-            // this payload. Snapshot replay sends segments before events, so
-            // only trust live ordering here (snapshot_done recomputes from
-            // timestamps). Break the tail merge so the boundary is exact.
+            // this payload. Snapshot replay suppresses local watermark updates
+            // and snapshot_done recomputes from exact payload sequence ids.
             if (!this._snapshotLoading) {
               request.liveSegmentsFrom = request.segments.length;
               request.breakNextSegmentMerge = true;
@@ -718,6 +874,9 @@
           tileBuffer.applyEvent(request, message.event);
           if (this._snapshotLoading) return;
           this._emit("request-changed", { id });
+          for (const changedId of globallyChanged) {
+            if (changedId !== id) this._emit("request-changed", { id: changedId });
+          }
           return;
         }
 
@@ -814,7 +973,14 @@
       const ws = new WebSocket(`${scheme}://${location.host}/debug/ws`);
       this._setStatus("connecting", "connecting");
       ws.addEventListener("open", () => this._setStatus("open", "live"));
-      ws.addEventListener("message", e => this.store.applyMessage(JSON.parse(e.data)));
+      ws.addEventListener("message", e => {
+        try {
+          this.store.applyMessage(JSON.parse(e.data));
+        } catch (error) {
+          console.error("invalid /debug/ws frame", error);
+          this._setStatus("error", "protocol error");
+        }
+      });
       ws.addEventListener("close", () => {
         this._setStatus("closed", "closed");
         setTimeout(() => this._connect(), 1000);
@@ -1938,6 +2104,9 @@
   const ROLE_LABELS = {
     reasoning: "Reasoning",
     meta: "Item",
+    instructions: "Instructions",
+    system: "System",
+    developer: "Developer",
     user: "User",
     assistant: "Assistant",
   };
@@ -2168,8 +2337,19 @@
       if (typeof request.temperature === "number") {
         parts.push(`<span class="chip">T=${request.temperature.toFixed(2)}</span>`);
       }
-      if (this._truncatedPreview) {
-        parts.push(`<span class="chip warn" title="The server truncated this payload preview; the earliest turns may be missing.">truncated preview</span>`);
+      if (this._incompletePreview) {
+        parts.push(`<span class="chip warn" title="No structurally complete payload preview was retained; displayed entries are an explicitly partial fallback.">incomplete preview</span>`);
+      } else if (this._truncatedPreview) {
+        parts.push(`<span class="chip warn" title="Large string values were elided, but the complete turn structure was retained.">payload text elided</span>`);
+      }
+      const omittedSegments = Number(request.segments_omitted_chars || 0)
+              + Number(request.local_segments_omitted_chars || 0);
+      const omittedEvents = Number(request.events_omitted || 0);
+      const omittedPayloads = Number(request.payload_previews_omitted || 0)
+              + Number(request.local_payload_previews_omitted || 0);
+      if (omittedSegments || omittedEvents || omittedPayloads) {
+        const detail = `${formatCount(omittedSegments)} streamed chars, ${formatCount(omittedEvents)} events, ${formatCount(omittedPayloads)} payload previews omitted from retained history`;
+        parts.push(`<span class="chip warn" title="${escapeHtml(detail)}">retention loss</span>`);
       }
       const html = parts.join("");
       if (this._chipsHtml !== html) {
@@ -2218,16 +2398,49 @@
     // streaming deltas.
     _conversationFor(request) {
       const candidates = payloadEventCandidates(request);
-      const cacheKey = `${request.response_id}:${candidates.length}`;
+      const newest = candidates[0];
+      const cacheKey = `${request.response_id}:${candidates.length}:${newest?.sequence || newest?.timestamp_ms || 0}:${newest?.payload_preview?.length || 0}:${request.payload_budget_version || 0}`;
       if (this._convoCacheKey === cacheKey) return this._convoCache;
       let convo = null;
       let usedIndex = -1;
+      let partial = null;
+      let skippedIncompleteCandidate = false;
       for (let i = 0; i < candidates.length; i++) {
         const parsed = parseConversationEvent(candidates[i]);
         if (parsed && (parsed.items.length || parsed.system)) {
-          convo = parsed;
-          usedIndex = i;
-          break;
+          if (parsed.structurallyComplete) {
+            convo = parsed;
+            usedIndex = i;
+            convo.skippedNewerIncomplete = skippedIncompleteCandidate;
+            break;
+          }
+          if (!partial) partial = { convo: parsed, index: i };
+          skippedIncompleteCandidate = true;
+        } else if (candidates[i].payload_truncated || candidates[i].payload_retention_omitted) {
+          skippedIncompleteCandidate = true;
+        }
+      }
+      if (!convo && partial) {
+        convo = partial.convo;
+        usedIndex = partial.index;
+      }
+      if (!convo) {
+        const unavailable = [...(request.events || [])].reverse().find(event =>
+          event && (event.kind === "upstream_request" || event.kind === "request_payload")
+                  && (event.payload_truncated || event.payload_retention_omitted)
+        );
+        if (unavailable) {
+          const expected = Number(unavailable.payload_entry_count);
+          convo = {
+            system: "",
+            items: [],
+            sourceEntryCount: 0,
+            expectedEntries: Number.isFinite(expected) ? expected : null,
+            structurallyComplete: false,
+            truncated: Boolean(unavailable.payload_truncated),
+            unavailable: true,
+            event: unavailable,
+          };
         }
       }
       // Item count of the PREVIOUS same-kind payload: items below it are
@@ -2247,6 +2460,8 @@
       this._convoCache = convo;
       this._prevItemCount = prevCount;
       this._truncatedPreview = !!convo?.truncated;
+      this._incompletePreview = !!convo
+              && (!convo.structurallyComplete || convo.skippedNewerIncomplete);
       return convo;
     }
 
@@ -2255,6 +2470,19 @@
     _messageSections(request, convo) {
       const sections = [];
       if (convo) {
+        if (!convo.structurallyComplete || convo.skippedNewerIncomplete) {
+          const expected = convo.expectedEntries === null ? "unknown" : formatCount(convo.expectedEntries);
+          const body = convo.unavailable
+                  ? "No structurally complete payload body remains in retained debug history. Raw and Events show the explicit omission record."
+                  : convo.skippedNewerIncomplete
+                  ? "A newer payload preview was unavailable or structurally incomplete. This is the newest complete retained payload; subsequent live segments are shown below."
+                  : `The retained payload could not be reconstructed completely (expected entries: ${expected}, recovered: ${formatCount(convo.sourceEntryCount)}).`;
+          sections.push({
+            key: "preview-incomplete", type: "message", label: "Incomplete payload preview", role: "meta",
+            body,
+            stale: false, defaultOpen: true,
+          });
+        }
         if (convo.system) {
           sections.push({
             key: "sys", type: "message", label: "System", role: "system",
@@ -2439,7 +2667,13 @@
     // ---- raw tab -----------------------------------------------------------
 
     _renderRaw(request) {
-      const state = (this._paneState ||= { kind: "raw" });
+      let state = (this._paneState ||= { kind: "raw" });
+      const payloadBudgetVersion = Number(request.payload_budget_version || 0);
+      if (state.built && state.payloadBudgetVersion !== payloadBudgetVersion) {
+        this._paneState = { kind: "raw" };
+        state = this._paneState;
+      }
+      state.payloadBudgetVersion = payloadBudgetVersion;
       if (!state.built) {
         state.built = true;
         this._pane.replaceChildren();
@@ -2461,8 +2695,8 @@
         state.receivedLen = -1;
       }
       const events = request.events || [];
-      const client = events.filter(e => e.kind === "request_payload" && e.payload_preview);
-      const upstream = events.filter(e => e.kind === "upstream_request" && e.payload_preview);
+      const client = events.filter(e => e.kind === "request_payload");
+      const upstream = events.filter(e => e.kind === "upstream_request");
       state.clientCount = this._appendPayloadBlocks(state.clientWrap, client, state.clientCount, "No client payload captured");
       state.upstreamCount = this._appendPayloadBlocks(state.upstreamWrap, upstream, state.upstreamCount, "No upstream request yet");
 
@@ -2510,13 +2744,18 @@
         head.className = "raw-block-head";
         const meta = document.createElement("span");
         meta.className = "raw-subhead";
-        meta.textContent = `#${i + 1} · ${formatTime(event.timestamp_ms)} · ${formatCount(event.payload_preview.length)} chars`;
+        const retainedChars = event.payload_preview?.length || 0;
+        const originalChars = Number(event.payload_original_chars || retainedChars);
+        const size = event.payload_retention_omitted
+                ? `${formatCount(originalChars)} chars · body omitted`
+                : `${formatCount(retainedChars)} chars`;
+        meta.textContent = `#${i + 1} · ${formatTime(event.timestamp_ms)} · ${size}`;
         head.appendChild(meta);
-        head.appendChild(makeCopyButton(() => event.payload_preview));
+        if (event.payload_preview) head.appendChild(makeCopyButton(() => event.payload_preview));
         block.appendChild(head);
         const pre = document.createElement("pre");
         pre.className = "payload";
-        pre.textContent = event.payload_preview;
+        pre.textContent = event.payload_preview || "[payload omitted from retained debug history]";
         block.appendChild(pre);
         wrap.appendChild(block);
       }
@@ -2572,13 +2811,15 @@
       return details;
     }
 
-    _hasDetail(event) { return Boolean(event.payload_preview || event.images?.length); }
+    _hasDetail(event) {
+      return Boolean(event.payload_preview || event.payload_retention_omitted || event.images?.length);
+    }
 
     _appendPayload(parent, event) {
-      if (!event.payload_preview) return;
+      if (!event.payload_preview && !event.payload_retention_omitted) return;
       const pre = document.createElement("pre");
       pre.className = "payload";
-      pre.textContent = event.payload_preview;
+      pre.textContent = event.payload_preview || "[payload omitted from retained debug history]";
       parent.appendChild(pre);
     }
 

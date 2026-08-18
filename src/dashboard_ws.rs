@@ -1404,7 +1404,9 @@ mod tests {
                 DebugWsMessage::SegmentAppend {
                     response_id: "resp_001".to_string(),
                     segment: DebugSegment {
+                        sequence: 0,
                         timestamp_ms: 1,
+                        payload_sequence: 0,
                         kind: DebugSegmentKind::Output,
                         text: "Hello".to_string(),
                     },
@@ -1412,7 +1414,9 @@ mod tests {
                 DebugWsMessage::SegmentAppend {
                     response_id: "resp_001".to_string(),
                     segment: DebugSegment {
+                        sequence: 0,
                         timestamp_ms: 2,
+                        payload_sequence: 0,
                         kind: DebugSegmentKind::Output,
                         text: ", world".to_string(),
                     },
@@ -1513,7 +1517,9 @@ mod tests {
                 DebugWsMessage::SegmentAppend {
                     response_id: "resp_001".to_string(),
                     segment: DebugSegment {
+                        sequence: 0,
                         timestamp_ms: 1,
+                        payload_sequence: 0,
                         kind: DebugSegmentKind::Output,
                         text: "hi".to_string(),
                     },
@@ -2045,6 +2051,9 @@ mod tests {
                             },
                             error: None,
                             usage: None,
+                            segments_omitted_chars: 0,
+                            events_omitted: 0,
+                            payload_previews_omitted: 0,
                         },
                     },
                 },
@@ -2052,7 +2061,9 @@ mod tests {
                     message: DebugWsMessage::SegmentAppend {
                         response_id: "resp_001".to_string(),
                         segment: DebugSegment {
+                            sequence: 0,
                             timestamp_ms: 1718900000001,
+                            payload_sequence: 0,
                             kind: DebugSegmentKind::Output,
                             text: "Hello".to_string(),
                         },
@@ -2062,7 +2073,9 @@ mod tests {
                     message: DebugWsMessage::SegmentAppend {
                         response_id: "resp_001".to_string(),
                         segment: DebugSegment {
+                            sequence: 0,
                             timestamp_ms: 1718900000002,
+                            payload_sequence: 0,
                             kind: DebugSegmentKind::Output,
                             text: ", world".to_string(),
                         },

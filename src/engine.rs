@@ -2120,6 +2120,9 @@ impl Gateway {
                 preview_json_limited_with_images(&request, PAYLOAD_PREVIEW_CHAR_LIMIT);
             MonitorEventKind::RequestPayload {
                 payload_preview: request_preview.text,
+                payload_truncated: request_preview.truncated,
+                payload_original_chars: request_preview.original_chars,
+                payload_entry_count: request.input.len(),
                 images: request_preview.images,
             }
         });
@@ -2399,6 +2402,8 @@ impl Gateway {
                             .map(|value| value.to_string().chars().count())
                             .sum::<usize>(),
                     payload_preview: upstream_preview.text,
+                    payload_truncated: upstream_preview.truncated,
+                    payload_original_chars: upstream_preview.original_chars,
                     images: upstream_preview.images,
                 }
             });
@@ -2975,6 +2980,9 @@ impl Gateway {
             MonitorEventKind::FinalResponse {
                 status: resource.status.clone(),
                 payload_preview: final_preview.text,
+                payload_truncated: final_preview.truncated,
+                payload_original_chars: final_preview.original_chars,
+                payload_entry_count: resource.output.len(),
                 images: final_preview.images,
             }
         });
@@ -3793,18 +3801,14 @@ where
 }
 
 /// Character budget for per-item previews (response items on the events
-/// timeline). Generous enough that a whole item's text is displayed in full;
-/// leaf elision + the whole-preview cut remain as pathological-case guards.
+/// timeline). Oversized string leaves are elided without cutting JSON syntax.
 const ITEM_PREVIEW_CHAR_LIMIT: usize = 64 * 1024;
 
 /// Character budget for the large request/upstream/final payload previews
 /// broadcast to the debug UI. Deliberately huge: the debug UI shows message
-/// text IN FULL when a turn is expanded, so any realistic agent-scale payload
-/// (even a ~1M-token context) must fit un-elided. Leaf elision
-/// (`elide_long_strings_in_value`) and the final character cut only guard
-/// against pathological payloads — the debug UI parses these previews back
-/// into structured turns, so staying valid JSON matters more than shaving
-/// broadcast bytes on this opt-in surface.
+/// text in full when the payload fits. Oversized payloads retain their complete
+/// messages[]/input[] structure while large string leaves carry explicit
+/// omission markers; previews are never cut into invalid JSON.
 const PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 8 * 1024 * 1024;
 
 fn preview_json_limited<T>(value: &T, limit: usize) -> String
@@ -3818,6 +3822,8 @@ where
 struct JsonPreview {
     text: String,
     images: Vec<DebugEventImage>,
+    truncated: bool,
+    original_chars: usize,
 }
 
 fn preview_json_limited_with_images<T>(value: &T, limit: usize) -> JsonPreview
@@ -3825,52 +3831,90 @@ where
     T: Serialize,
 {
     let mut images = Vec::new();
-    let rendered = match serde_json::to_value(value) {
-        Ok(mut value) => {
-            // First collect image METADATA cards (mime/size/path) for the debug
-            // UI — without the raw bytes. Then redact ALL image URIs (data: and
-            // raw/escaped http(s), case-insensitive) in the preview TEXT via the
-            // shared redactor, so the broadcast preview never carries image
-            // content (G4 round-4 #4 — the weaker bespoke redactor missed
-            // remote/signed URLs and uppercase DATA:).
-            collect_data_image_cards(&value, "$", &mut images);
-            crate::redaction::redact_image_uris_in_value(&mut value);
-            match serde_json::to_string_pretty(&value) {
-                Ok(text) if text.chars().count() > limit => {
-                    // Over budget: elide long string LEAVES (file dumps, huge
-                    // tool outputs) and re-render before falling back to the
-                    // whole-preview character cut below. The debug UI parses
-                    // these previews back into conversation turns, so a cut
-                    // that breaks JSON parseability (and silently drops every
-                    // turn serialized after the cut) is a last resort; eliding
-                    // leaves keeps one giant message from evicting the rest of
-                    // the conversation. Runs AFTER image-URI redaction so the
-                    // redactor always sees the full string.
-                    let leaf_cap = (limit / 4).max(256);
-                    elide_long_strings_in_value(&mut value, leaf_cap);
-                    serde_json::to_string_pretty(&value)
-                }
-                other => other,
-            }
+    let mut value = match serde_json::to_value(value) {
+        Ok(value) => value,
+        Err(err) => {
+            let text = serde_json::to_string_pretty(&serde_json::json!({
+                "serialization_error": err.to_string(),
+            }))
+            .expect("serialization error diagnostic serializes");
+            return JsonPreview {
+                original_chars: text.chars().count(),
+                text,
+                images,
+                truncated: false,
+            };
         }
-        Err(err) => Err(err),
+    };
+
+    // Collect image metadata before redaction, then ensure every candidate
+    // preview is derived from the same fully-redacted value.
+    collect_data_image_cards(&value, "$", &mut images);
+    crate::redaction::redact_image_uris_in_value(&mut value);
+    let original =
+        serde_json::to_string_pretty(&value).expect("serde_json::Value always serializes");
+    let original_chars = original.chars().count();
+    if original_chars <= limit {
+        return JsonPreview {
+            text: original,
+            images,
+            truncated: false,
+            original_chars,
+        };
     }
-    .unwrap_or_else(|err| format!("{{\"serialization_error\":\"{err}\"}}"));
-    if rendered.chars().count() <= limit {
-        JsonPreview {
-            text: rendered,
-            images,
+
+    // Reduce leaf text progressively while preserving the complete JSON
+    // structure. In particular, every messages[]/input[] entry survives; the UI
+    // can render an explicit per-leaf omission marker without inventing a
+    // syntactically valid prefix that silently loses later turns.
+    let leaf_caps = [
+        (limit / 4).max(64),
+        (limit / 16).max(64),
+        (limit / 64).max(64),
+        (limit / 256).max(64),
+        4 * 1024,
+        1024,
+        256,
+        64,
+    ];
+    let mut previous_cap = usize::MAX;
+    for cap in leaf_caps {
+        if cap >= previous_cap {
+            continue;
         }
-    } else {
-        let end = rendered
-            .char_indices()
-            .nth(limit)
-            .map(|(index, _)| index)
-            .unwrap_or(rendered.len());
-        JsonPreview {
-            text: format!("{}...\n[truncated]", &rendered[..end]),
-            images,
+        previous_cap = cap;
+        let mut candidate = value.clone();
+        elide_long_strings_in_value(&mut candidate, cap);
+        let Ok(rendered) = serde_json::to_string_pretty(&candidate) else {
+            continue;
+        };
+        if rendered.chars().count() <= limit {
+            return JsonPreview {
+                text: rendered,
+                images,
+                truncated: true,
+                original_chars,
+            };
         }
+    }
+
+    // If object/array structure alone exceeds the budget, return a small VALID
+    // JSON diagnostic instead of cutting through JSON. The event's exact entry
+    // count lets the client reject this as structurally incomplete and fall
+    // back to another payload rather than presenting it as authoritative.
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "_llmconduit_debug_preview": {
+            "omitted": true,
+            "reason": "JSON structure exceeds the debug preview budget",
+            "original_chars": original_chars,
+        }
+    }))
+    .expect("debug preview diagnostic serializes");
+    JsonPreview {
+        text,
+        images,
+        truncated: true,
+        original_chars,
     }
 }
 
@@ -4201,19 +4245,23 @@ mod tests {
     }
 
     #[test]
-    fn preview_json_truncates_as_last_resort_on_char_boundary() {
-        // So many sub-cap string leaves that even the elided render exceeds the
-        // budget: the whole-preview character cut still applies (and cuts on a
-        // char boundary).
+    fn preview_json_progressively_elides_many_leaves_without_losing_entries() {
+        // Many individually modest leaves can exceed the aggregate budget. The
+        // preview must remain valid JSON and retain every array entry instead of
+        // manufacturing a parseable prefix that loses the suffix.
         let per_leaf = 99;
         let count = super::ITEM_PREVIEW_CHAR_LIMIT / per_leaf + 100;
         let items: Vec<_> = (0..count)
             .map(|_| json!(format!("{}é", "a".repeat(per_leaf))))
             .collect();
         let value = json!(items);
-        let preview = preview_json(&value);
-        assert!(preview.ends_with("...\n[truncated]"));
-        assert!(preview.is_char_boundary(preview.len()));
+        let preview =
+            super::preview_json_limited_with_images(&value, super::ITEM_PREVIEW_CHAR_LIMIT);
+        assert!(preview.truncated);
+        assert!(preview.original_chars > super::ITEM_PREVIEW_CHAR_LIMIT);
+        let parsed: serde_json::Value = serde_json::from_str(&preview.text).expect("valid JSON");
+        assert_eq!(parsed.as_array().expect("array").len(), count);
+        assert!(preview.text.contains("… [+"));
     }
 
     #[test]
