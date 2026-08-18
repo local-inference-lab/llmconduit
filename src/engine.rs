@@ -2116,7 +2116,8 @@ impl Gateway {
             }
         });
         self.monitor.emit_with(response_id.as_str(), || {
-            let request_preview = preview_json_limited_with_images(&request, 128 * 1024);
+            let request_preview =
+                preview_json_limited_with_images(&request, PAYLOAD_PREVIEW_CHAR_LIMIT);
             MonitorEventKind::RequestPayload {
                 payload_preview: request_preview.text,
                 images: request_preview.images,
@@ -2284,11 +2285,54 @@ impl Gateway {
                     extra_body: upstream_extra_body.clone(),
                 },
             );
+            // D6: compose kill with hangup before opening the upstream stream.
+            if tx.is_closed() || abort_token.is_cancelled() {
+                return Err(AppError::cancelled());
+            }
+            let backend_request = crate::upstream::BackendChatRequest::new(
+                upstream_request.clone(),
+                client_chat_template_kwargs.clone(),
+                // D2: thread the flow's `resp_{uuid}` so the leaf can key its on-wire
+                // capture to this flow's FlowStore record, and share the per-flow
+                // serving token so routing/failover can tag `{route, provider}`.
+                Some(response_id.clone()),
+                Some(Arc::clone(&serving_token)),
+            )
+            .with_thinking_override(request.thinking)
+            // F1d: attach the turn-capture handle (see above) so the leaf's
+            // `upstream_request` write can reach this turn's artifact.
+            .with_capture(capture.clone());
+            let stream_result = tokio::select! {
+                biased;
+                _ = tx.closed() => return Err(AppError::cancelled()),
+                // D6: a kill while awaiting the upstream connect cancels it (499), same
+                // as a hang-up. `biased` keeps the cancel branches highest-priority.
+                _ = abort_token.cancelled() => return Err(AppError::cancelled()),
+                result = self.upstream.stream_chat_completion_with_timeout(
+                    &backend_request,
+                    self.config.request_timeout,
+                ) => result,
+            };
+            // The leaf finalizes profile/provider kwargs only after routing and
+            // failover choose the concrete backend. Emit the debug request AFTER
+            // that dispatch seam and prefer the FlowStore's captured on-wire body;
+            // emitting the engine's pre-routing request here used to hide fields
+            // such as `chat_template_kwargs.enable_thinking` from both debug UIs.
+            // Keep the pre-routing request only as a fallback for uninstrumented
+            // test gateways where the FlowStore is disabled.
             self.monitor.emit_with(response_id.as_str(), || {
-                let upstream_debug_request =
-                    sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
-                let upstream_preview =
-                    preview_json_limited_with_images(&upstream_debug_request, 128 * 1024);
+                let upstream_debug_request = self
+                    .flow_store
+                    .detail(response_id.as_str())
+                    .and_then(|record| record.upstream_body.clone())
+                    .and_then(|body| serde_json::from_slice(&body).ok())
+                    .unwrap_or_else(|| {
+                        sanitize_chat_request(upstream_request.clone(), self.config.flatten_content)
+                    });
+                let upstream_preview = preview_json_limited_with_images(
+                    &upstream_debug_request,
+                    PAYLOAD_PREVIEW_CHAR_LIMIT,
+                );
                 MonitorEventKind::UpstreamRequest {
                     request_index: upstream_request_index,
                     message_count: upstream_debug_request.messages.len(),
@@ -2358,34 +2402,7 @@ impl Gateway {
                     images: upstream_preview.images,
                 }
             });
-            // D6: compose kill with hangup before opening the upstream stream.
-            if tx.is_closed() || abort_token.is_cancelled() {
-                return Err(AppError::cancelled());
-            }
-            let backend_request = crate::upstream::BackendChatRequest::new(
-                upstream_request.clone(),
-                client_chat_template_kwargs.clone(),
-                // D2: thread the flow's `resp_{uuid}` so the leaf can key its on-wire
-                // capture to this flow's FlowStore record, and share the per-flow
-                // serving token so routing/failover can tag `{route, provider}`.
-                Some(response_id.clone()),
-                Some(Arc::clone(&serving_token)),
-            )
-            .with_thinking_override(request.thinking)
-            // F1d: attach the turn-capture handle (see above) so the leaf's
-            // `upstream_request` write can reach this turn's artifact.
-            .with_capture(capture.clone());
-            let mut stream = tokio::select! {
-                biased;
-                _ = tx.closed() => return Err(AppError::cancelled()),
-                // D6: a kill while awaiting the upstream connect cancels it (499), same
-                // as a hang-up. `biased` keeps the cancel branches highest-priority.
-                _ = abort_token.cancelled() => return Err(AppError::cancelled()),
-                result = self.upstream.stream_chat_completion_with_timeout(
-                    &backend_request,
-                    self.config.request_timeout,
-                ) => result?,
-            };
+            let mut stream = stream_result?;
             let mut state = StreamState::default();
             let mut turn_usage: Option<ChunkUsage> = None;
             // D3: the flow's cumulative usage BEFORE this turn. OpenAI usage chunks
@@ -2953,7 +2970,8 @@ impl Gateway {
             terminal_reason: Some(terminal_reason),
         };
         self.monitor.emit_with(response_id.as_str(), || {
-            let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);
+            let final_preview =
+                preview_json_limited_with_images(&resource, PAYLOAD_PREVIEW_CHAR_LIMIT);
             MonitorEventKind::FinalResponse {
                 status: resource.status.clone(),
                 payload_preview: final_preview.text,
@@ -3771,8 +3789,23 @@ fn preview_json<T>(value: &T) -> String
 where
     T: Serialize,
 {
-    preview_json_limited(value, 4_000)
+    preview_json_limited(value, ITEM_PREVIEW_CHAR_LIMIT)
 }
+
+/// Character budget for per-item previews (response items on the events
+/// timeline). Generous enough that a whole item's text is displayed in full;
+/// leaf elision + the whole-preview cut remain as pathological-case guards.
+const ITEM_PREVIEW_CHAR_LIMIT: usize = 64 * 1024;
+
+/// Character budget for the large request/upstream/final payload previews
+/// broadcast to the debug UI. Deliberately huge: the debug UI shows message
+/// text IN FULL when a turn is expanded, so any realistic agent-scale payload
+/// (even a ~1M-token context) must fit un-elided. Leaf elision
+/// (`elide_long_strings_in_value`) and the final character cut only guard
+/// against pathological payloads — the debug UI parses these previews back
+/// into structured turns, so staying valid JSON matters more than shaving
+/// broadcast bytes on this opt-in surface.
+const PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 8 * 1024 * 1024;
 
 fn preview_json_limited<T>(value: &T, limit: usize) -> String
 where
@@ -3802,7 +3835,23 @@ where
             // remote/signed URLs and uppercase DATA:).
             collect_data_image_cards(&value, "$", &mut images);
             crate::redaction::redact_image_uris_in_value(&mut value);
-            serde_json::to_string_pretty(&value)
+            match serde_json::to_string_pretty(&value) {
+                Ok(text) if text.chars().count() > limit => {
+                    // Over budget: elide long string LEAVES (file dumps, huge
+                    // tool outputs) and re-render before falling back to the
+                    // whole-preview character cut below. The debug UI parses
+                    // these previews back into conversation turns, so a cut
+                    // that breaks JSON parseability (and silently drops every
+                    // turn serialized after the cut) is a last resort; eliding
+                    // leaves keeps one giant message from evicting the rest of
+                    // the conversation. Runs AFTER image-URI redaction so the
+                    // redactor always sees the full string.
+                    let leaf_cap = (limit / 4).max(256);
+                    elide_long_strings_in_value(&mut value, leaf_cap);
+                    serde_json::to_string_pretty(&value)
+                }
+                other => other,
+            }
         }
         Err(err) => Err(err),
     }
@@ -3822,6 +3871,37 @@ where
             text: format!("{}...\n[truncated]", &rendered[..end]),
             images,
         }
+    }
+}
+
+/// Truncate every string LEAF longer than `cap` chars to `cap` chars plus a
+/// `… [+N chars]` marker, in place. Keys are left alone; only values shrink.
+fn elide_long_strings_in_value(value: &mut Value, cap: usize) {
+    match value {
+        Value::String(text) => {
+            let total = text.chars().count();
+            if total > cap {
+                let end = text
+                    .char_indices()
+                    .nth(cap)
+                    .map(|(index, _)| index)
+                    .unwrap_or(text.len());
+                let omitted = total - cap;
+                text.truncate(end);
+                text.push_str(&format!("… [+{omitted} chars]"));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                elide_long_strings_in_value(item, cap);
+            }
+        }
+        Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                elide_long_strings_in_value(item, cap);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -4060,8 +4140,77 @@ mod tests {
     }
 
     #[test]
-    fn preview_json_truncates_on_char_boundary() {
-        let value = json!({ "text": format!("{}éβ", "a".repeat(4_100)) });
+    fn payload_preview_keeps_long_message_text_fully() {
+        // The debug UI shows message text IN FULL when a turn is expanded, so
+        // a realistic long message must survive the payload preview un-elided
+        // and un-truncated.
+        let value = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "y".repeat(200_000) }]
+        });
+        let preview = super::preview_json_limited(&value, super::PAYLOAD_PREVIEW_CHAR_LIMIT);
+        assert!(!preview.contains("… [+"), "no elision marker");
+        assert!(!preview.contains("[truncated]"));
+        assert!(preview.contains(&"y".repeat(200_000)), "full text present");
+    }
+
+    #[test]
+    fn preview_json_elides_oversized_string_leaves_instead_of_truncating() {
+        // A string LEAF that alone blows the whole budget is elided in place
+        // (with a char count marker) so the preview stays VALID JSON — the
+        // debug UI parses previews back into conversation turns, and a
+        // mid-string cut used to drop every turn after it.
+        let oversized = super::ITEM_PREVIEW_CHAR_LIMIT + 4_000;
+        let value = json!({ "text": format!("{}éβ", "a".repeat(oversized)) });
+        let preview = preview_json(&value);
+        assert!(!preview.contains("[truncated]"));
+        let parsed: serde_json::Value = serde_json::from_str(&preview).expect("valid JSON");
+        let text = parsed["text"].as_str().expect("string leaf");
+        assert!(text.contains("… [+"), "elision marker present");
+        assert!(text.chars().count() < oversized);
+        assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn preview_json_elision_keeps_every_conversation_turn() {
+        // A many-turn conversation where ONE giant message used to evict all
+        // later turns via the whole-preview cut: after leaf elision every turn
+        // survives and the preview parses.
+        let giant = "x".repeat(super::ITEM_PREVIEW_CHAR_LIMIT + 10_000);
+        let mut messages = vec![json!({ "role": "user", "content": giant })];
+        for index in 0..20 {
+            messages.push(json!({ "role": "assistant", "content": format!("turn {index}") }));
+        }
+        let value = json!({ "model": "m", "messages": messages });
+        let preview = preview_json(&value);
+        let parsed: serde_json::Value = serde_json::from_str(&preview).expect("valid JSON");
+        let parsed_messages = parsed["messages"].as_array().expect("messages array");
+        assert_eq!(parsed_messages.len(), 21, "every turn retained");
+        assert!(preview.contains("turn 19"), "last turn visible");
+    }
+
+    #[test]
+    fn preview_json_under_budget_is_not_elided() {
+        // Elision only kicks in when the FULL render exceeds the limit; small
+        // payloads keep full fidelity even with individually long-ish strings.
+        let long_but_fits = "b".repeat(2_000);
+        let value = json!({ "text": long_but_fits });
+        let preview = preview_json(&value);
+        assert!(!preview.contains("… [+"));
+        assert!(preview.contains(&"b".repeat(2_000)));
+    }
+
+    #[test]
+    fn preview_json_truncates_as_last_resort_on_char_boundary() {
+        // So many sub-cap string leaves that even the elided render exceeds the
+        // budget: the whole-preview character cut still applies (and cuts on a
+        // char boundary).
+        let per_leaf = 99;
+        let count = super::ITEM_PREVIEW_CHAR_LIMIT / per_leaf + 100;
+        let items: Vec<_> = (0..count)
+            .map(|_| json!(format!("{}é", "a".repeat(per_leaf))))
+            .collect();
+        let value = json!(items);
         let preview = preview_json(&value);
         assert!(preview.ends_with("...\n[truncated]"));
         assert!(preview.is_char_boundary(preview.len()));

@@ -6269,6 +6269,13 @@ async fn d13_wiremock_app() -> (axum::Router, Arc<Gateway>, MockServer) {
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
     config.price_table = d13_price_table();
+    // Exercise leaf-only finalization in the UI regression below: this default is
+    // absent from the engine's pre-routing request and appears only on the actual
+    // on-wire request after `finalize_request_for_backend` runs.
+    config.upstream_chat_kwargs.insert(
+        "chat_template_kwargs".to_string(),
+        json!({"enable_thinking": true}),
+    );
     // Loopback bind ⇒ dev-open auth (the routes register, no token required).
     let (app, gateway) = llmconduit::build_app_with_gateway_and_options(
         config,
@@ -6617,6 +6624,11 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         detail["upstream_body"]["model"],
         serde_json::json!("glm-5.1")
     );
+    assert_eq!(
+        detail["upstream_body"]["chat_template_kwargs"]["enable_thinking"],
+        serde_json::json!(true),
+        "leaf-finalized kwargs are present in the authoritative wire body"
+    );
     // (D13 R1 HIGH) The MIDDLE pane: the engine captures the NORMALIZED canonical
     // body (the internal `ResponsesRequest` after the inbound→canonical adapter, just
     // before lowering) via `set_normalized`, so `normalized` is NON-absent, parses as
@@ -6657,6 +6669,20 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     assert!(
         detail["deltas"].is_array(),
         "deltas replayed from the monitor"
+    );
+    let upstream_preview = detail["deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["kind"] == serde_json::json!("event.upstream_request"))
+        .and_then(|delta| delta["payload"]["payload_preview"].as_str())
+        .expect("upstream request timeline preview");
+    let upstream_preview: serde_json::Value =
+        serde_json::from_str(upstream_preview).expect("timeline preview is JSON");
+    assert_eq!(
+        upstream_preview["chat_template_kwargs"]["enable_thinking"],
+        serde_json::json!(true),
+        "UI timeline shows the post-finalization request rather than the engine preview"
     );
     let cost = detail["cost"].as_f64().expect("detail cost priced");
     assert!((cost - 0.425).abs() < 1e-9, "detail cost {cost} == 0.425");

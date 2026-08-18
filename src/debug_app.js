@@ -34,6 +34,387 @@
     return `${bytes} B`;
   };
 
+  const formatCompact = (value) => {
+    const n = Number(value || 0);
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 10e3) return `${Math.round(n / 1e3)}k`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+    return String(n);
+  };
+
+  // Segments index where the current round's live stream begins, derived from
+  // timestamps: the first run starting at/after the newest payload event.
+  // Used after snapshot replay, where event-vs-segment ordering is lost.
+  function computeLiveSegmentsFrom(request) {
+    let lastPayloadTs = 0;
+    for (const event of request.events || []) {
+      if (!event || !event.payload_preview) continue;
+      if (event.kind !== "upstream_request" && event.kind !== "request_payload") continue;
+      const ts = Number(event.timestamp_ms || 0);
+      if (ts > lastPayloadTs) lastPayloadTs = ts;
+    }
+    const segments = request.segments || [];
+    if (!lastPayloadTs) return 0;
+    for (let i = 0; i < segments.length; i++) {
+      if (Number(segments[i].timestamp_ms || 0) >= lastPayloadTs) return i;
+    }
+    return segments.length;
+  }
+
+  // ------------------------------------------------------------------------
+  // Tolerant payload parsing. Server previews elide long string leaves but can
+  // still be hard-truncated (`...\n[truncated]` suffix). A strict JSON.parse
+  // fails on those, which used to silently drop the ENTIRE conversation from
+  // the Messages tab. The repair pass closes an unterminated string, drops a
+  // dangling partial token, and closes open brackets, then parses again.
+  // ------------------------------------------------------------------------
+
+  const TRUNCATION_MARKER = "...\n[truncated]";
+
+  function parseJsonTolerant(raw) {
+    if (!raw) return { value: null, truncated: false };
+    try { return { value: JSON.parse(raw), truncated: false }; } catch (_) { /* repair below */ }
+    let text = raw;
+    if (text.endsWith(TRUNCATION_MARKER)) text = text.slice(0, -TRUNCATION_MARKER.length);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const repaired = repairTruncatedJson(text);
+      if (repaired !== null) {
+        try { return { value: JSON.parse(repaired), truncated: true }; } catch (_) { /* chop */ }
+      }
+      // The cut landed somewhere the repair pass couldn't classify: chop back
+      // to before the last comma and retry. Previews are pretty-printed, so
+      // commas at value boundaries dominate.
+      const cut = text.lastIndexOf(",");
+      if (cut <= 0) break;
+      text = text.slice(0, cut);
+    }
+    return { value: null, truncated: true };
+  }
+
+  function repairTruncatedJson(text) {
+    // One scan tracking string/escape state and the open-bracket stack.
+    const stack = [];
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === "{" || ch === "[") stack.push(ch);
+      else if (ch === "}" || ch === "]") stack.pop();
+    }
+    if (!stack.length && !inString) return null; // complete JSON; not a truncation problem
+    let out = text;
+    if (inString) {
+      if (escape) out = out.slice(0, -1); // dangling backslash
+      out = out.replace(/\\u[0-9a-fA-F]{0,3}$/, ""); // partial \uXXXX escape
+      out += '"';
+    }
+    // Normalize the tail to a clean value boundary.
+    for (let guard = 0; guard < 16; guard++) {
+      const trimmed = out.replace(/\s+$/, "");
+      if (trimmed.endsWith(",")) { out = trimmed.slice(0, -1); continue; }
+      if (trimmed.endsWith(":")) { out = trimmed + " null"; break; }
+      if (trimmed.endsWith('"')) {
+        // A complete string at the tail. In KEY position (preceded by `{` or
+        // `,`) it needs a value for the closed object to parse.
+        const start = findTailStringStart(trimmed);
+        if (start > 0) {
+          const before = trimmed.slice(0, start).replace(/\s+$/, "");
+          if (before.endsWith("{") || before.endsWith(",")) { out = trimmed + ": null"; break; }
+        }
+        out = trimmed;
+        break;
+      }
+      // A partial bare token (`tru`, `nul`, `-12.`, `1e`): drop it, re-check.
+      const token = trimmed.match(/[A-Za-z0-9+\-.eE]+$/);
+      if (token
+              && !/^(true|false|null)$/.test(token[0])
+              && !/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(token[0])) {
+        out = trimmed.slice(0, trimmed.length - token[0].length);
+        continue;
+      }
+      out = trimmed;
+      break;
+    }
+    for (let i = stack.length - 1; i >= 0; i--) out += stack[i] === "{" ? "}" : "]";
+    return out;
+  }
+
+  // Index of the opening quote of the string literal that ENDS `text` (which
+  // must end with `"`), or -1. Walks back skipping escaped quotes.
+  function findTailStringStart(text) {
+    for (let i = text.length - 2; i >= 0; i--) {
+      if (text[i] !== '"') continue;
+      let backslashes = 0;
+      for (let j = i - 1; j >= 0 && text[j] === "\\"; j--) backslashes++;
+      if (backslashes % 2 === 0) return i;
+    }
+    return -1;
+  }
+
+  // ------------------------------------------------------------------------
+  // Conversation extraction: turns a request/upstream payload preview into a
+  // uniform list of turn items (message / tool_call / tool_result), covering
+  // OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses shapes —
+  // including reasoning carried as Responses `type:"reasoning"` input items,
+  // chat-shape assistant `reasoning_content`, and Anthropic `thinking` blocks.
+  // ------------------------------------------------------------------------
+
+  function payloadEventCandidates(request) {
+    const events = request.events || [];
+    const upstream = [];
+    const client = [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      if (!event || !event.payload_preview) continue;
+      if (event.kind === "upstream_request") upstream.push(event);
+      else if (event.kind === "request_payload") client.push(event);
+    }
+    // Newest upstream payloads first (they carry the full lowered history),
+    // then client payloads as fallback.
+    return [...upstream, ...client];
+  }
+
+  function parseConversationEvent(event) {
+    if (!event) return null;
+    const { value, truncated } = parseJsonTolerant(event.payload_preview);
+    if (!value || typeof value !== "object") return null;
+    const convo = conversationFromPayload(value);
+    if (!convo) return null;
+    convo.truncated = truncated;
+    convo.event = event;
+    return convo;
+  }
+
+  function flattenTextDeep(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return value;
+    if (!Array.isArray(value)) {
+      if (typeof value === "object" && typeof value.text === "string") return value.text;
+      return "";
+    }
+    let out = "";
+    const push = (s) => {
+      if (!s) return;
+      if (out && !out.endsWith("\n")) out += "\n";
+      out += s;
+    };
+    for (const item of value) {
+      if (typeof item === "string") push(item);
+      else if (item && typeof item === "object" && typeof item.text === "string") push(item.text);
+    }
+    return out;
+  }
+
+  // Reasoning text from a Responses `type:"reasoning"` item: summary parts
+  // and/or content parts, whichever the provider populated.
+  function reasoningItemText(item) {
+    const parts = [];
+    for (const list of [item.summary, item.content]) {
+      if (!Array.isArray(list)) continue;
+      for (const block of list) {
+        if (block && typeof block === "object" && typeof block.text === "string" && block.text) {
+          parts.push(block.text);
+        } else if (typeof block === "string" && block) {
+          parts.push(block);
+        }
+      }
+    }
+    return parts.join("\n");
+  }
+
+  function conversationFromPayload(parsed) {
+    let system = "";
+    if (typeof parsed.system === "string") {
+      system = parsed.system;
+    } else if (Array.isArray(parsed.system)) {
+      system = flattenTextDeep(parsed.system);
+    }
+
+    const items = [];
+    const pushReasoning = (text) => {
+      items.push({ kind: "message", role: "reasoning", content: text || "[encrypted reasoning]" });
+    };
+    const pushFromContent = (role, content) => {
+      if (content === null || content === undefined) return;
+      if (typeof content === "string") {
+        if (content) items.push({ kind: "message", role, content });
+        return;
+      }
+      const blocks = Array.isArray(content) ? content : [content];
+      let textBuf = "";
+      const appendText = (text) => {
+        if (!text) return;
+        if (textBuf) textBuf += "\n";
+        textBuf += text;
+      };
+      const flushText = () => {
+        if (textBuf) {
+          items.push({ kind: "message", role, content: textBuf });
+          textBuf = "";
+        }
+      };
+      for (const block of blocks) {
+        if (typeof block === "string") { appendText(block); continue; }
+        if (!block || typeof block !== "object") continue;
+        const t = block.type;
+        if (t === "text" || t === "input_text" || t === "output_text" || typeof block.text === "string") {
+          appendText(block.text || "");
+        } else if (t === "thinking" || t === "redacted_thinking") {
+          flushText();
+          const thinking = typeof block.thinking === "string" && block.thinking
+                  ? block.thinking
+                  : "[redacted thinking]";
+          pushReasoning(thinking);
+        } else if (t === "tool_use") {
+          flushText();
+          items.push({
+            kind: "tool_call",
+            name: block.name || "",
+            call_id: block.id || "",
+            arguments: block.input,
+          });
+        } else if (t === "tool_result") {
+          flushText();
+          items.push({
+            kind: "tool_result",
+            call_id: block.tool_use_id || "",
+            output: block.content !== undefined ? block.content : block.output,
+          });
+        } else if (t === "refusal") {
+          appendText(`[refusal] ${block.refusal || ""}`);
+        } else if (t === "image" || t === "input_image") {
+          appendText("[image]");
+        } else {
+          appendText(`[${t || "block"}]`);
+        }
+      }
+      flushText();
+    };
+
+    if (Array.isArray(parsed.messages)) {
+      // Anthropic and OpenAI Chat Completions: top-level messages[].
+      for (const msg of parsed.messages) {
+        if (!msg) continue;
+        const role = typeof msg.role === "string" ? msg.role : "user";
+        if (role === "system" || role === "developer") {
+          if (!system) {
+            const text = typeof msg.content === "string" ? msg.content : flattenTextDeep(msg.content);
+            if (text) system = text;
+          }
+          continue;
+        }
+        if (role === "tool") {
+          // Chat Completions tool result message.
+          items.push({
+            kind: "tool_result",
+            call_id: msg.tool_call_id || "",
+            output: msg.content !== undefined ? msg.content : msg.output,
+          });
+          continue;
+        }
+        if (role === "assistant") {
+          // Reasoning lowered onto the chat assistant message (DeepSeek-style
+          // `reasoning_content`, or a bare `reasoning`/`thinking` string).
+          const reasoning = [msg.reasoning_content, msg.reasoning, msg.thinking]
+                  .find(v => typeof v === "string" && v);
+          if (reasoning) pushReasoning(reasoning);
+        }
+        pushFromContent(role, msg.content);
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            if (!tc) continue;
+            const fn = tc.function || {};
+            let args = fn.arguments;
+            if (typeof args === "string") {
+              try { args = JSON.parse(args); } catch (_) { /* keep string */ }
+            }
+            items.push({
+              kind: "tool_call",
+              name: fn.name || tc.name || "",
+              call_id: tc.id || "",
+              arguments: args,
+            });
+          }
+        }
+      }
+    } else if (parsed.input !== undefined) {
+      // OpenAI Responses: `input` is a string or an array of typed items.
+      if (Array.isArray(parsed.input)) {
+        for (const item of parsed.input) {
+          if (!item) continue;
+          if (typeof item === "string") {
+            items.push({ kind: "message", role: "user", content: item });
+            continue;
+          }
+          if (typeof item !== "object") continue;
+          const t = item.type;
+          if (t === "reasoning") {
+            pushReasoning(reasoningItemText(item));
+          } else if (t === "function_call") {
+            let args = item.arguments;
+            if (typeof args === "string") {
+              try { args = JSON.parse(args); } catch (_) { /* keep string */ }
+            }
+            items.push({
+              kind: "tool_call",
+              name: item.name || "",
+              call_id: item.call_id || item.id || "",
+              arguments: args,
+            });
+          } else if (t === "function_call_output") {
+            let out = item.output;
+            if (typeof out === "string") {
+              try { out = JSON.parse(out); } catch (_) { /* keep string */ }
+            }
+            items.push({
+              kind: "tool_result",
+              call_id: item.call_id || "",
+              output: out,
+            });
+          } else if (t === "web_search_call") {
+            items.push({
+              kind: "tool_call",
+              name: "web_search",
+              call_id: item.id || "",
+              arguments: item.action !== undefined ? item.action : item.query,
+            });
+          } else if (typeof item.role === "string") {
+            if (item.role === "system" || item.role === "developer") {
+              if (!system) {
+                const text = typeof item.content === "string" ? item.content : flattenTextDeep(item.content);
+                if (text) system = text;
+              }
+            } else {
+              pushFromContent(item.role, item.content);
+            }
+          } else if (typeof item.text === "string") {
+            items.push({ kind: "message", role: "user", content: item.text });
+          } else {
+            // Unknown typed item: surface it rather than silently dropping a
+            // turn — this is a debugging tool.
+            items.push({ kind: "message", role: "meta", content: `[${t || "item"}]` });
+          }
+        }
+      } else if (typeof parsed.input === "string") {
+        if (parsed.input) items.push({ kind: "message", role: "user", content: parsed.input });
+      }
+      if (typeof parsed.instructions === "string" && parsed.instructions && !system) {
+        system = parsed.instructions;
+      }
+    } else {
+      return null;
+    }
+
+    return { system, items };
+  }
+
   // ------------------------------------------------------------------------
   // Span buffer: flattens monitor events into a kinded text stream that the
   // tile body renders. Mirrors the TUI's Tile/span model. Reasoning is kept
@@ -190,7 +571,14 @@
           tileSpans: [],
           tileLastKind: null,
           temperature: null,
-          reasoningUserToggles: new Map()
+          reasoningUserToggles: new Map(),
+          // Detail-view local state: accordion open/close choices the user made
+          // (keyed by section key) and the segments index where the CURRENT
+          // upstream round's live stream begins (everything before it is
+          // represented structurally in the latest payload event).
+          detailToggles: new Map(),
+          liveSegmentsFrom: 0,
+          breakNextSegmentMerge: false
         });
         this.order.unshift(id);
       }
@@ -248,7 +636,19 @@
             const rb = this.requests.get(b);
             return Number(rb?.started_at_ms || 0) - Number(ra?.started_at_ms || 0);
           });
+          // The snapshot replays ALL segments before ALL events, so the live
+          // event-order watermark couldn't be tracked during replay; recompute
+          // it from timestamps (server-side merged segments keep their FIRST
+          // chunk's timestamp, so run starts are comparable to event times).
+          for (const request of this.requests.values()) {
+            request.liveSegmentsFrom = computeLiveSegmentsFrom(request);
+          }
           this._emit("list-changed");
+          // A mounted detail view suppressed per-request emits during the
+          // replay; wake it so it re-renders against the rebuilt record.
+          if (this.selectedId !== DASHBOARD_KEY && this.requests.has(this.selectedId)) {
+            this._emit("request-changed", { id: this.selectedId });
+          }
           return;
 
         case "request_upsert": {
@@ -284,10 +684,12 @@
           const request = this.ensureRequest(id);
           request.updated_at_ms = message.segment.timestamp_ms || Date.now();
           const last = request.segments[request.segments.length - 1];
-          if (last && last.kind === message.segment.kind) {
+          if (last && last.kind === message.segment.kind && !request.breakNextSegmentMerge) {
+            // Merge into the run but KEEP the run's first-chunk timestamp —
+            // the detail view compares run starts against payload-event times.
             last.text += message.segment.text;
-            last.timestamp_ms = message.segment.timestamp_ms;
           } else {
+            request.breakNextSegmentMerge = false;
             request.segments.push(message.segment);
           }
           tileBuffer.appendSegment(request, message.segment.kind, message.segment.text);
@@ -301,7 +703,35 @@
           const request = this.ensureRequest(id);
           request.updated_at_ms = message.event.timestamp_ms || Date.now();
           request.events.push(message.event);
+          const kind = message.event.kind;
+          if (kind === "upstream_request" || kind === "request_payload") {
+            // Payload boundary: stream content after this point belongs to the
+            // new round; everything before it is represented structurally in
+            // this payload. Snapshot replay sends segments before events, so
+            // only trust live ordering here (snapshot_done recomputes from
+            // timestamps). Break the tail merge so the boundary is exact.
+            if (!this._snapshotLoading) {
+              request.liveSegmentsFrom = request.segments.length;
+              request.breakNextSegmentMerge = true;
+            }
+          }
           tileBuffer.applyEvent(request, message.event);
+          if (this._snapshotLoading) return;
+          this._emit("request-changed", { id });
+          return;
+        }
+
+        case "usage": {
+          const id = message.response_id;
+          const request = this.ensureRequest(id);
+          request.usage = {
+            prompt: Number(message.prompt || 0),
+            completion: Number(message.completion || 0),
+            total: Number(message.total || 0),
+            cached: Number(message.cached || 0),
+            reasoning: Number(message.reasoning || 0)
+          };
+          request.updated_at_ms = Date.now();
           if (this._snapshotLoading) return;
           this._emit("request-changed", { id });
           return;
@@ -528,7 +958,10 @@
 
       this._setText("items", `${formatCount(request.stats?.input_items)} items`);
       this._setText("tools", `${formatCount(request.stats?.tool_count)} tools`);
-      this._setText("chars", `${formatCount(request.stats?.input_chars)} chars`);
+      // Real token usage (D3) beats the input-chars heuristic once it arrives.
+      this._setText("chars", request.usage
+              ? `${formatCompact(request.usage.total)} tok`
+              : `${formatCount(request.stats?.input_chars)} chars`);
       this._setText("started", formatTime(request.started_at_ms));
       this._setText("duration", formatDuration(request));
       this._setText("events", `${formatCount(request.events?.length)} events`);
@@ -705,10 +1138,15 @@
         this._iconBtn.addEventListener("click", () => this._open());
         this._clear.addEventListener("click", () => this._close());
         this._input.addEventListener("input", () => {
-          store.setSearchQuery(this._input.value);
+          // Debounced: the filter pass scans every request's payload previews
+          // (now full-fidelity, possibly megabytes), so run it once per typing
+          // pause instead of per keystroke.
+          clearTimeout(this._debounce);
+          this._debounce = setTimeout(() => store.setSearchQuery(this._input.value), 150);
         });
         this._input.addEventListener("keydown", (e) => {
           if (e.key === "Escape") {
+            clearTimeout(this._debounce);
             if (this._input.value) {
               this._input.value = "";
               store.setSearchQuery("");
@@ -726,6 +1164,7 @@
     }
     _close() {
       this.removeAttribute("open");
+      clearTimeout(this._debounce);
       if (this._input.value) {
         this._input.value = "";
         store.setSearchQuery("");
@@ -1072,7 +1511,8 @@
       const start = Number(request.started_at_ms || 0);
       const end = Number(request.completed_at_ms || Date.now());
       const seconds = start ? Math.max(0, (end - start) / 1000) : 0;
-      const mainText = `${id} · ${model}${temp} · ${seconds.toFixed(1)}s`;
+      const tokens = request.usage ? ` · ${formatCompact(request.usage.total)} tok` : "";
+      const mainText = `${id} · ${model}${temp} · ${seconds.toFixed(1)}s${tokens}`;
 
       let lingerText = "";
       if (status !== "running" && request.completed_at_ms) {
@@ -1436,8 +1876,74 @@
 
   // ------------------------------------------------------------------------
   // <request-detail>: tabbed view for a single request (Messages / Raw /
-  // Events).
+  // Events). Fully incremental: the head is built once and patched in place,
+  // and each tab reconciles its pane against keyed section state instead of
+  // rebuilding, so accordion open/close choices, text selection, scroll
+  // position, and in-flight clicks all survive streaming updates. Refreshes
+  // are coalesced to one per animation frame.
   // ------------------------------------------------------------------------
+
+  function prettyJson(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if ((trimmed.startsWith("{") && trimmed.endsWith("}"))
+              || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+        try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch (_) { /* fallthrough */ }
+      }
+      return value;
+    }
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  }
+
+  function makeCopyButton(getText) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "copy-btn";
+    btn.textContent = "copy";
+    btn.title = "Copy to clipboard";
+    const flash = (label, cls) => {
+      btn.textContent = label;
+      if (cls) btn.classList.add(cls);
+      setTimeout(() => {
+        btn.textContent = "copy";
+        if (cls) btn.classList.remove(cls);
+      }, 1200);
+    };
+    btn.addEventListener("click", (e) => {
+      // Inside a <summary>: don't toggle the enclosing <details>.
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        navigator.clipboard.writeText(getText()).then(
+                () => flash("copied", "done"),
+                () => flash("failed")
+        );
+      } catch (_) {
+        flash("failed");
+      }
+    });
+    return btn;
+  }
+
+  function eventDotClass(kind) {
+    if (kind === "failed") return "k-red";
+    if (kind === "completed") return "k-green";
+    if (kind === "request_started" || kind === "request_payload"
+            || kind === "upstream_request" || kind === "final_response") return "k-blue";
+    if ((kind || "").includes("tool")) return "k-amber";
+    return "";
+  }
+
+  const ROLE_LABELS = {
+    reasoning: "Reasoning",
+    meta: "Item",
+    user: "User",
+    assistant: "Assistant",
+  };
+  function roleLabel(role) {
+    return ROLE_LABELS[role] || (role ? role.charAt(0).toUpperCase() + role.slice(1) : "Message");
+  }
 
   class RequestDetail extends HTMLElement {
     static get observedAttributes() { return ["request-id"]; }
@@ -1445,468 +1951,625 @@
     connectedCallback() {
       if (!this._built) {
         this.innerHTML = `
-            <div class="detail-head" data-role="head"></div>
+            <div class="detail-head" data-role="head">
+              <div class="title-row">
+                <span class="badge status-icon" data-role="status"></span>
+                <span class="title" data-role="title"></span>
+                <span class="title-model" data-role="model"></span>
+              </div>
+              <div class="head-meta">
+                <span class="meta-item" data-role="started"></span>
+                <span class="meta-item" data-role="duration"></span>
+                <span class="chip-list" data-role="chips"></span>
+              </div>
+              <div class="error-banner" data-role="error" hidden></div>
+              <div class="tabs-row">
+                <div class="tabs" data-role="tabs">
+                  <button type="button" class="tab" data-tab="messages">Messages<span class="tab-count" data-role="count-messages"></span></button>
+                  <button type="button" class="tab" data-tab="raw">Raw<span class="tab-count" data-role="count-raw"></span></button>
+                  <button type="button" class="tab" data-tab="events">Events<span class="tab-count" data-role="count-events"></span></button>
+                </div>
+                <div class="tab-actions" data-role="tab-actions">
+                  <button type="button" class="tab-action" data-role="expand-all">Expand all</button>
+                  <button type="button" class="tab-action" data-role="collapse-all">Collapse all</button>
+                </div>
+              </div>
+            </div>
             <div class="pane" data-role="pane"></div>
+            <button type="button" class="jump-latest" data-role="jump" hidden>↓ Follow stream</button>
           `;
-        this._head = this.querySelector('[data-role="head"]');
+        this._headEl = this.querySelector('[data-role="head"]');
+        this._statusEl = this.querySelector('[data-role="status"]');
+        this._titleEl = this.querySelector('[data-role="title"]');
+        this._modelEl = this.querySelector('[data-role="model"]');
+        this._startedEl = this.querySelector('[data-role="started"]');
+        this._durationEl = this.querySelector('[data-role="duration"]');
+        this._chipsEl = this.querySelector('[data-role="chips"]');
+        this._errorEl = this.querySelector('[data-role="error"]');
+        this._actionsEl = this.querySelector('[data-role="tab-actions"]');
         this._pane = this.querySelector('[data-role="pane"]');
+        this._jumpEl = this.querySelector('[data-role="jump"]');
         this._tab = "messages";
+        this._stick = false;
+        this._suppressScroll = false;
+
+        for (const button of this.querySelectorAll(".tab")) {
+          button.addEventListener("click", () => this._setTab(button.dataset.tab));
+        }
+        this.querySelector('[data-role="expand-all"]').addEventListener("click", () => this._setAllOpen(true));
+        this.querySelector('[data-role="collapse-all"]').addEventListener("click", () => this._setAllOpen(false));
+        this._pane.addEventListener("scroll", () => {
+          if (this._suppressScroll) {
+            this._suppressScroll = false;
+            return;
+          }
+          const p = this._pane;
+          this._stick = (p.scrollTop + p.clientHeight + 48) >= p.scrollHeight;
+          this._renderJump();
+        });
+        this._jumpEl.addEventListener("click", () => {
+          this._stick = true;
+          this._scrollToBottom();
+          this._renderJump();
+        });
         this._built = true;
       }
       this._onRequestChanged = (e) => {
-        if (e.detail.id === this.getAttribute("request-id")) this.refresh();
+        if (e.detail.id === this.getAttribute("request-id")) this._scheduleRefresh();
       };
       store.addEventListener("request-changed", this._onRequestChanged);
+      this._syncTabButtons();
       this.refresh();
     }
     disconnectedCallback() {
       store.removeEventListener("request-changed", this._onRequestChanged);
     }
-    attributeChangedCallback() { if (this._built) this.refresh(); }
+    attributeChangedCallback() {
+      if (!this._built) return;
+      this._resetPane();
+      this.refresh();
+    }
+
+    _scheduleRefresh() {
+      if (this._refreshQueued) return;
+      this._refreshQueued = true;
+      requestAnimationFrame(() => {
+        this._refreshQueued = false;
+        if (this.isConnected) this.refresh();
+      });
+    }
+
+    _setTab(tab) {
+      if (this._tab === tab) return;
+      this._tab = tab;
+      this._syncTabButtons();
+      this._resetPane();
+      this.refresh();
+    }
+
+    _syncTabButtons() {
+      for (const button of this.querySelectorAll(".tab")) {
+        const active = button.dataset.tab === this._tab;
+        button.classList.toggle("active", active);
+      }
+      this._actionsEl.hidden = this._tab !== "messages";
+    }
+
+    _resetPane() {
+      this._paneState = null;
+      this._convoCacheKey = null;
+      this._convoCache = null;
+      this._stick = false;
+      if (this._pane) {
+        this._pane.className = "pane";
+        this._pane.replaceChildren();
+      }
+    }
 
     refresh() {
       const request = store.get(this.getAttribute("request-id"));
       if (!request) {
-        this._head.replaceChildren();
-        this._pane.className = "pane empty";
-        this._pane.textContent = "Waiting for requests";
+        if (!this._waiting) {
+          this._waiting = true;
+          this._headEl.hidden = true;
+          this._jumpEl.hidden = true;
+          this._pane.className = "pane empty";
+          this._pane.textContent = "Waiting for requests";
+          this._paneState = null;
+        }
         return;
       }
-      this._renderHead(request);
-      this._pane.className = "pane";
+      if (this._waiting) {
+        this._waiting = false;
+        this._headEl.hidden = false;
+        this._resetPane();
+      }
+      // Pane first: it derives the parsed conversation, whose truncation flag
+      // the head chips display.
       switch (this._tab) {
-        case "messages": this._renderMessages(request); break;
-        case "raw": this._renderUpstream(request); break;
+        case "raw": this._renderRaw(request); break;
         case "events": this._renderEvents(request); break;
         default: this._renderMessages(request); break;
       }
+      this._renderHead(request);
+      this._maybeStick();
+    }
+
+    // Called by the global 1Hz tick so the elapsed clock moves between
+    // streaming events.
+    tick() {
+      if (this._waiting || !this._built) return;
+      const request = store.get(this.getAttribute("request-id"));
+      if (!request || request.status !== "running") return;
+      this._setText(this._durationEl, formatDuration(request));
+    }
+
+    // ---- head ------------------------------------------------------------
+
+    _setText(el, text) {
+      if (el.textContent !== text) el.textContent = text;
     }
 
     _renderHead(request) {
       const status = request.status || "running";
-      this._head.innerHTML = `
-          <div class="title-row">
-            <div class="title">${escapeHtml(formatTime(request.started_at_ms))} ${escapeHtml(request.response_id)} ${escapeHtml(formatDuration(request))}</div>
-            <span class="title-model">${escapeHtml(request.model || "unknown model")}</span>
-            <span class="badge status-icon ${escapeHtml(status)}" title="${escapeHtml(status)}">${statusIcon(status)}</span>
-          </div>
-          <div class="tabs">
-            ${this._tabButton("messages", "Messages")}
-            ${this._tabButton("raw", "Raw")}
-            ${this._tabButton("events", "Events")}
-          </div>
-        `;
-      for (const button of this._head.querySelectorAll(".tab")) {
-        button.addEventListener("click", () => {
-          this._tab = button.dataset.tab;
-          this.refresh();
-        });
+      const badge = this._statusEl;
+      const wantClass = `badge status-icon ${status}`;
+      if (badge.className !== wantClass) badge.className = wantClass;
+      if (badge.dataset.status !== status) {
+        badge.dataset.status = status;
+        badge.innerHTML = statusIcon(status);
+        badge.title = status;
+      }
+      this._setText(this._titleEl, request.response_id || "");
+      this._setText(this._modelEl, request.model || "unknown model");
+      this._setText(this._startedEl, formatTime(request.started_at_ms));
+      this._setText(this._durationEl, formatDuration(request));
+
+      const error = request.error || "";
+      this._errorEl.hidden = !error;
+      if (error) this._setText(this._errorEl, error);
+
+      // Tab counts (all cheap: conversation parse is cached per payload
+      // event). Parsed before the chips so the truncation flag is current.
+      const convo = this._conversationFor(request);
+      this._renderChips(request);
+      const events = request.events || [];
+      let payloadCount = 0;
+      for (const event of events) {
+        if (event.payload_preview
+                && (event.kind === "upstream_request" || event.kind === "request_payload")) {
+          payloadCount++;
+        }
+      }
+      let liveRuns = 0;
+      const from = Math.min(request.liveSegmentsFrom ?? 0, request.segments.length);
+      for (let i = from; i < request.segments.length; i++) {
+        if (request.segments[i].text && request.segments[i].text.trim()) liveRuns++;
+      }
+      const messageCount = (convo ? convo.items.length + (convo.system ? 1 : 0) : 0) + liveRuns;
+      this._setText(this.querySelector('[data-role="count-messages"]'), messageCount ? String(messageCount) : "");
+      this._setText(this.querySelector('[data-role="count-raw"]'), payloadCount ? String(payloadCount) : "");
+      this._setText(this.querySelector('[data-role="count-events"]'), events.length ? String(events.length) : "");
+      this._renderJump();
+    }
+
+    _renderChips(request) {
+      const parts = [];
+      const usage = request.usage;
+      if (usage) {
+        const cached = usage.cached
+                ? ` <span class="chip-sub">(${escapeHtml(formatCount(usage.cached))} cached)</span>` : "";
+        parts.push(`<span class="chip" title="Prompt tokens (cumulative)">↑ ${escapeHtml(formatCount(usage.prompt))}${cached}</span>`);
+        parts.push(`<span class="chip" title="Completion tokens (cumulative)">↓ ${escapeHtml(formatCount(usage.completion))}</span>`);
+        if (usage.reasoning) {
+          parts.push(`<span class="chip" title="Reasoning tokens (cumulative)">∴ ${escapeHtml(formatCount(usage.reasoning))}</span>`);
+        }
+      }
+      if (typeof request.temperature === "number") {
+        parts.push(`<span class="chip">T=${request.temperature.toFixed(2)}</span>`);
+      }
+      if (this._truncatedPreview) {
+        parts.push(`<span class="chip warn" title="The server truncated this payload preview; the earliest turns may be missing.">truncated preview</span>`);
+      }
+      const html = parts.join("");
+      if (this._chipsHtml !== html) {
+        this._chipsHtml = html;
+        this._chipsEl.innerHTML = html;
       }
     }
 
-    _tabButton(id, label) {
-      return `<button type="button" class="tab ${this._tab === id ? "active" : ""}" data-tab="${id}">${label}</button>`;
+    _renderJump() {
+      const request = store.get(this.getAttribute("request-id"));
+      const show = !!request && (request.status || "running") === "running" && !this._stick;
+      if (this._jumpEl.hidden !== !show) this._jumpEl.hidden = !show;
     }
 
-    _renderMessages(request) {
-      this._pane.replaceChildren();
+    _maybeStick() {
+      if (!this._stick) return;
+      const p = this._pane;
+      // Only suppress when the assignment will actually move the pane (and
+      // thus fire a scroll event) — otherwise the flag would swallow the
+      // user's next real scroll.
+      if (p.scrollTop + p.clientHeight + 1 < p.scrollHeight) {
+        this._suppressScroll = true;
+        this._scrollToBottom();
+      }
+    }
 
-      const sections = [];
+    _scrollToBottom() {
+      this._pane.scrollTop = this._pane.scrollHeight;
+    }
 
-      // System prompt + conversation items parsed from the upstream payload.
-      // When there's been a previous upstream call on this request, mark
-      // everything carried over from it as "stale" so it can default closed.
-      const parsed = this._parseConversation(request);
-      const prevCount = this._countPreviousItems(request);
-      if (parsed) {
-        if (parsed.system) {
-          sections.push({ kind: "message", label: "System", role: "system", body: parsed.system, stale: true });
+    _setAllOpen(open) {
+      const request = store.get(this.getAttribute("request-id"));
+      for (const details of this._pane.querySelectorAll("details.accordion")) {
+        // The per-node toggle listener records the choice as a user pref.
+        details.open = open;
+      }
+      if (request && this._paneState?.nodes) {
+        for (const key of this._paneState.nodes.keys()) request.detailToggles.set(key, open);
+      }
+    }
+
+    // ---- conversation cache ------------------------------------------------
+
+    // Parse (and cache) the conversation from the best available payload
+    // event. Re-parses only when a NEW payload event arrives — never on
+    // streaming deltas.
+    _conversationFor(request) {
+      const candidates = payloadEventCandidates(request);
+      const cacheKey = `${request.response_id}:${candidates.length}`;
+      if (this._convoCacheKey === cacheKey) return this._convoCache;
+      let convo = null;
+      let usedIndex = -1;
+      for (let i = 0; i < candidates.length; i++) {
+        const parsed = parseConversationEvent(candidates[i]);
+        if (parsed && (parsed.items.length || parsed.system)) {
+          convo = parsed;
+          usedIndex = i;
+          break;
         }
-        parsed.items.forEach((item, idx) => {
+      }
+      // Item count of the PREVIOUS same-kind payload: items below it are
+      // carry-over from the prior round and default to collapsed.
+      let prevCount = 0;
+      if (convo) {
+        for (let i = usedIndex + 1; i < candidates.length; i++) {
+          if (candidates[i].kind !== convo.event.kind) continue;
+          const prev = parseConversationEvent(candidates[i]);
+          if (prev) {
+            prevCount = prev.items.length;
+            break;
+          }
+        }
+      }
+      this._convoCacheKey = cacheKey;
+      this._convoCache = convo;
+      this._prevItemCount = prevCount;
+      this._truncatedPreview = !!convo?.truncated;
+      return convo;
+    }
+
+    // ---- messages tab ------------------------------------------------------
+
+    _messageSections(request, convo) {
+      const sections = [];
+      if (convo) {
+        if (convo.system) {
+          sections.push({
+            key: "sys", type: "message", label: "System", role: "system",
+            body: convo.system, stale: true, defaultOpen: false,
+          });
+        }
+        const prevCount = this._prevItemCount || 0;
+        convo.items.forEach((item, idx) => {
           const stale = idx < prevCount;
-          if (item.kind === "message") {
+          const key = `c${idx}`;
+          if (item.kind === "tool_call") {
             sections.push({
-              kind: "message",
-              label: item.role.charAt(0).toUpperCase() + item.role.slice(1),
-              role: item.role,
-              body: item.content,
-              stale,
-            });
-          } else if (item.kind === "tool_call") {
-            sections.push({
-              kind: "tool_call",
-              label: `Tool call → ${item.name || "unknown"}`,
-              role: "tool",
-              item,
-              stale,
+              key, type: "tool_call", label: `Tool call → ${item.name || "unknown"}`,
+              role: "tool", item, stale, defaultOpen: !stale,
             });
           } else if (item.kind === "tool_result") {
             sections.push({
-              kind: "tool_result",
-              label: "Tool result",
-              role: "tool",
-              item,
-              stale,
+              key, type: "tool_result", label: "Tool result",
+              role: "tool", item, stale, defaultOpen: !stale,
             });
-          }
-        });
-      }
-
-      // Live-streamed current turn from segments. The completed tool call
-      // shows up in the next request's input as a structured tool_call item;
-      // these segments are the only view we have while it's still streaming.
-      const segs = request.segments || [];
-      let reasoning = "";
-      let output = "";
-      let toolStream = "";
-      for (const seg of segs) {
-        if (seg.kind === "reasoning") reasoning += seg.text;
-        else if (seg.kind === "tool") toolStream += seg.text;
-        else output += seg.text;
-      }
-      if (reasoning.trim()) sections.push({ kind: "message", label: "Reasoning", role: "reasoning", body: reasoning, stale: false });
-      if (toolStream.trim()) sections.push({ kind: "message", label: "Tool stream", role: "tool", body: toolStream, stale: false });
-      if (output.trim()) sections.push({ kind: "message", label: "Assistant", role: "assistant", body: output, stale: false });
-
-      if (!sections.length) { this._empty("No messages yet"); return; }
-
-      for (const section of sections) {
-        if (section.kind === "tool_call") {
-          this._pane.appendChild(this._renderToolCard(section, "tool-call", "Arguments", section.item.arguments));
-        } else if (section.kind === "tool_result") {
-          this._pane.appendChild(this._renderToolCard(section, "tool-result", "Output", section.item.output));
-        } else {
-          this._pane.appendChild(this._renderMessageSection(section));
-        }
-      }
-    }
-
-    _renderMessageSection(section) {
-      const details = document.createElement("details");
-      details.className = `accordion role-${section.role}${section.stale ? " stale" : ""}`;
-      details.open = !section.stale && section.role !== "system";
-      const summary = document.createElement("summary");
-      summary.className = "accordion-summary";
-      summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>`;
-      details.appendChild(summary);
-      const pre = document.createElement("pre");
-      pre.className = `segment ${section.role === "reasoning" ? "reasoning" : section.role === "tool" ? "tool" : "output"}`;
-      pre.textContent = section.body;
-      details.appendChild(pre);
-      return details;
-    }
-
-    _renderToolCard(section, variant, _fieldLabel, payload) {
-      const details = document.createElement("details");
-      details.className = `accordion role-tool ${variant}${section.stale ? " stale" : ""}`;
-      details.open = !section.stale;
-      const summary = document.createElement("summary");
-      summary.className = "accordion-summary";
-      const callId = section.item.call_id ? `<span class="tool-call-id">${escapeHtml(section.item.call_id)}</span>` : "";
-      summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>${callId}`;
-      details.appendChild(summary);
-      const pre = document.createElement("pre");
-      pre.className = "segment tool-payload";
-      pre.textContent = this._prettyJson(payload);
-      details.appendChild(pre);
-      return details;
-    }
-
-    _prettyJson(value) {
-      if (value === null || value === undefined) return "";
-      if (typeof value === "string") {
-        const trimmed = value.trim();
-        if ((trimmed.startsWith("{") && trimmed.endsWith("}"))
-                || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
-          try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch (_) { /* fallthrough */ }
-        }
-        return value;
-      }
-      try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
-    }
-
-    // Returns the conversation item count from the most recent *prior*
-    // upstream call on this request — anything at index < this count in the
-    // current payload is carry-over and should default to collapsed.
-    _countPreviousItems(request) {
-      const events = (request.events || []).filter(it =>
-              (it.kind === "upstream_request" || it.kind === "request_payload") && it.payload_preview
-      );
-      if (events.length < 2) return 0;
-      const prev = this._parseConversationFromEvent(events[events.length - 2]);
-      return prev ? prev.items.length : 0;
-    }
-
-    _parseConversation(request) {
-      const events = [...(request.events || [])].reverse();
-      const event = events.find(it => it.kind === "upstream_request" && it.payload_preview)
-              || events.find(it => it.kind === "request_payload" && it.payload_preview);
-      return this._parseConversationFromEvent(event);
-    }
-
-    _parseConversationFromEvent(event) {
-      if (!event) return null;
-      let parsed = null;
-      try { parsed = JSON.parse(event.payload_preview); } catch (_) { return null; }
-      if (!parsed) return null;
-
-      let system = "";
-      if (typeof parsed.system === "string") {
-        system = parsed.system;
-      } else if (Array.isArray(parsed.system)) {
-        system = this._flattenText(parsed.system);
-      }
-
-      const items = [];
-      const pushFromContent = (role, content) => {
-        if (content === null || content === undefined) return;
-        if (typeof content === "string") {
-          if (content) items.push({ kind: "message", role, content });
-          return;
-        }
-        const blocks = Array.isArray(content) ? content : [content];
-        let textBuf = "";
-        const appendText = (text) => {
-          if (!text) return;
-          if (textBuf) textBuf += "\n";
-          textBuf += text;
-        };
-        const flushText = () => {
-          if (textBuf) {
-            items.push({ kind: "message", role, content: textBuf });
-            textBuf = "";
-          }
-        };
-        for (const block of blocks) {
-          if (typeof block === "string") { appendText(block); continue; }
-          if (!block || typeof block !== "object") continue;
-          const t = block.type;
-          if (t === "text" || t === "input_text" || t === "output_text" || typeof block.text === "string") {
-            appendText(block.text || "");
-          } else if (t === "tool_use") {
-            flushText();
-            items.push({
-              kind: "tool_call",
-              name: block.name || "",
-              call_id: block.id || "",
-              arguments: block.input,
-            });
-          } else if (t === "tool_result") {
-            flushText();
-            items.push({
-              kind: "tool_result",
-              call_id: block.tool_use_id || "",
-              output: block.content !== undefined ? block.content : block.output,
-            });
-          } else if (t === "image" || t === "input_image") {
-            appendText("[image]");
           } else {
-            appendText(`[${t || "block"}]`);
-          }
-        }
-        flushText();
-      };
-
-      if (Array.isArray(parsed.messages)) {
-        // Anthropic and OpenAI Chat Completions: top-level messages[].
-        for (const msg of parsed.messages) {
-          if (!msg) continue;
-          const role = typeof msg.role === "string" ? msg.role : "user";
-          if (role === "system") {
-            if (!system) {
-              const text = typeof msg.content === "string" ? msg.content : this._flattenText(msg.content);
-              if (text) system = text;
-            }
-            continue;
-          }
-          if (role === "tool") {
-            // Chat Completions tool result message.
-            items.push({
-              kind: "tool_result",
-              call_id: msg.tool_call_id || "",
-              output: msg.content !== undefined ? msg.content : msg.output,
+            sections.push({
+              key, type: "message", label: roleLabel(item.role), role: item.role,
+              body: item.content, stale,
+              defaultOpen: !stale && item.role !== "reasoning" && item.role !== "meta",
             });
-            continue;
           }
-          pushFromContent(role, msg.content);
-          if (Array.isArray(msg.tool_calls)) {
-            for (const tc of msg.tool_calls) {
-              if (!tc) continue;
-              const fn = tc.function || {};
-              let args = fn.arguments;
-              if (typeof args === "string") {
-                try { args = JSON.parse(args); } catch (_) { /* keep string */ }
-              }
-              items.push({
-                kind: "tool_call",
-                name: fn.name || tc.name || "",
-                call_id: tc.id || "",
-                arguments: args,
-              });
-            }
-          }
-        }
-      } else if (parsed.input !== undefined) {
-        // OpenAI Responses: `input` is a string or an array of typed items.
-        if (Array.isArray(parsed.input)) {
-          for (const item of parsed.input) {
-            if (!item) continue;
-            if (typeof item === "string") {
-              items.push({ kind: "message", role: "user", content: item });
-              continue;
-            }
-            if (typeof item !== "object") continue;
-            const t = item.type;
-            if (t === "function_call") {
-              let args = item.arguments;
-              if (typeof args === "string") {
-                try { args = JSON.parse(args); } catch (_) { /* keep string */ }
-              }
-              items.push({
-                kind: "tool_call",
-                name: item.name || "",
-                call_id: item.call_id || item.id || "",
-                arguments: args,
-              });
-            } else if (t === "function_call_output") {
-              let out = item.output;
-              if (typeof out === "string") {
-                try { out = JSON.parse(out); } catch (_) { /* keep string */ }
-              }
-              items.push({
-                kind: "tool_result",
-                call_id: item.call_id || "",
-                output: out,
-              });
-            } else if (typeof item.role === "string") {
-              if (item.role === "system") {
-                if (!system) {
-                  const text = typeof item.content === "string" ? item.content : this._flattenText(item.content);
-                  if (text) system = text;
-                }
-              } else {
-                pushFromContent(item.role, item.content);
-              }
-            } else if (typeof item.text === "string") {
-              items.push({ kind: "message", role: "user", content: item.text });
-            }
-          }
-        } else if (typeof parsed.input === "string") {
-          if (parsed.input) items.push({ kind: "message", role: "user", content: parsed.input });
-        }
-        if (typeof parsed.instructions === "string" && !system) system = parsed.instructions;
-      }
-
-      return { system, items };
-    }
-
-    _flattenText(value) {
-      if (value === null || value === undefined) return "";
-      if (typeof value === "string") return value;
-      if (!Array.isArray(value)) {
-        if (typeof value === "object" && typeof value.text === "string") return value.text;
-        return "";
-      }
-      let out = "";
-      const push = (s) => {
-        if (!s) return;
-        if (out && !out.endsWith("\n")) out += "\n";
-        out += s;
-      };
-      for (const item of value) {
-        if (typeof item === "string") push(item);
-        else if (item && typeof item === "object" && typeof item.text === "string") push(item.text);
-      }
-      return out;
-    }
-
-    _renderUpstream(request) {
-      this._pane.replaceChildren();
-
-      const events = request.events || [];
-      const clientEvents = events.filter(it => it.kind === "request_payload" && it.payload_preview);
-      const upstreamEvents = events.filter(it => it.kind === "upstream_request" && it.payload_preview);
-
-      const addHeader = (text) => {
-        const el = document.createElement("div");
-        el.className = "raw-section-label";
-        el.textContent = text;
-        this._pane.appendChild(el);
-      };
-      const addSubhead = (text) => {
-        const el = document.createElement("div");
-        el.className = "raw-subhead";
-        el.textContent = text;
-        this._pane.appendChild(el);
-      };
-      const addEmpty = (text) => {
-        const el = document.createElement("div");
-        el.className = "raw-empty";
-        el.textContent = text;
-        this._pane.appendChild(el);
-      };
-      const addPayload = (text) => {
-        const pre = document.createElement("pre");
-        pre.className = "payload";
-        pre.textContent = text;
-        this._pane.appendChild(pre);
-      };
-
-      // Client request: the original payload received by LLMConduit.
-      addHeader("Client request");
-      if (!clientEvents.length) {
-        addEmpty("No client payload captured");
-      } else {
-        for (const event of clientEvents) {
-          addPayload(event.payload_preview);
-        }
-      }
-
-      // Upstream request(s): what LLMConduit forwarded to the provider,
-      // after transformation. Multiple when tool calls trigger follow-ups.
-      addHeader("Upstream request");
-      if (!upstreamEvents.length) {
-        addEmpty("No upstream request yet");
-      } else {
-        upstreamEvents.forEach((event, idx) => {
-          if (upstreamEvents.length > 1) {
-            addSubhead(`#${idx + 1} · ${formatTime(event.timestamp_ms)}`);
-          }
-          addPayload(event.payload_preview);
         });
       }
 
-      // Received: reconstructed from streamed segments.
-      addHeader("Received");
+      // Live stream of the current round, in arrival order — one section per
+      // consecutive same-kind run, NOT merged across the whole request.
+      // Earlier rounds already appear structurally above (they're in the
+      // latest upstream payload), so start at the live watermark.
+      const segs = request.segments || [];
+      const from = Math.min(request.liveSegmentsFrom ?? 0, segs.length);
+      const running = (request.status || "running") === "running";
+      const live = [];
+      for (let i = from; i < segs.length; i++) {
+        const seg = segs[i];
+        if (!seg.text || !seg.text.trim()) continue;
+        const role = seg.kind === "reasoning" ? "reasoning" : seg.kind === "tool" ? "tool" : "assistant";
+        const label = seg.kind === "reasoning" ? "Reasoning" : seg.kind === "tool" ? "Tool activity" : "Assistant";
+        live.push({
+          key: `live${i}`, type: "live", label, role, body: seg.text,
+          defaultOpen: true, streaming: running && i === segs.length - 1,
+        });
+      }
+      if (live.length) {
+        sections.push({
+          key: "live-divider", type: "divider",
+          label: running ? "Streaming" : "Response", streaming: running,
+        });
+        sections.push(...live);
+      }
+      return sections;
+    }
+
+    _renderMessages(request) {
+      const convo = this._conversationFor(request);
+      const state = (this._paneState ||= { kind: "messages", convoKey: null, nodes: new Map(), emptyNode: null });
+      const sections = this._messageSections(request, convo);
+
+      // The parsed conversation changed (a new payload round arrived):
+      // rebuild wholesale. Section keys are stable across rounds, so the
+      // user's recorded open/close choices re-apply.
+      if (state.convoKey !== this._convoCacheKey) {
+        state.convoKey = this._convoCacheKey;
+        state.nodes = new Map();
+        state.emptyNode = null;
+        this._pane.replaceChildren();
+      }
+
+      if (!sections.length) {
+        if (!state.emptyNode) {
+          state.emptyNode = document.createElement("div");
+          state.emptyNode.className = "pane-empty";
+          state.emptyNode.textContent = "No messages yet";
+          this._pane.appendChild(state.emptyNode);
+        }
+        return;
+      }
+      if (state.emptyNode) {
+        state.emptyNode.remove();
+        state.emptyNode = null;
+      }
+
+      const nodes = state.nodes;
+      const seen = new Set();
+      let prev = null;
+      for (const section of sections) {
+        seen.add(section.key);
+        let entry = nodes.get(section.key);
+        if (!entry) {
+          entry = this._buildSection(request, section);
+          nodes.set(section.key, entry);
+          if (prev) prev.after(entry.node);
+          else this._pane.prepend(entry.node);
+        } else if (entry.mutable) {
+          this._updateSection(entry, section);
+        }
+        prev = entry.node;
+      }
+      for (const [key, entry] of nodes) {
+        if (!seen.has(key)) {
+          entry.node.remove();
+          nodes.delete(key);
+        }
+      }
+    }
+
+    _buildSection(request, section) {
+      if (section.type === "divider") {
+        const div = document.createElement("div");
+        div.className = `live-divider${section.streaming ? " streaming" : ""}`;
+        const label = document.createElement("span");
+        label.className = "live-divider-label";
+        label.textContent = section.label;
+        div.appendChild(label);
+        return { node: div, labelEl: label, type: "divider", mutable: true };
+      }
+
+      const details = document.createElement("details");
+      const variant = section.type === "tool_call" ? " tool-call"
+              : section.type === "tool_result" ? " tool-result" : "";
+      details.className = `accordion role-${section.role || "tool"}${variant}`
+              + `${section.stale ? " stale" : ""}${section.streaming ? " streaming" : ""}`;
+
+      const summary = document.createElement("summary");
+      summary.className = "accordion-summary";
+      const roleEl = document.createElement("span");
+      roleEl.className = "accordion-role";
+      roleEl.textContent = section.label;
+      summary.appendChild(roleEl);
+      if (section.item?.call_id) {
+        const callId = document.createElement("span");
+        callId.className = "tool-call-id";
+        callId.textContent = section.item.call_id;
+        summary.appendChild(callId);
+      }
+
+      const body = document.createElement("pre");
+      let mutable = false;
+      if (section.type === "tool_call" || section.type === "tool_result") {
+        body.className = "segment tool-payload";
+        body.textContent = prettyJson(section.type === "tool_call" ? section.item.arguments : section.item.output);
+      } else {
+        body.className = `segment ${section.role === "reasoning" ? "reasoning" : section.role === "tool" ? "tool" : "output"}`;
+        body.textContent = section.body || "";
+        mutable = section.type === "live";
+      }
+      summary.appendChild(makeCopyButton(() => body.textContent));
+      details.appendChild(summary);
+      details.appendChild(body);
+
+      // Initial open state: the user's recorded choice wins over the default.
+      const pref = request.detailToggles.get(section.key);
+      details.open = pref !== undefined ? pref : !!section.defaultOpen;
+      // `toggle` also fires (async) for the programmatic assignment above;
+      // compare against the last known state so only real changes record.
+      let lastOpen = details.open;
+      details.addEventListener("toggle", () => {
+        if (details.open === lastOpen) return;
+        lastOpen = details.open;
+        request.detailToggles.set(section.key, details.open);
+      });
+
+      return { node: details, bodyEl: body, labelEl: roleEl, type: section.type, mutable };
+    }
+
+    _updateSection(entry, section) {
+      if (entry.type === "divider") {
+        if (entry.labelEl.textContent !== section.label) entry.labelEl.textContent = section.label;
+        entry.node.classList.toggle("streaming", !!section.streaming);
+        return;
+      }
+      // Only live sections mutate: grow the text in place.
+      setNodeText(entry.bodyEl, section.body || "");
+      entry.node.classList.toggle("streaming", !!section.streaming);
+    }
+
+    // ---- raw tab -----------------------------------------------------------
+
+    _renderRaw(request) {
+      const state = (this._paneState ||= { kind: "raw" });
+      if (!state.built) {
+        state.built = true;
+        this._pane.replaceChildren();
+        const section = (label) => {
+          const head = document.createElement("div");
+          head.className = "raw-section-label";
+          head.textContent = label;
+          this._pane.appendChild(head);
+          const wrap = document.createElement("div");
+          this._pane.appendChild(wrap);
+          return wrap;
+        };
+        state.clientWrap = section("Client request");
+        state.upstreamWrap = section("Upstream requests");
+        state.receivedWrap = section("Received stream");
+        state.clientCount = 0;
+        state.upstreamCount = 0;
+        state.receivedPre = null;
+        state.receivedLen = -1;
+      }
+      const events = request.events || [];
+      const client = events.filter(e => e.kind === "request_payload" && e.payload_preview);
+      const upstream = events.filter(e => e.kind === "upstream_request" && e.payload_preview);
+      state.clientCount = this._appendPayloadBlocks(state.clientWrap, client, state.clientCount, "No client payload captured");
+      state.upstreamCount = this._appendPayloadBlocks(state.upstreamWrap, upstream, state.upstreamCount, "No upstream request yet");
+
       const segs = request.segments || [];
       if (!segs.length) {
-        addEmpty("No response yet");
-      } else {
-        addPayload(segs.map(s => s.text).join(""));
+        if (!state.receivedWrap.firstChild) {
+          const empty = document.createElement("div");
+          empty.className = "raw-empty";
+          empty.textContent = "No response yet";
+          state.receivedWrap.appendChild(empty);
+        }
+        return;
+      }
+      if (!state.receivedPre) {
+        state.receivedWrap.replaceChildren();
+        state.receivedPre = document.createElement("pre");
+        state.receivedPre.className = "payload";
+        state.receivedWrap.appendChild(state.receivedPre);
+      }
+      // The join is O(total text); only rebuild when the length moved.
+      let total = 0;
+      for (const seg of segs) total += seg.text.length;
+      if (total !== state.receivedLen) {
+        state.receivedLen = total;
+        setNodeText(state.receivedPre, segs.map(s => s.text).join(""));
       }
     }
+
+    _appendPayloadBlocks(wrap, events, renderedCount, emptyText) {
+      if (!events.length) {
+        if (!wrap.firstChild) {
+          const empty = document.createElement("div");
+          empty.className = "raw-empty";
+          empty.textContent = emptyText;
+          wrap.appendChild(empty);
+        }
+        return 0;
+      }
+      if (renderedCount === 0) wrap.replaceChildren();
+      for (let i = renderedCount; i < events.length; i++) {
+        const event = events[i];
+        const block = document.createElement("div");
+        block.className = "raw-block";
+        const head = document.createElement("div");
+        head.className = "raw-block-head";
+        const meta = document.createElement("span");
+        meta.className = "raw-subhead";
+        meta.textContent = `#${i + 1} · ${formatTime(event.timestamp_ms)} · ${formatCount(event.payload_preview.length)} chars`;
+        head.appendChild(meta);
+        head.appendChild(makeCopyButton(() => event.payload_preview));
+        block.appendChild(head);
+        const pre = document.createElement("pre");
+        pre.className = "payload";
+        pre.textContent = event.payload_preview;
+        block.appendChild(pre);
+        wrap.appendChild(block);
+      }
+      return events.length;
+    }
+
+    // ---- events tab ----------------------------------------------------------
 
     _renderEvents(request) {
-      this._pane.replaceChildren();
-      if (!request.events?.length) { this._empty("No events"); return; }
-      for (const event of request.events) {
-        const details = document.createElement("details");
-        details.className = "event";
-        details.innerHTML = `
-            <summary>
-              <div class="event-meta"><span>${formatTime(event.timestamp_ms)}</span><span class="event-kind">${escapeHtml(event.kind)}</span></div>
-              <div class="event-summary">${escapeHtml(event.summary || "")}</div>
-            </summary>
-          `;
-        this._appendImages(details, event);
-        this._appendPayload(details, event);
-        this._pane.appendChild(details);
+      const state = (this._paneState ||= { kind: "events", eventCount: 0, emptyNode: null });
+      const events = request.events || [];
+      if (!events.length) {
+        if (!state.emptyNode) {
+          state.emptyNode = document.createElement("div");
+          state.emptyNode.className = "pane-empty";
+          state.emptyNode.textContent = "No events";
+          this._pane.appendChild(state.emptyNode);
+        }
+        return;
       }
+      if (state.emptyNode) {
+        state.emptyNode.remove();
+        state.emptyNode = null;
+      }
+      for (let i = state.eventCount; i < events.length; i++) {
+        this._pane.appendChild(this._buildEventNode(events[i]));
+      }
+      state.eventCount = events.length;
     }
 
-    _empty(text) {
-      this._pane.className = "pane empty";
-      this._pane.textContent = text;
+    _buildEventNode(event) {
+      const details = document.createElement("details");
+      details.className = `event${this._hasDetail(event) ? "" : " no-detail"}`;
+      const summary = document.createElement("summary");
+      const meta = document.createElement("div");
+      meta.className = "event-meta";
+      const dot = document.createElement("span");
+      dot.className = `event-dot ${eventDotClass(event.kind)}`;
+      const time = document.createElement("span");
+      time.textContent = formatTime(event.timestamp_ms);
+      const kind = document.createElement("span");
+      kind.className = "event-kind";
+      kind.textContent = event.kind;
+      meta.append(dot, time, kind);
+      summary.appendChild(meta);
+      const text = document.createElement("div");
+      text.className = "event-summary";
+      text.textContent = event.summary || "";
+      summary.appendChild(text);
+      details.appendChild(summary);
+      this._appendImages(details, event);
+      this._appendPayload(details, event);
+      return details;
     }
 
     _hasDetail(event) { return Boolean(event.payload_preview || event.images?.length); }
@@ -1978,7 +2641,9 @@
   setInterval(() => {
     const pruned = store.pruneExpired();
     if (pruned) {
-      store.dispatchEvent(new CustomEvent("list-changed"));
+      // Route through _emit so a hidden tab coalesces the change instead of
+      // queueing FLIP/rAF work it can't paint.
+      store._emit("list-changed");
       return;
     }
     // Skip the per-tile DOM tick when the tab is hidden -- the dashboard
@@ -1986,6 +2651,9 @@
     // would just queue up to flood the main thread on return. Tiles will
     // re-render through flushDirty() on visibilitychange.
     if (document.hidden) return;
+    // Detail view: advance the elapsed clock for a running request.
+    const detail = document.querySelector("request-detail");
+    if (detail && typeof detail.tick === "function") detail.tick();
     // Per-tile refresh (only when dashboard is mounted). We tick tiles for
     // the elapsed clock + linger countdown, but only call dashboard.refresh()
     // -- which walks every request via dashboardVisibleRequests() -- when at
