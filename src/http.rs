@@ -69,6 +69,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -372,6 +373,45 @@ fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
     })
 }
 
+/// Inbound `Content-Encoding` decompression. codex-tui 0.145+ zstd-compresses
+/// Responses request bodies (`enable_request_compression`); without this the
+/// `Json` extractor parses still-compressed bytes and rejects with
+/// `expected value at line 1 column 1`. Bodies are already fully buffered by
+/// `log_api_call`, so this decodes synchronously in place. `identity`/absent ⇒
+/// passthrough. Unknown encodings ⇒ `Err` so the caller surfaces a 415.
+fn decode_content_encoding(body: &Bytes, encoding: &str) -> Result<Bytes, String> {
+    let enc = encoding.trim().to_ascii_lowercase();
+    if enc.is_empty() || enc == "identity" {
+        return Ok(body.clone());
+    }
+    let decoded = match enc.as_str() {
+        "gzip" => {
+            let mut out = Vec::with_capacity(body.len());
+            flate2::read::GzDecoder::new(&body[..])
+                .read_to_end(&mut out)
+                .map_err(|e| format!("gzip: {e}"))?;
+            out
+        }
+        "deflate" => {
+            let mut out = Vec::with_capacity(body.len());
+            flate2::read::ZlibDecoder::new(&body[..])
+                .read_to_end(&mut out)
+                .map_err(|e| format!("deflate: {e}"))?;
+            out
+        }
+        "br" => {
+            let mut out = Vec::with_capacity(body.len());
+            brotli::Decompressor::new(&body[..], 4096)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("br: {e}"))?;
+            out
+        }
+        "zstd" => zstd::decode_all(&body[..]).map_err(|e| format!("zstd: {e}"))?,
+        other => return Err(format!("unsupported content-encoding: {other}")),
+    };
+    Ok(Bytes::from(decoded))
+}
+
 /// Parse the inbound `Content-Length` as a byte count, if present and valid.
 fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
@@ -489,6 +529,48 @@ async fn log_api_call(
                 .into_response();
         }
     };
+
+    // Inbound `Content-Encoding` decompression (codex-tui 0.145+ sends
+    // `Content-Encoding: zstd` for Responses bodies). Decoded here, BEFORE the
+    // log/body-summary/flow-store/turn-capture seams, so every downstream
+    // consumer — including the `Json<...>` extractor on the rebuilt request —
+    // sees plain JSON bytes. The `Content-Encoding` header is stripped and
+    // `Content-Length` is corrected so the rebuilt request is self-consistent
+    // (the upstream builds its own request from the parsed body, so forwarding
+    // the inbound `Content-Encoding` would make the upstream double-decode).
+    let body_bytes = match headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(encoding) if !encoding.trim().eq_ignore_ascii_case("identity") => {
+            match decode_content_encoding(&body_bytes, encoding) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    tracing::warn!(
+                        api_call_id = %api_call_id,
+                        method = %method,
+                        path = %uri.path(),
+                        content_encoding = %encoding,
+                        error = %err,
+                        "failed to decode inbound Content-Encoding"
+                    );
+                    return (
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        format!("failed to decode Content-Encoding: {err}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        _ => body_bytes,
+    };
+    // `parts.headers` owns the headers of the rebuilt request; strip
+    // `Content-Encoding` (already decoded) and fix `Content-Length` so the
+    // axum extractors and any downstream reader see the true decoded size.
+    parts.headers.remove(header::CONTENT_ENCODING);
+    if let Some(len) = HeaderValue::from_str(&body_bytes.len().to_string()).ok() {
+        parts.headers.insert(header::CONTENT_LENGTH, len);
+    }
 
     // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
     // field may be logged — a `body_sha256` + `body_bytes` length on the login
@@ -2429,5 +2511,80 @@ mod tests {
             data: serde_json::json!({ "type": "response.created" }),
         };
         assert_eq!(responses_wire_event_data(&event), event.data.to_string());
+    }
+
+    /// Round-trips every supported `Content-Encoding` and the passthrough cases.
+    /// codex-tui 0.145+ ships `Content-Encoding: zstd`; the gzip/deflate/br arms
+    /// cover generic HTTP clients. An unknown encoding surfaces a 415-carrying
+    /// `Err` rather than silently passing compressed bytes to the JSON extractor.
+    #[test]
+    fn decode_content_encoding_roundtrips_all_supported_encodings() {
+        use std::io::Read as _;
+        let original = br#"{"model":"glm-5.1","input":[]}"#;
+        let original_bytes = Bytes::copy_from_slice(original);
+
+        // zstd (the codex path — magic 28 b5 2f fd).
+        let z = zstd::encode_all(&original[..], 3).expect("zstd encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(z), "zstd").expect("zstd decode"),
+            original_bytes
+        );
+
+        // gzip
+        let mut gz = flate2::read::GzEncoder::new(
+            std::io::Cursor::new(original),
+            flate2::Compression::default(),
+        );
+        let mut out = Vec::new();
+        gz.read_to_end(&mut out).expect("gz encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "gzip").expect("gzip decode"),
+            original_bytes
+        );
+
+        // deflate (zlib-wrapped)
+        let mut zlib = flate2::read::ZlibEncoder::new(
+            std::io::Cursor::new(original),
+            flate2::Compression::default(),
+        );
+        let mut out = Vec::new();
+        zlib.read_to_end(&mut out).expect("zlib encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "deflate").expect("deflate decode"),
+            original_bytes
+        );
+
+        // brotli
+        let mut br = brotli::CompressorReader::new(std::io::Cursor::new(original), 4096, 11, 22);
+        let mut out = Vec::new();
+        br.read_to_end(&mut out).expect("br encode");
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(out), "br").expect("br decode"),
+            original_bytes
+        );
+    }
+
+    /// `identity` and a missing/blank encoding are passthroughs, and the lookup
+    /// is case-insensitive (HTTP header values are case-insensitive). An unknown
+    /// encoding returns `Err` so the middleware can surface 415 instead of
+    /// forwarding opaque bytes.
+    #[test]
+    fn decode_content_encoding_identity_blank_case_insensitive_and_unknown() {
+        let body = Bytes::from_static(b"hello");
+        assert_eq!(
+            super::decode_content_encoding(&body, "identity").unwrap(),
+            body
+        );
+        assert_eq!(super::decode_content_encoding(&body, "").unwrap(), body);
+        assert_eq!(super::decode_content_encoding(&body, "  ").unwrap(), body);
+        // Header values are case-insensitive — codex sends lowercase, but a
+        // generic client may send `ZSTD` / `GZIP`.
+        let z = zstd::encode_all(&b"hello"[..], 3).unwrap();
+        assert_eq!(
+            super::decode_content_encoding(&Bytes::from(z), "ZSTD").unwrap(),
+            body
+        );
+        // Unknown encoding ⇒ Err (caller returns 415, not a silent 400 JSON parse).
+        assert!(super::decode_content_encoding(&body, "snappy").is_err());
     }
 }

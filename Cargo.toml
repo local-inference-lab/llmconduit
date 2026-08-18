@@ -60,6 +60,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+# Inbound request-body decompression (`Content-Encoding: zstd`/`gzip`/`deflate`/
+# `br`). codex-tui 0.145+ ships zstd-compressed Responses bodies when
+# `enable_request_compression` is on; without these the `Json` extractor parses
+# still-compressed bytes and 400s. Bodies are already fully buffered in
+# `log_api_call`, so synchronous in-place decode is correct and avoids pulling
+# in `async-compression`'s streaming machinery. `zstd` is the codex path; the
+# other two cover generic HTTP clients.
+zstd = "0.13"
+flate2 = "1"
+brotli = "8"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]

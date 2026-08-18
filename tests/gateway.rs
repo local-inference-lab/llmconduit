@@ -2622,6 +2622,77 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
     server.abort();
 }
 
+/// The core codex-tui fix: a POST `/v1/responses` with `Content-Encoding: zstd`
+/// (codex-tui 0.145+ with `enable_request_compression`) is decompressed by the
+/// inbound middleware BEFORE the `Json` extractor runs, so the turn executes
+/// instead of 400-ing on zstd magic bytes. Before the decode layer this returned
+/// 400 "expected value at line 1 column 1".
+#[tokio::test]
+async fn responses_post_decodes_zstd_content_encoding() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let request = base_request(vec![user_message("hello")]);
+    let json = serde_json::to_string(&request).expect("serialize request");
+    let zstd_body = zstd::encode_all(json.as_bytes(), 3).expect("zstd encode");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("content-encoding", "zstd")
+                .body(Body::from(zstd_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "zstd body must decode and run"
+    );
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+    // The turn reached the upstream — proving the decoded body parsed + lowered.
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.as_ref().and_then(|v| v.as_str()) == Some("hello")),
+        "the decoded user message reached the upstream"
+    );
+}
+
+/// An unsupported `Content-Encoding` surfaces 415 (not a misleading 400 JSON
+/// parse error), so a client sending an encoding the gateway can't decode gets a
+/// precise, actionable status.
+#[tokio::test]
+async fn responses_post_unknown_content_encoding_returns_415() {
+    let gateway = test_gateway(MockUpstream::default(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("content-encoding", "snappy")
+                .body(Body::from(b"\x0aHello".to_vec()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 415);
+}
+
 /// D7b R4 finding 1 (end-to-end): the live `/dashboard/ws` snapshot sources its
 /// flow-domain dedup cursor from the MONITOR's `last_sequence` (captured atomically with
 /// the transcript), NOT the FlowStore `flow_seq`. Drive a real flow so the monitor
