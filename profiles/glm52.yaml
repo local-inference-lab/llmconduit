@@ -3,8 +3,8 @@
 # Drop-in: merge this into your config.yaml (or load it as a profile fragment)
 # to get the gateway's GLM-5.2 shaping: thinking-kwarg injection on the
 # Anthropic route, z.ai effort clamping, capability advertisement, and the
-# full-role message mapping. Every field below is optional; trim what you
-# don't need.
+# full-role message mapping. Every field below is optional except `upstream`;
+# trim what you don't need.
 
 # Shared template inherited by GLM-5.2 via `extends`. chat_template_kwargs is
 # profile-level shorthand for upstream_chat_kwargs, forwarded to the upstream
@@ -20,6 +20,9 @@ model_profiles:
   GLM-5.2:
     extends:
       - thinking
+
+    # Must match the `name` of an `upstreams:` entry in your config.
+    upstream: local
 
     # Profile-level shorthand for upstream_chat_kwargs.chat_template_kwargs,
     # forwarded to GLM's chat template verbatim.
@@ -43,6 +46,15 @@ model_profiles:
       structured_outputs: true
       image_input: false
       pdf_input: false
+
+    # GLM-5.2 has no native vision support. Uncomment to strip images from the
+    # latest turn and route them to a vision-capable profile for description
+    # instead of sending them upstream (that profile must be an existing
+    # exact-key profile, e.g. one wrapping a Qwen3-VL backend, with no
+    # image_analysis of its own).
+    # image_analysis:
+    #   model: Qwen3-VL
+    #   residual_images: placeholder
 
     # Full-role mapping: system is accepted at any position (GLM handles inline
     # system), tool is supported, and developer is rewritten to system. The

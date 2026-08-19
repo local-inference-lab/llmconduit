@@ -7,6 +7,7 @@ use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -532,29 +533,9 @@ fn valid_tag_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
 }
 
-/// E2b: policy for a residual `InputImage` (one the G4 image agent did not
-/// strip — agent inactive/disabled, `tool_choice=="none"`, a `file_id` image,
-/// a non-`user`-role image, or old history) that would otherwise reach a
-/// non-native-vision backend. `Placeholder` (the default) replaces it with an
-/// instructive text placeholder so the model self-corrects instead of the
-/// upstream 400ing on raw image bytes (the field incident this closes);
-/// `Reject` fails the turn before dispatch with a 4xx instead. No `Drop`
-/// variant — silently discarding image content with no signal to the model or
-/// client is a defect, not a policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum UnsupportedImagePolicy {
-    #[default]
-    Placeholder,
-    Reject,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     /// F1 (Topic F): opt-in durable per-turn capture directory. When set,
@@ -565,18 +546,11 @@ pub struct Config {
     pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
-    pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
-    pub model_profiles: BTreeMap<String, ModelProfile>,
-    /// Ad-hoc model routes (G7). Each route maps a request-model *name* (which
-    /// may be a glob pattern such as `claude-opus-*`) to a synthetic upstream
-    /// (base URL + optional upstream model). Routes turn the gateway into
-    /// routing mode and are matched in `RoutingModelCatalog::resolve` strictly
-    /// between an exact catalog model id and the canonical-key/default
-    /// fallbacks, so an exact upstream model id always beats a glob route.
-    /// DECLARATION order is preserved (file order, then CLI `--model-route`
-    /// merged in) so the FIRST matching glob wins when two globs overlap.
-    pub model_routes: Vec<ModelRoute>,
+    /// Request-model routing table in DECLARATION order: each entry is a
+    /// profile key (literal or glob), its compiled matcher, and the resolved
+    /// profile. `resolve_route` scans it exact-first, then globs first-match.
+    pub model_profiles: Vec<CompiledProfile>,
     /// Forces the backend chat-template contract (`kimi`/`deepseek`) regardless
     /// of the model name, when family auto-detection from the model id is wrong
     /// (G2). Profile-level `template_family` overrides this global value.
@@ -609,24 +583,10 @@ pub struct Config {
     /// 10 MiB (raise for very large prompts). Distinct from `max_sse_frame_bytes`,
     /// which bounds the UPSTREAM response read path, not the inbound request.
     pub max_request_body_bytes: usize,
-    /// Master switch for the G4 image agent (vision offload). When `false` the
-    /// strip/cache seam and `analyzeImage` tool injection are skipped entirely
-    /// and images flow to the upstream unchanged.
-    pub image_agent_enabled: bool,
-    /// OpenAI-compatible chat-completions endpoint of the vision backend the
-    /// image agent forwards stripped images to. `None` disables the agent even
-    /// when `image_agent_enabled` is true (no endpoint to call), matching
-    /// claude-relay's "skip without `vision_url`" gate.
-    pub vision_url: Option<Url>,
-    /// Model id sent to the vision backend.
-    pub vision_model: Option<String>,
     /// Per-session LRU image-cache capacity.
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     pub image_cache_ttl_secs: u64,
-    /// E2b: policy applied to a residual image reaching a non-native-vision
-    /// backend after G4 gating. See [`UnsupportedImagePolicy`].
-    pub unsupported_image_policy: UnsupportedImagePolicy,
     /// Per-model price table (T13/D13), keyed by SERVED model id. Drives the
     /// dashboard's flow `cost` roll-up + the Sankey cost coloring + the
     /// `cost_per_min`/`cost_per_sec` rates. Loaded from the YAML `price_table:`
@@ -784,208 +744,80 @@ fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub name: String,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    pub upstream_request_log_path: Option<PathBuf>,
-    pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    pub url: Url,
+    pub api_key: Option<String>,
+    pub chat_kwargs: JsonMap<String, JsonValue>,
+    pub request_log_path: Option<PathBuf>,
 }
 
-/// A resolved ad-hoc model route (G7): request-model name → synthetic upstream.
-#[derive(Debug, Clone)]
-pub struct ModelRoute {
-    /// The request-model name this route matches. May be a literal id or a glob
-    /// pattern (`*`, `?`, `[...]`) such as `claude-opus-*`.
-    pub name: String,
-    /// Compiled, case-insensitive matcher when `name` is a glob pattern; `None`
-    /// for a literal name (matched with `eq_ignore_ascii_case`). Compiled once
-    /// here so an invalid pattern is a clean startup error, not a later panic.
-    pub glob: Option<Regex>,
-    /// Base URL of the synthetic upstream this route forwards to.
-    pub upstream_base_url: Url,
-    /// Optional upstream model id to send to that upstream. When `None`, the
-    /// request model flows through unchanged.
-    pub upstream_model: Option<String>,
-}
-
-impl PartialEq for ModelRoute {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.glob.as_ref().map(Regex::as_str) == other.glob.as_ref().map(Regex::as_str)
-            && self.upstream_base_url == other.upstream_base_url
-            && self.upstream_model == other.upstream_model
-    }
-}
-
-/// Whether `model` matches ANY of `routes` by exact name (case-insensitive) or
-/// glob. The single route-matching primitive shared by config-side route checks
-/// and the routing catalog's dispatch (`RoutingModelCatalog::match_route` returns
-/// the SPECIFIC matching route for dispatch; this is the boolean projection).
-/// Trims + rejects empty input.
-pub fn route_matches(routes: &[ModelRoute], model: &str) -> bool {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    routes.iter().any(|route| match &route.glob {
-        Some(glob) => glob.is_match(trimmed),
-        None => route.name.eq_ignore_ascii_case(trimmed),
-    })
-}
-
-/// Persisted form of a model route. Accepts either a bare URL string
-/// (`name = "http://host:8000"`) or a table with `upstream_base_url`/`url` and
-/// `upstream_model`/`model`, mirroring claude-relay's str-or-table coercion.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(from = "RawPersistedModelRoute")]
-pub struct PersistedModelRoute {
+/// A single fallback hop for a model profile: the named `upstreams:` entry to
+/// try, plus an optional model-name remap for that hop. Accepts a bare string
+/// (`"openrouter"`, upstream name only) or the table form via the untagged
+/// str-or-table shape below.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "RawPersistedProfileFallback")]
+pub struct PersistedProfileFallback {
+    pub upstream: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
+    pub model: Option<String>,
 }
 
-/// Untagged input shape for `PersistedModelRoute`: either a bare string URL or a
-/// table with URL/model aliases.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum RawPersistedModelRoute {
-    Url(String),
+enum RawPersistedProfileFallback {
+    Upstream(String),
     Table {
-        #[serde(default)]
-        upstream_base_url: Option<String>,
-        #[serde(default)]
-        url: Option<String>,
-        #[serde(default)]
-        upstream_model: Option<String>,
+        upstream: String,
         #[serde(default)]
         model: Option<String>,
     },
 }
 
-impl From<RawPersistedModelRoute> for PersistedModelRoute {
-    fn from(raw: RawPersistedModelRoute) -> Self {
+impl From<RawPersistedProfileFallback> for PersistedProfileFallback {
+    fn from(raw: RawPersistedProfileFallback) -> Self {
         match raw {
-            RawPersistedModelRoute::Url(url) => Self {
-                upstream_base_url: Some(url),
-                upstream_model: None,
+            RawPersistedProfileFallback::Upstream(upstream) => Self {
+                upstream,
+                model: None,
             },
-            RawPersistedModelRoute::Table {
-                upstream_base_url,
-                url,
-                upstream_model,
-                model,
-            } => Self {
-                upstream_base_url: upstream_base_url.or(url),
-                upstream_model: upstream_model.or(model),
-            },
+            RawPersistedProfileFallback::Table { upstream, model } => Self { upstream, model },
         }
     }
 }
 
-/// Ordered set of persisted model routes, keyed by request-model name.
-///
-/// A `Vec` of pairs rather than a `BTreeMap` so glob routes keep their
-/// DECLARATION order: overlapping globs are scanned first-match-wins, and a
-/// `BTreeMap` would silently re-sort keys alphabetically (e.g. `claude-*`
-/// sorting before `claude-opus-*`) and mis-route. Both serde_yaml and the
-/// `toml` crate (with `preserve_order`) yield map entries in document order, so
-/// the file order is the routing order. CLI `--model-route` specs are merged in
-/// declaration order too (replace-in-place on a name match, else append).
-///
-/// It (de)serializes as a MAP (`name: route`), not a sequence, so a config
-/// written by `write_persisted_config` round-trips back through the map
-/// deserializer; declaration order is preserved on write.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct OrderedModelRoutes(pub Vec<(String, PersistedModelRoute)>);
-
-impl OrderedModelRoutes {
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Insert a route by name, replacing an existing entry IN PLACE (preserving
-    /// its position) or appending when the name is new. Used to layer CLI routes
-    /// over file routes — and to collapse duplicate keys to last-wins — without
-    /// disturbing declaration order.
-    ///
-    /// Name comparison is TRIMMED + ASCII-case-insensitive, identical to route
-    /// DISPATCH (`Config::matches_model_route` / `RoutingModelCatalog::match_route`),
-    /// so e.g. a CLI `claude-*` route overrides a file `Claude-*` route in place
-    /// rather than adding a shadowed duplicate. The replacing entry adopts the
-    /// new name (CLI/last value wins) but keeps the original position.
-    pub fn upsert(&mut self, name: String, route: PersistedModelRoute) {
-        let key = name.trim();
-        if let Some(existing) = self
-            .0
-            .iter_mut()
-            .find(|(existing, _)| existing.trim().eq_ignore_ascii_case(key))
-        {
-            existing.0 = name;
-            existing.1 = route;
-        } else {
-            self.0.push((name, route));
-        }
-    }
+/// Policy for an `image_analysis` redirect's residual image: one left over
+/// after the redirect stripped the latest user turn (a `file_id` image, a
+/// non-`user`-role image, or old history). `Placeholder` (the default)
+/// replaces it with an instructive text placeholder so the model self-corrects
+/// instead of the text-only upstream 400ing on raw image bytes; `Reject` fails
+/// the turn before dispatch with a 4xx instead. No `Drop` variant: silently
+/// discarding image content with no signal to the model or client is a defect,
+/// not a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualImagePolicy {
+    #[default]
+    Placeholder,
+    Reject,
 }
 
-impl Serialize for OrderedModelRoutes {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        // Emit as a MAP in declaration order so the written config reloads
-        // through `visit_map` (a sequence would not round-trip).
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, route) in &self.0 {
-            map.serialize_entry(name, route)?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for OrderedModelRoutes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct RoutesVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for RoutesVisitor {
-            type Value = OrderedModelRoutes;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map of model-route name to route definition")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: serde::de::MapAccess<'de>,
-            {
-                let mut routes =
-                    OrderedModelRoutes(Vec::with_capacity(access.size_hint().unwrap_or(0)));
-                while let Some((name, route)) =
-                    access.next_entry::<String, PersistedModelRoute>()?
-                {
-                    // Collapse duplicate keys to last-wins (replace in place),
-                    // matching CLI-override and claude-relay dict semantics,
-                    // rather than keeping a shadowed first entry.
-                    routes.upsert(name, route);
-                }
-                Ok(routes)
-            }
-        }
-
-        deserializer.deserialize_map(RoutesVisitor)
-    }
+/// Per-profile redirect: images route to `model` (another profile) instead of
+/// the native/agent path. See README "Migrating" for the `native_vision`
+/// replacement this enables.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImageAnalysisConfig {
+    pub model: String,
+    #[serde(default)]
+    pub residual_images: ResidualImagePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub struct PersistedModelProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -994,13 +826,19 @@ pub struct PersistedModelProfile {
     pub roles: Option<RolesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_family: Option<String>,
-    /// Per-profile override for whether the resolved backend can natively see
-    /// images (G4). `Some(true)` forces the image agent OFF for this profile
-    /// (the backend is multimodal); `Some(false)` forces text-only handling
-    /// even for a name the family sniff would treat as native-vision. `None`
-    /// defers to the name-based default.
+    // Removed-key detection only; presence is a startup error (see README
+    // "Migrating"). Native image passthrough is now the default and
+    // `image_analysis` enables the redirect.
+    #[serde(default, skip_serializing)]
+    pub native_vision: Option<JsonValue>,
+    /// Ordered fallback hops tried after `upstream` (and after the model's own
+    /// exhausted retries). `None` means "not set here"; distinct from `Some(vec![])`
+    /// ("set to explicitly empty") so `extends` merge can tell inherit-from-template
+    /// apart from override-to-no-fallbacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_vision: Option<bool>,
+    pub fallbacks: Option<Vec<PersistedProfileFallback>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_analysis: Option<ImageAnalysisConfig>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model map from a canonical reasoning-effort level (`none`/`low`/
@@ -1036,6 +874,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             extends: Vec<String>,
             #[serde(default)]
+            upstream: Option<String>,
+            #[serde(default)]
             upstream_model: Option<String>,
             #[serde(default)]
             system_prompt_prefix: Option<String>,
@@ -1044,7 +884,11 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             template_family: Option<String>,
             #[serde(default)]
-            native_vision: Option<bool>,
+            native_vision: Option<JsonValue>,
+            #[serde(default)]
+            fallbacks: Option<Vec<PersistedProfileFallback>>,
+            #[serde(default)]
+            image_analysis: Option<ImageAnalysisConfig>,
             #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default)]
@@ -1061,11 +905,15 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
         let mut upstream_chat_kwargs = raw.shorthand_upstream_chat_kwargs;
-        // `template_family`/`native_vision`/effort knobs are recognized profile
-        // fields, not chat-template shorthand kwargs, so drop any copy the
-        // `flatten` swept into the shorthand bucket (they live in typed fields).
+        // These keys all name recognized typed profile fields, not chat-template
+        // shorthand kwargs. serde's `flatten` copies them into the shorthand
+        // bucket alongside the typed fields, so strip the duplicates here; only
+        // genuinely unknown keys survive as shorthand kwargs.
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
+        upstream_chat_kwargs.remove("upstream");
+        upstream_chat_kwargs.remove("fallbacks");
+        upstream_chat_kwargs.remove("image_analysis");
         upstream_chat_kwargs.remove("reasoning_effort_map");
         upstream_chat_kwargs.remove("reasoning_effort_default");
         upstream_chat_kwargs.remove("reasoning_effort");
@@ -1074,11 +922,14 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
+            upstream: raw.upstream,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
             roles: raw.roles,
             template_family: raw.template_family,
             native_vision: raw.native_vision,
+            fallbacks: raw.fallbacks,
+            image_analysis: raw.image_analysis,
             upstream_chat_kwargs,
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
@@ -1088,20 +939,157 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
     }
 }
 
+/// Ordered set of persisted model profiles, keyed by request-model name.
+///
+/// A `Vec` of pairs rather than a `BTreeMap`, mirroring `OrderedModelRoutes`,
+/// so profile keys keep their DECLARATION order: a glob-capable profile key
+/// needs first-match-wins scanning when two globs overlap, and a `BTreeMap`
+/// would silently re-sort keys alphabetically. Both serde_yaml and
+/// the `toml` crate (with `preserve_order`) yield map entries in document
+/// order, so the file order is the resolution order.
+///
+/// It (de)serializes as a MAP (`name: profile`), not a sequence, so a config
+/// written by `write_persisted_config` round-trips back through the map
+/// deserializer; declaration order is preserved on write.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderedModelProfiles(pub Vec<(String, PersistedModelProfile)>);
+
+impl OrderedModelProfiles {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Insert a profile by name, replacing an existing entry IN PLACE
+    /// (preserving its position) or appending when the name is new. Collapses
+    /// duplicate keys to last-wins without disturbing declaration order.
+    ///
+    /// Name comparison is TRIMMED + ASCII-case-insensitive, identical to
+    /// `OrderedModelRoutes::upsert`. The replacing entry adopts the new name
+    /// (last value wins) but keeps the original position.
+    pub fn upsert(&mut self, name: String, profile: PersistedModelProfile) {
+        let key = name.trim();
+        if let Some(existing) = self
+            .0
+            .iter_mut()
+            .find(|(existing, _)| existing.trim().eq_ignore_ascii_case(key))
+        {
+            existing.0 = name;
+            existing.1 = profile;
+        } else {
+            self.0.push((name, profile));
+        }
+    }
+}
+
+impl Serialize for OrderedModelProfiles {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        // Emit as a MAP in declaration order so the written config reloads
+        // through `visit_map` (a sequence would not round-trip).
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, profile) in &self.0 {
+            map.serialize_entry(name, profile)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedModelProfiles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProfilesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProfilesVisitor {
+            type Value = OrderedModelProfiles;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of model-profile name to profile definition")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut profiles =
+                    OrderedModelProfiles(Vec::with_capacity(access.size_hint().unwrap_or(0)));
+                while let Some((name, profile)) =
+                    access.next_entry::<String, PersistedModelProfile>()?
+                {
+                    // Collapse duplicate keys to last-wins (replace in place),
+                    // matching `OrderedModelRoutes` and claude-relay dict
+                    // semantics, rather than keeping a shadowed first entry.
+                    profiles.upsert(name, profile);
+                }
+                Ok(profiles)
+            }
+        }
+
+        deserializer.deserialize_map(ProfilesVisitor)
+    }
+}
+
+/// A resolved fallback hop: the named `upstreams:` entry to try, plus an
+/// optional model-name remap for that hop.
+#[derive(Debug, Clone)]
+pub struct ProfileFallback {
+    pub upstream: String,
+    pub model: Option<String>,
+}
+
+impl From<PersistedProfileFallback> for ProfileFallback {
+    fn from(persisted: PersistedProfileFallback) -> Self {
+        Self {
+            upstream: persisted.upstream,
+            model: trim_nonempty(persisted.model.as_deref()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
+    /// Validated reference into `config.upstreams` (required after `extends`
+    /// merge). Names the primary endpoint this profile routes to.
+    pub upstream: String,
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub roles: Option<RolesConfig>,
     pub template_family: Option<String>,
-    /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
-    pub native_vision: Option<bool>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
     pub reasoning_effort_default: Option<String>,
     pub capabilities: Option<CapabilitiesConfig>,
     pub reasoning_effort: Option<ReasoningConfig>,
+    pub fallbacks: Vec<ProfileFallback>,
+    pub image_analysis: Option<ImageAnalysisConfig>,
+}
+
+/// A model profile compiled for resolution: the declared key, its glob matcher
+/// (`None` for a literal key matched by exact, trimmed, case-insensitive
+/// comparison), and the resolved profile. Held in DECLARATION order so
+/// overlapping globs resolve first-match-wins.
+#[derive(Debug, Clone)]
+pub struct CompiledProfile {
+    pub key: String,
+    pub glob: Option<Regex>,
+    pub profile: ModelProfile,
+}
+
+/// The outcome of resolving a request model against the compiled profiles: the
+/// matched profile plus the model id to serve upstream.
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute<'a> {
+    pub profile_key: &'a str,
+    pub profile: &'a ModelProfile,
+    /// `upstream_model` when set, else the exact profile key, else the trimmed
+    /// request model passed through (a glob match carries no key to serve).
+    pub served_model: String,
+    pub matched_glob: bool,
 }
 
 /// Resolved reasoning-effort policy for a backend model: canonical effort level
@@ -1116,61 +1104,52 @@ pub struct ReasoningEffortPolicy {
     pub upstream_reasoning: Option<ReasoningConfig>,
 }
 
-#[derive(Debug, Clone)]
-pub struct FallbackUpstreamConfig {
-    pub name: String,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
-    pub exposed_model: Option<String>,
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    pub upstream_request_log_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct PersistedFallbackUpstream {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub upstream_base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exposed_model: Option<String>,
-    #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_request_log_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedUpstream {
+    pub name: String,
+    #[serde(alias = "upstream_base_url")]
+    pub url: String,
+    #[serde(
+        default,
+        alias = "upstream_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key: Option<String>,
+    /// Name of an environment variable to read the API key from at startup,
+    /// so the secret itself can stay out of the config file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub upstream_base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
-    #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_request_log_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    pub api_key_env: Option<String>,
+    #[serde(
+        default,
+        alias = "upstream_chat_kwargs",
+        skip_serializing_if = "JsonMap::is_empty"
+    )]
+    pub chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(
+        default,
+        alias = "upstream_request_log_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_log_path: Option<String>,
+    // Removed-key detection only; presence is a startup error.
+    #[serde(default, skip_serializing)]
+    pub upstream_model: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub fallback_upstreams: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
-    #[serde(default = "default_upstream_base_url")]
-    pub upstream_base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
+    // Removed-key detection only; presence is a startup error naming the
+    // profile/`upstreams` replacement (see `from_persisted`).
+    #[serde(default, skip_serializing)]
+    pub upstream_base_url: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub upstream_api_key: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub upstream_model: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1183,19 +1162,16 @@ pub struct PersistedConfig {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<PersistedUpstream>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    #[serde(default, skip_serializing)]
+    pub fallback_upstreams: Option<JsonValue>,
     #[serde(default = "default_upstream_failure_cooldown_secs")]
     pub upstream_failure_cooldown_secs: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profile_templates: BTreeMap<String, PersistedModelProfile>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub model_profiles: BTreeMap<String, PersistedModelProfile>,
-    /// Ad-hoc model routes (G7): request-model name (possibly a glob) →
-    /// synthetic upstream, in DECLARATION order (see `OrderedModelRoutes`). CLI
-    /// `--model-route` specs are merged in after these.
-    #[serde(default, skip_serializing_if = "OrderedModelRoutes::is_empty")]
-    pub model_routes: OrderedModelRoutes,
+    #[serde(default, skip_serializing_if = "OrderedModelProfiles::is_empty")]
+    pub model_profiles: OrderedModelProfiles,
+    #[serde(default, skip_serializing)]
+    pub model_routes: Option<JsonValue>,
     /// Global override for the backend chat-template family (`kimi`/`deepseek`).
     /// A matched model profile's `template_family` takes precedence (G2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1231,27 +1207,22 @@ pub struct PersistedConfig {
     /// Bodies larger than this are rejected with HTTP 413. Defaults to 10 MiB.
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
-    /// Master switch for the G4 image agent (vision offload). Off by default so
-    /// the gateway's text-first design is preserved unless explicitly opted in.
-    #[serde(default)]
-    pub image_agent_enabled: bool,
-    /// OpenAI-compatible chat-completions endpoint of the vision backend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_url: Option<String>,
-    /// Model id sent to the vision backend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_model: Option<String>,
+    // Removed-key detection only; presence is a startup error naming the profile
+    // `image_analysis` replacement (see `from_persisted`).
+    #[serde(default, skip_serializing)]
+    pub image_agent_enabled: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub vision_url: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub vision_model: Option<JsonValue>,
     /// Per-session LRU image-cache capacity.
     #[serde(default = "default_image_cache_max_size")]
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     #[serde(default = "default_image_cache_ttl_secs")]
     pub image_cache_ttl_secs: u64,
-    /// E2b: policy for a residual image reaching a non-native-vision backend.
-    /// Defaults to `placeholder` (never a silent `drop`) — see
-    /// [`UnsupportedImagePolicy`].
-    #[serde(default = "default_unsupported_image_policy")]
-    pub unsupported_image_policy: UnsupportedImagePolicy,
+    #[serde(default, skip_serializing)]
+    pub unsupported_image_policy: Option<JsonValue>,
     /// Per-model price table (T13/D13), keyed by served model id. A YAML map of
     /// `model: { input_per_1k, output_per_1k, cached_per_1k? }`. Wholesale-
     /// overridable by `LLMCONDUIT_PRICE_TABLE_JSON` (mirrors the
@@ -1264,9 +1235,10 @@ fn default_bind_addr() -> String {
     "127.0.0.1:4000".to_string()
 }
 
-fn default_upstream_base_url() -> String {
-    "http://127.0.0.1:8000/v1".to_string()
-}
+/// Base URL seeded into the `default` upstream entry of the out-of-box
+/// minimal config (`PersistedConfig::default()`), and the value the setup
+/// wizard pre-fills for the upstream URL prompt when no config exists yet.
+const DEFAULT_UPSTREAM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
 fn default_brave_base_url() -> String {
     "https://api.search.brave.com/res/v1".to_string()
@@ -1332,31 +1304,42 @@ fn default_image_cache_ttl_secs() -> u64 {
     300
 }
 
-/// Default E2b residual-image policy: replace with an instructive placeholder
-/// rather than reject the turn, so an existing deployment that upgrades keeps
-/// serving `200`s (matching the pre-E2b common case) instead of newly 4xx-ing
-/// every image-bearing turn against a non-native-vision backend.
-fn default_unsupported_image_policy() -> UnsupportedImagePolicy {
-    UnsupportedImagePolicy::Placeholder
-}
-
 impl Default for PersistedConfig {
+    /// The minimal profile config a missing config file resolves to: a single
+    /// `default` upstream plus a `"*"` catch-all profile pointing at it. This
+    /// preserves the out-of-box "just proxy to localhost:8000" behavior now that
+    /// the top-level single-upstream knobs are gone.
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
-            upstream_base_url: default_upstream_base_url(),
+            upstream_base_url: None,
             upstream_api_key: None,
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: vec![PersistedUpstream {
+                name: "default".to_string(),
+                url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
+                api_key: None,
+                api_key_env: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: None,
+            }],
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::new(),
-            model_routes: OrderedModelRoutes::default(),
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("default".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            model_routes: None,
             template_family: None,
             brave_base_url: default_brave_base_url(),
             brave_api_key: None,
@@ -1370,12 +1353,12 @@ impl Default for PersistedConfig {
             min_completion_tokens: default_min_completion_tokens(),
             max_sse_frame_bytes: default_max_sse_frame_bytes(),
             max_request_body_bytes: default_max_request_body_bytes(),
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: default_image_cache_max_size(),
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
-            unsupported_image_policy: default_unsupported_image_policy(),
+            unsupported_image_policy: None,
             price_table: HashMap::new(),
         }
     }
@@ -1383,29 +1366,12 @@ impl Default for PersistedConfig {
 
 impl Config {
     pub fn from_env_and_file(path: Option<&Path>) -> Result<Self, String> {
-        Self::from_env_file_and_routes(path, &[])
-    }
-
-    /// Like `from_env_and_file`, but additionally merges `--model-route` CLI
-    /// specs (G7) after the file and env overrides, so a CLI route wins over a
-    /// file route with the same name. A malformed spec is a clean `Err`.
-    pub fn from_env_file_and_routes(
-        path: Option<&Path>,
-        route_specs: &[String],
-    ) -> Result<Self, String> {
         let mut persisted = if let Some(path) = path {
             load_persisted_config(path)?
         } else {
             load_default_persisted_config()?
         };
         apply_env_overrides(&mut persisted);
-        for spec in route_specs {
-            let (name, route) = parse_model_route_spec(spec)?;
-            // Replace a same-named file route in place (preserve its position),
-            // else append — keeps glob declaration order intact while letting
-            // CLI win on a name conflict.
-            persisted.model_routes.upsert(name, route);
-        }
         Self::from_persisted(&persisted)
     }
 
@@ -1419,19 +1385,9 @@ impl Config {
     /// inventing a second log-path concept.
     ///
     /// This mirrors how `build_app_with_gateway_and_options` wires upstreams:
-    /// - Routing mode (`upstreams` non-empty): only the per-routing-upstream
-    ///   paths and their nested fallbacks are active. The top-level
-    ///   `upstream_request_log_path` and the global `fallback_upstreams` are
-    ///   ignored by the gateway, so they are excluded here too.
-    /// - Single/failover mode (`upstreams` empty): the top-level path plus the
-    ///   global `fallback_upstreams` paths are active.
-    /// - Explicit-upstream routing (`upstreams` non-empty, no `model_routes`):
-    ///   per-routing-upstream primaries and their nested fallbacks.
-    /// - Routes-only (`model_routes` non-empty, `upstreams` empty): route
-    ///   providers all write the top-level `upstream_request_log_path`, so the
-    ///   single/failover branch covers them.
-    /// - Mixed (`upstreams` + `model_routes`): per-routing-upstream paths PLUS
-    ///   the top-level path (route providers always use the top-level path).
+    /// the gateway builds one provider per `upstreams` entry, so only the
+    /// per-upstream `request_log_path`s are active. When `upstreams` is empty the
+    /// top-level `upstream_request_log_path` is the sole request-log path.
     ///
     /// F1: `turn_capture_dir`, when set, is ALWAYS included (unconditionally,
     /// last) regardless of routing/failover mode -- it is a single
@@ -1454,28 +1410,14 @@ impl Config {
         };
 
         if self.upstreams.is_empty() {
-            // Single/failover OR routes-only mode: top-level primary + global
-            // fallbacks. Route providers (G7) all write the top-level path, so
-            // this branch covers routes-only configs too.
+            // No named upstreams: the top-level primary path is the sole active
+            // request-log path.
             push_dir(self.upstream_request_log_path.as_ref());
-            for fallback in &self.fallback_upstreams {
-                push_dir(fallback.upstream_request_log_path.as_ref());
-            }
         } else {
-            // Explicit-upstream routing mode: per-routing-upstream primaries and
-            // their nested fallbacks.
+            // One provider per `upstreams` entry: only their per-upstream paths
+            // are written to.
             for upstream in &self.upstreams {
-                push_dir(upstream.upstream_request_log_path.as_ref());
-                for fallback in &upstream.fallback_upstreams {
-                    push_dir(fallback.upstream_request_log_path.as_ref());
-                }
-            }
-            // In mixed mode (`upstreams` + `model_routes`), route providers
-            // still write the top-level `upstream_request_log_path`, which the
-            // loop above does not include. Add it so route-log dirs are cleaned
-            // too (no-op dedup if it coincides with a routing-upstream path).
-            if !self.model_routes.is_empty() {
-                push_dir(self.upstream_request_log_path.as_ref());
+                push_dir(upstream.request_log_path.as_ref());
             }
         }
         // F1: `turn_capture_dir` IS the directory artifacts land in directly
@@ -1493,48 +1435,25 @@ impl Config {
     }
 
     pub fn from_persisted(config: &PersistedConfig) -> Result<Self, String> {
+        reject_removed_global_knobs(config)?;
         let bind_addr = config
             .bind_addr
             .parse()
             .map_err(|err| format!("invalid bind_addr: {err}"))?;
-        let upstream_base_url = Url::parse(&config.upstream_base_url)
-            .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
-        let fallback_upstreams = config
-            .fallback_upstreams
-            .iter()
-            .enumerate()
-            .map(|(index, provider)| parse_fallback_upstream(provider, index, "fallback_upstreams"))
-            .collect::<Result<Vec<_>, String>>()?;
-        let upstreams = config
-            .upstreams
-            .iter()
-            .enumerate()
-            .map(parse_upstream)
-            .collect::<Result<Vec<_>, String>>()?;
+        let upstreams = parse_upstreams(&config.upstreams)?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
-        let model_routes = resolve_model_routes(&config.model_routes)?;
-        let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
-            Some(url) => {
-                Some(Url::parse(&url).map_err(|err| format!("invalid vision_url: {err}"))?)
-            }
-            None => None,
-        };
+        if model_profiles.is_empty() {
+            return Err(
+                "`model_profiles` is empty; every served model needs a profile - add one (a catch-all works: `model_profiles: {\"*\": {upstream: <name>}}`) (see README \"Migrating\")"
+                    .to_string(),
+            );
+        }
+        validate_model_profiles(&model_profiles, &upstreams)?;
         Ok(Self {
             bind_addr,
-            upstream_base_url,
-            upstream_api_key: config
-                .upstream_api_key
-                .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            upstream_model: config
-                .upstream_model
-                .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
             system_prompt_prefix: config
                 .system_prompt_prefix
                 .as_ref()
@@ -1554,10 +1473,8 @@ impl Config {
                 .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
             upstreams,
-            fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
-            model_routes,
             template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
             brave_api_key: config
@@ -1579,14 +1496,10 @@ impl Config {
             // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
             // request; the default (10 MiB) is far larger.
             max_request_body_bytes: config.max_request_body_bytes.max(1024),
-            image_agent_enabled: config.image_agent_enabled,
-            vision_url,
-            vision_model: trim_nonempty(config.vision_model.as_deref()),
             // Floor the capacity at 1 so a misconfigured zero does not make the
             // cache evict every image immediately and silently disable the agent.
             image_cache_max_size: config.image_cache_max_size.max(1),
             image_cache_ttl_secs: config.image_cache_ttl_secs,
-            unsupported_image_policy: config.unsupported_image_policy,
             price_table: {
                 // D13 R1 MED: reject any YAML price entry with a non-finite rate so
                 // the resolved table only holds finite prices (the topology price
@@ -1599,10 +1512,95 @@ impl Config {
     }
 
     pub fn resolve_upstream_model(&self, request_model: &str) -> String {
-        self.model_profile(request_model)
-            .and_then(|profile| profile.upstream_model.clone())
-            .or_else(|| self.upstream_model.clone())
-            .unwrap_or_else(|| request_model.to_string())
+        self.resolve_route(request_model)
+            .map(|route| route.served_model)
+            .unwrap_or_else(|| request_model.trim().to_string())
+    }
+
+    /// Resolve `request_model` against the compiled profiles. An exact key
+    /// (trimmed, case-insensitive) beats any glob regardless of declaration
+    /// order; globs match first in declaration order. Returns `None` (a 404)
+    /// when nothing matches. A blank request model resolves only through a glob
+    /// whose regex matches the empty string AND that sets `upstream_model`,
+    /// since there is no request model to pass through.
+    pub fn resolve_route(&self, request_model: &str) -> Option<ResolvedRoute<'_>> {
+        let trimmed = request_model.trim();
+        if !trimmed.is_empty() {
+            // Prefer an exact-case match, then a case-insensitive one, mirroring
+            // `model_profile`, so two keys differing only in case pick the exact.
+            let exact = self
+                .model_profiles
+                .iter()
+                .find(|cp| cp.glob.is_none() && cp.key.trim() == trimmed)
+                .or_else(|| {
+                    self.model_profiles
+                        .iter()
+                        .find(|cp| cp.glob.is_none() && cp.key.trim().eq_ignore_ascii_case(trimmed))
+                });
+            if let Some(cp) = exact {
+                let served_model = cp
+                    .profile
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| cp.key.trim().to_string());
+                return Some(ResolvedRoute {
+                    profile_key: cp.key.as_str(),
+                    profile: &cp.profile,
+                    served_model,
+                    matched_glob: false,
+                });
+            }
+        }
+        for cp in &self.model_profiles {
+            let Some(glob) = &cp.glob else {
+                continue;
+            };
+            if !glob.is_match(trimmed) {
+                continue;
+            }
+            if trimmed.is_empty() {
+                // No request model to pass through: a blank model needs the glob
+                // profile's own `upstream_model` to name what to serve.
+                return cp
+                    .profile
+                    .upstream_model
+                    .clone()
+                    .map(|served_model| ResolvedRoute {
+                        profile_key: cp.key.as_str(),
+                        profile: &cp.profile,
+                        served_model,
+                        matched_glob: true,
+                    });
+            }
+            let served_model = cp
+                .profile
+                .upstream_model
+                .clone()
+                .unwrap_or_else(|| trimmed.to_string());
+            return Some(ResolvedRoute {
+                profile_key: cp.key.as_str(),
+                profile: &cp.profile,
+                served_model,
+                matched_glob: true,
+            });
+        }
+        None
+    }
+
+    /// Non-glob profile keys in declaration order.
+    pub fn exact_profile_keys(&self) -> impl Iterator<Item = &str> {
+        self.model_profiles
+            .iter()
+            .filter(|cp| cp.glob.is_none())
+            .map(|cp| cp.key.as_str())
+    }
+
+    /// The `upstreams:` entry named `name` (trimmed, case-insensitive lookup).
+    pub fn upstream_by_name(&self, name: &str) -> Option<&UpstreamConfig> {
+        let name = name.trim();
+        self.upstreams
+            .iter()
+            .find(|upstream| upstream.name.trim().eq_ignore_ascii_case(name))
     }
 
     /// The configured [`ModelPrice`] for `model` (T13/D13). Exact key match first,
@@ -1619,117 +1617,68 @@ impl Config {
         })
     }
 
-    /// Whether `model` matches an ad-hoc `model_routes` entry by exact name
-    /// (case-insensitive) or glob, via the shared [`route_matches`] primitive
-    /// (the SAME boolean projection `RoutingModelCatalog::match_route` uses for
-    /// dispatch, G7). The engine consults this so a route-bound request model is
-    /// NOT pre-collapsed to a catalog/default model before the routing client can
-    /// dispatch it. Slots between an exact catalog id and the canonical-key/
-    /// default fallbacks: callers must check an exact catalog id FIRST so a
-    /// catalog id still beats a route.
-    pub fn matches_model_route(&self, model: &str) -> bool {
-        route_matches(&self.model_routes, model)
-    }
-
-    /// Plain single-provider mode: no `upstreams` (routing), no `model_routes`
-    /// (ad-hoc routes), no top-level `fallback_upstreams` (non-routing failover).
-    /// In this mode the engine's own `/v1/models` catalog IS the single served
-    /// provider, so G3 budgeting may fall back to it when the candidate plan has
-    /// no known window. In any other mode the candidate plan is the authoritative
-    /// resolver (routing/failover rewrites the model pre-first-chunk), so the
-    /// engine union catalog must NOT be used as a budgeting fallback — it could
-    /// mask a failover target's smaller window or budget a routed model against
-    /// the wrong window (T9).
+    /// Plain single-provider mode: no named `upstreams`. In this mode the
+    /// engine's own `/v1/models` catalog IS the single served provider, so G3
+    /// budgeting may fall back to it when the candidate plan has no known window.
+    /// In any other mode the candidate plan is the authoritative resolver
+    /// (profile routing rewrites the model pre-first-chunk), so the engine union
+    /// catalog must NOT be used as a budgeting fallback - it could mask a
+    /// failover target's smaller window or budget a routed model against the
+    /// wrong window (T9).
     pub fn is_plain_single_provider(&self) -> bool {
         self.upstreams.is_empty()
-            && self.model_routes.is_empty()
-            && self.fallback_upstreams.is_empty()
     }
 
-    /// Per-BACKEND-MODEL reasoning-effort policies, keyed by the resolved model
-    /// id (profile name). Applied at the upstream LEAF — the single point that
-    /// knows the FINAL provider model after routing/failover/exposed-alias remap
-    /// — so a route/failover target gets its OWN model's effort vocabulary rather
-    /// than the request alias's. Both the fork's fragment-based map and the
-    /// upstream-compatible typed shorthand are compiled into the same leaf
-    /// policy, after profile inheritance has resolved.
-    pub fn reasoning_effort_policies(&self) -> BTreeMap<String, ReasoningEffortPolicy> {
-        self.model_profiles
-            .iter()
-            .filter(|(_, profile)| {
-                !profile.reasoning_effort_map.is_empty() || profile.reasoning_effort.is_some()
-            })
-            .map(|(name, profile)| {
-                let (map, default, upstream_reasoning) =
-                    if let Some(reasoning) = &profile.reasoning_effort {
-                        let mut map: BTreeMap<String, JsonValue> = reasoning
-                            .map
-                            .iter()
-                            .map(|(level, mapped)| {
-                                (
-                                    level.trim().to_ascii_lowercase(),
-                                    serde_json::json!({"reasoning_effort": mapped}),
-                                )
-                            })
-                            .collect();
-                        let default = trim_nonempty(reasoning.default.as_deref())
-                            .map(|level| level.to_ascii_lowercase());
-                        // Upstream semantics do not run the configured default
-                        // back through `map`: the default is emitted verbatim.
-                        if let Some(level) = &default {
-                            map.insert(
-                                level.clone(),
-                                serde_json::json!({"reasoning_effort": level}),
-                            );
-                        }
-                        (map, default, Some(reasoning.clone()))
-                    } else {
-                        (
-                            profile
-                                .reasoning_effort_map
-                                .iter()
-                                .map(|(level, fragment)| {
-                                    (level.trim().to_ascii_lowercase(), fragment.clone())
-                                })
-                                .collect(),
-                            trim_nonempty(profile.reasoning_effort_default.as_deref())
-                                .map(|level| level.to_ascii_lowercase()),
-                            None,
-                        )
-                    };
-                (
-                    name.clone(),
-                    ReasoningEffortPolicy {
-                        map,
-                        default,
-                        upstream_reasoning,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Per-BACKEND-MODEL `template_family` override policies, keyed by the
-    /// resolved model id (profile name). Applied at the upstream LEAF — the
-    /// single point that knows the FINAL provider model after routing/failover/
-    /// exposed-alias remap — so a route/failover target gets its OWN model's
-    /// family override rather than the request alias's (T1). Each profile's
-    /// `template_family` is already normalized to `kimi`/`deepseek` at
-    /// construction. Only profiles that set a family are included; the GLOBAL
-    /// `template_family` is exposed separately by [`global_template_family`]
-    /// and the leaf folds it in as the fallback when no per-model policy matches.
+    /// Per-BACKEND-MODEL reasoning-effort policies for exact leaf lookup, keyed
+    /// by the effective backend model (`upstream_model` if set, else the profile
+    /// key) - the id the leaf POSTs. Applied at the upstream leaf, the single
+    /// point that knows the FINAL provider model after routing/failover, so a
+    /// route/failover target gets its OWN model's effort vocabulary rather than
+    /// the request alias's. A glob profile that pins `upstream_model` serves a
+    /// fixed id, so it is registered here (not in the glob list); glob profiles
+    /// without `upstream_model` are exposed by [`reasoning_effort_policy_globs`].
+    /// Both the fork's fragment-based map and the upstream-compatible typed
+    /// shorthand compile into the same leaf policy.
     ///
+    /// [`reasoning_effort_policy_globs`]: Config::reasoning_effort_policy_globs
+    pub fn reasoning_effort_policies(&self) -> BTreeMap<String, ReasoningEffortPolicy> {
+        build_exact_policies(&self.model_profiles, reasoning_effort_policy_of)
+    }
+
+    /// Reasoning-effort policies for glob profiles WITHOUT `upstream_model`,
+    /// paired with their compiled matcher, in declaration order. Such a profile
+    /// passes the request model through, so the leaf pattern-matches the POSTed
+    /// id; a glob profile that pins `upstream_model` is an exact entry instead.
+    pub fn reasoning_effort_policy_globs(&self) -> Vec<(Regex, ReasoningEffortPolicy)> {
+        build_glob_policies(&self.model_profiles, reasoning_effort_policy_of)
+    }
+
+    /// Per-BACKEND-MODEL `template_family` overrides for exact leaf lookup, keyed
+    /// by the effective backend model (`upstream_model` if set, else the profile
+    /// key). Applied at the upstream leaf, the single point that knows the FINAL
+    /// provider model after routing/failover, so a route/failover target gets its
+    /// OWN model's family override rather than the request alias's (T1). Each
+    /// profile's `template_family` is already normalized to `kimi`/`deepseek` at
+    /// construction. Glob profiles without `upstream_model` are exposed by
+    /// [`template_family_policy_globs`] and the GLOBAL `template_family` by
+    /// [`global_template_family`], which the leaf folds in as the fallback when no
+    /// per-model policy matches.
+    ///
+    /// [`template_family_policy_globs`]: Config::template_family_policy_globs
     /// [`global_template_family`]: Config::global_template_family
     pub fn template_family_policies(&self) -> BTreeMap<String, String> {
-        self.model_profiles
-            .iter()
-            .filter_map(|(name, profile)| {
-                profile
-                    .template_family
-                    .clone()
-                    .map(|family| (name.clone(), family))
-            })
-            .collect()
+        build_exact_policies(&self.model_profiles, |profile| {
+            profile.template_family.clone()
+        })
+    }
+
+    /// `template_family` overrides for glob profiles WITHOUT `upstream_model`,
+    /// paired with their compiled matcher, in declaration order (matched against
+    /// the POSTed model).
+    pub fn template_family_policy_globs(&self) -> Vec<(Regex, String)> {
+        build_glob_policies(&self.model_profiles, |profile| {
+            profile.template_family.clone()
+        })
     }
 
     /// The GLOBAL `template_family` override (already normalized), applied by
@@ -1740,28 +1689,32 @@ impl Config {
         self.template_family.clone()
     }
 
-    /// Per-BACKEND-MODEL `upstream_chat_kwargs` policies, keyed by the resolved
-    /// model id (profile name). Applied at the upstream LEAF — the single point
-    /// that knows the FINAL provider model after routing/failover/exposed-alias
-    /// remap — so a route/failover target gets its OWN model's kwargs rather
-    /// than the request alias's (T1). Each profile's `upstream_chat_kwargs` is
-    /// already extends-merged at construction. Only non-empty profiles are
-    /// included; the GLOBAL `upstream_chat_kwargs` is exposed separately by
-    /// [`global_upstream_chat_kwargs`] and the leaf merges it as the base layer
-    /// under the per-profile policy.
+    /// Per-BACKEND-MODEL `upstream_chat_kwargs` policies for exact leaf lookup,
+    /// keyed by the effective backend model (`upstream_model` if set, else the
+    /// profile key). Applied at the upstream leaf, the single point that knows
+    /// the FINAL provider model after routing/failover, so a route/failover
+    /// target gets its OWN model's kwargs rather than the request alias's (T1).
+    /// Each profile's `upstream_chat_kwargs` is already extends-merged at
+    /// construction. Glob profiles without `upstream_model` are exposed by
+    /// [`upstream_chat_kwargs_policy_globs`]; the GLOBAL `upstream_chat_kwargs`
+    /// is exposed by [`global_upstream_chat_kwargs`] and merged by the leaf as
+    /// the base layer under the per-profile policy.
     ///
+    /// [`upstream_chat_kwargs_policy_globs`]: Config::upstream_chat_kwargs_policy_globs
     /// [`global_upstream_chat_kwargs`]: Config::global_upstream_chat_kwargs
     pub fn upstream_chat_kwargs_policies(&self) -> BTreeMap<String, JsonMap<String, JsonValue>> {
-        self.model_profiles
-            .iter()
-            .filter_map(|(name, profile)| {
-                if profile.upstream_chat_kwargs.is_empty() {
-                    None
-                } else {
-                    Some((name.clone(), profile.upstream_chat_kwargs.clone()))
-                }
-            })
-            .collect()
+        build_exact_policies(&self.model_profiles, |profile| {
+            (!profile.upstream_chat_kwargs.is_empty()).then(|| profile.upstream_chat_kwargs.clone())
+        })
+    }
+
+    /// `upstream_chat_kwargs` for glob profiles WITHOUT `upstream_model`, paired
+    /// with their compiled matcher, in declaration order (matched against the
+    /// POSTed model).
+    pub fn upstream_chat_kwargs_policy_globs(&self) -> Vec<(Regex, JsonMap<String, JsonValue>)> {
+        build_glob_policies(&self.model_profiles, |profile| {
+            (!profile.upstream_chat_kwargs.is_empty()).then(|| profile.upstream_chat_kwargs.clone())
+        })
     }
 
     /// The GLOBAL `upstream_chat_kwargs` (base layer), merged by the leaf under
@@ -1771,34 +1724,13 @@ impl Config {
         &self.upstream_chat_kwargs
     }
 
-    /// Direct, PROFILE-ONLY `native_vision` lookup for EXACTLY `model` (G4
-    /// round-9 #1). Looks up the profile keyed on `model` and returns its
-    /// (already template-resolved) `native_vision`, with NO `upstream_model`
-    /// remap. This is the ONLY native_vision accessor G4 gating uses: each input
-    /// is already a final backend model (a candidate) or the literal request
-    /// model, so re-applying the `upstream_model` remap would judge a DIFFERENT
-    /// model's profile than the one the provider receives / than the request
-    /// actually carries.
-    pub fn profile_native_vision(&self, model: &str) -> Option<bool> {
-        self.model_profile(model)
-            .and_then(|profile| profile.native_vision)
-    }
-
+    /// The system-prompt prefix for `request_model`: the global prefix followed
+    /// by the resolved profile's prefix (if any), joined with a blank line. A
+    /// single profile applies - the one `resolve_route` selects.
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
-        let upstream_model = self.resolve_upstream_model(request_model);
-        self.resolve_system_prompt_prefix_for_resolved_model(request_model, &upstream_model)
-    }
-
-    pub fn resolve_system_prompt_prefix_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<String> {
         let profile_prefix = self
-            .model_profiles_for_resolved_model(request_model, resolved_model)
-            .into_iter()
-            .rev()
-            .find_map(|profile| profile.system_prompt_prefix.clone());
+            .resolve_route(request_model)
+            .and_then(|route| route.profile.system_prompt_prefix.clone());
         join_prompt_prefixes(
             [self.system_prompt_prefix.clone(), profile_prefix]
                 .into_iter()
@@ -1813,91 +1745,186 @@ impl Config {
         if let Some(profile) = self.model_profile(id) {
             return profile.capabilities.as_ref();
         }
-        for profile in self.model_profiles.values() {
-            if profile
+        for cp in &self.model_profiles {
+            if cp
+                .profile
                 .upstream_model
                 .as_deref()
                 .is_some_and(|model| model.eq_ignore_ascii_case(id))
             {
-                return profile.capabilities.as_ref();
+                return cp.profile.capabilities.as_ref();
             }
         }
         self.model_profile("*")
             .and_then(|profile| profile.capabilities.as_ref())
     }
 
-    pub fn resolve_roles_config_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<&RolesConfig> {
-        self.model_profiles_for_resolved_model(request_model, resolved_model)
-            .into_iter()
-            .rev()
-            .find_map(|profile| profile.roles.as_ref())
+    /// The role-mapping policy for `request_model`, from the single profile
+    /// `resolve_route` selects. `None` when no profile matches or it sets none.
+    pub fn resolve_roles_config(&self, request_model: &str) -> Option<&RolesConfig> {
+        self.resolve_route(request_model)?.profile.roles.as_ref()
     }
 
-    fn model_profiles_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Vec<&ModelProfile> {
-        let mut profiles: Vec<&ModelProfile> = Vec::new();
-        let configured_model = self.resolve_upstream_model(request_model);
-        for model in [resolved_model, configured_model.as_str(), request_model] {
-            if let Some(profile) = self.model_profile(model)
-                && !profiles
+    /// Looks up the profile keyed on `request_model` (exact, then trimmed
+    /// case-insensitive), already `extends`-resolved. Exact-key match only - a
+    /// glob key matches only when `request_model` equals the pattern verbatim;
+    /// use `resolve_route` for glob-aware routing.
+    pub fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
+        let key = request_model.trim();
+        self.model_profiles
+            .iter()
+            .find(|cp| cp.key.trim() == key)
+            .or_else(|| {
+                self.model_profiles
                     .iter()
-                    .any(|existing| std::ptr::eq(*existing, profile))
-            {
-                profiles.push(profile);
-            }
-        }
-        if profiles.is_empty()
-            && let Some(profile) = self.model_profile("*")
-        {
-            profiles.push(profile);
-        }
-        profiles
+                    .find(|cp| cp.key.trim().eq_ignore_ascii_case(key))
+            })
+            .map(|cp| &cp.profile)
     }
+}
 
-    fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
-        self.model_profiles.get(request_model).or_else(|| {
-            self.model_profiles
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(request_model))
-                .map(|(_, profile)| profile)
-        })
+/// The effective backend model a profile serves: `upstream_model` when set,
+/// else the profile key. This is the id the leaf POSTs, so the leaf's per-model
+/// policies are keyed by it.
+fn effective_backend_model(cp: &CompiledProfile) -> String {
+    cp.profile
+        .upstream_model
+        .clone()
+        .unwrap_or_else(|| cp.key.clone())
+}
+
+/// Build the EXACT leaf-policy map: for every profile whose effective backend
+/// model is a FIXED id the leaf POSTs - a non-glob profile, or a glob profile
+/// that pins `upstream_model` - register `extract(profile)` under that id. First
+/// registration wins on a key collision, matching declaration-order precedence.
+fn build_exact_policies<V>(
+    profiles: &[CompiledProfile],
+    extract: impl Fn(&ModelProfile) -> Option<V>,
+) -> BTreeMap<String, V> {
+    let mut map = BTreeMap::new();
+    for cp in profiles {
+        // A glob profile with no `upstream_model` serves the passthrough request
+        // model, so it is matched by pattern, not by a fixed exact id.
+        if cp.glob.is_some() && cp.profile.upstream_model.is_none() {
+            continue;
+        }
+        if let Some(value) = extract(&cp.profile) {
+            map.entry(effective_backend_model(cp)).or_insert(value);
+        }
     }
+    map
+}
+
+/// Build the GLOB leaf-policy list, in declaration order, for glob profiles that
+/// have NO `upstream_model` (their POSTed id is the passthrough request model,
+/// so the compiled pattern matches it). Glob profiles that pin `upstream_model`
+/// serve a fixed id and are exact entries via [`build_exact_policies`] instead.
+fn build_glob_policies<V>(
+    profiles: &[CompiledProfile],
+    extract: impl Fn(&ModelProfile) -> Option<V>,
+) -> Vec<(Regex, V)> {
+    profiles
+        .iter()
+        .filter_map(|cp| {
+            let glob = cp.glob.clone()?;
+            if cp.profile.upstream_model.is_some() {
+                return None;
+            }
+            extract(&cp.profile).map(|value| (glob, value))
+        })
+        .collect()
+}
+
+/// Compile a profile's resolved reasoning-effort config into a leaf policy, or
+/// `None` when the profile carries no effort map / typed syntax. Both the
+/// fragment-based map and the upstream-compatible typed shorthand fold into the
+/// same policy.
+fn reasoning_effort_policy_of(profile: &ModelProfile) -> Option<ReasoningEffortPolicy> {
+    if profile.reasoning_effort_map.is_empty() && profile.reasoning_effort.is_none() {
+        return None;
+    }
+    let (map, default, upstream_reasoning) = if let Some(reasoning) = &profile.reasoning_effort {
+        let mut map: BTreeMap<String, JsonValue> = reasoning
+            .map
+            .iter()
+            .map(|(level, mapped)| {
+                (
+                    level.trim().to_ascii_lowercase(),
+                    serde_json::json!({"reasoning_effort": mapped}),
+                )
+            })
+            .collect();
+        let default =
+            trim_nonempty(reasoning.default.as_deref()).map(|level| level.to_ascii_lowercase());
+        // Upstream semantics do not run the configured default back through
+        // `map`: the default is emitted verbatim.
+        if let Some(level) = &default {
+            map.insert(
+                level.clone(),
+                serde_json::json!({"reasoning_effort": level}),
+            );
+        }
+        (map, default, Some(reasoning.clone()))
+    } else {
+        (
+            profile
+                .reasoning_effort_map
+                .iter()
+                .map(|(level, fragment)| (level.trim().to_ascii_lowercase(), fragment.clone()))
+                .collect(),
+            trim_nonempty(profile.reasoning_effort_default.as_deref())
+                .map(|level| level.to_ascii_lowercase()),
+            None,
+        )
+    };
+    Some(ReasoningEffortPolicy {
+        map,
+        default,
+        upstream_reasoning,
+    })
 }
 
 #[derive(Debug, Clone, Default)]
 struct ResolvedModelProfile {
+    upstream: Option<String>,
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     roles: Option<RolesConfig>,
     template_family: Option<String>,
-    native_vision: Option<bool>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
     capabilities: Option<CapabilitiesConfig>,
     reasoning_effort: Option<ReasoningConfig>,
+    /// `None` = no profile or template in the `extends` chain set `fallbacks`;
+    /// `Some(_)` = the last profile/template to set it, whole-list (see
+    /// `merge_persisted_model_profile`).
+    fallbacks: Option<Vec<PersistedProfileFallback>>,
+    image_analysis: Option<ImageAnalysisConfig>,
 }
 
 impl ResolvedModelProfile {
     fn into_model_profile(self) -> ModelProfile {
         ModelProfile {
+            // Empty when no profile/template in the chain set it; validated as
+            // required (non-empty) in `validate_model_profiles`.
+            upstream: self.upstream.unwrap_or_default(),
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             roles: self.roles,
             template_family: normalize_template_family(self.template_family.as_deref()),
-            native_vision: self.native_vision,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
             capabilities: self.capabilities,
             reasoning_effort: self.reasoning_effort,
+            fallbacks: self
+                .fallbacks
+                .unwrap_or_default()
+                .into_iter()
+                .map(ProfileFallback::from)
+                .collect(),
+            image_analysis: self.image_analysis,
         }
     }
 }
@@ -1956,73 +1983,24 @@ pub(crate) fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&regex).map_err(|err| format!("invalid glob {pattern:?}: {err}"))
 }
 
-/// Resolve persisted model routes into ordered `ModelRoute`s. A route with a
-/// blank key, a missing/invalid `upstream_base_url`, or an uncompilable glob is
-/// a clean startup error, never a panic. Order follows DECLARATION order (file
-/// order, then CLI specs merged in before this runs), so an earlier route wins
-/// when two globs overlap.
-fn resolve_model_routes(routes: &OrderedModelRoutes) -> Result<Vec<ModelRoute>, String> {
-    let mut resolved = Vec::with_capacity(routes.0.len());
-    for (name, route) in &routes.0 {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("model_routes: route name must not be blank".to_string());
-        }
-        let base_url = trim_nonempty(route.upstream_base_url.as_deref())
-            .ok_or_else(|| format!("model_routes[{name}]: missing upstream_base_url"))?;
-        let upstream_base_url = Url::parse(&base_url)
-            .map_err(|err| format!("model_routes[{name}]: invalid upstream_base_url: {err}"))?;
-        let glob = if is_glob_pattern(name) {
-            Some(glob_to_regex(name).map_err(|err| format!("model_routes[{name}]: {err}"))?)
-        } else {
-            None
-        };
-        resolved.push(ModelRoute {
-            name: name.to_string(),
-            glob,
-            upstream_base_url,
-            upstream_model: trim_nonempty(route.upstream_model.as_deref()),
-        });
+/// Compile a persisted key into a case-insensitive glob matcher, or `None` for
+/// a literal key matched by exact (trimmed, case-insensitive) comparison
+/// instead. The single glob-compilation entry point for `model_profiles`, so
+/// profile keys keep exactly one glob truth.
+pub fn compile_model_glob(pattern: &str) -> Result<Option<Regex>, String> {
+    if is_glob_pattern(pattern) {
+        Ok(Some(glob_to_regex(pattern)?))
+    } else {
+        Ok(None)
     }
-    Ok(resolved)
-}
-
-/// Parse a `--model-route "name=url[,upstream]"` CLI spec into a persisted route
-/// (G7). Malformed specs return an `Err` so startup fails cleanly instead of
-/// panicking. Mirrors claude-relay's `parse_model_route`.
-pub fn parse_model_route_spec(spec: &str) -> Result<(String, PersistedModelRoute), String> {
-    let (name, value) = spec
-        .split_once('=')
-        .ok_or_else(|| format!("--model-route {spec:?} must use NAME=URL[,UPSTREAM_MODEL]"))?;
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(format!("--model-route {spec:?} is missing NAME"));
-    }
-    let (url, upstream_model) = match value.split_once(',') {
-        Some((url, upstream_model)) => (url.trim(), upstream_model.trim()),
-        None => (value.trim(), ""),
-    };
-    if url.is_empty() {
-        return Err(format!("--model-route {spec:?} is missing URL"));
-    }
-    // Validate the URL eagerly so a malformed spec is rejected here rather than
-    // surfacing later from `from_persisted`.
-    Url::parse(url).map_err(|err| format!("--model-route {spec:?}: invalid URL: {err}"))?;
-    Ok((
-        name.to_string(),
-        PersistedModelRoute {
-            upstream_base_url: Some(url.to_string()),
-            upstream_model: (!upstream_model.is_empty()).then(|| upstream_model.to_string()),
-        },
-    ))
 }
 
 fn resolve_model_profiles(
-    profiles: &BTreeMap<String, PersistedModelProfile>,
+    profiles: &OrderedModelProfiles,
     templates: &BTreeMap<String, PersistedModelProfile>,
-) -> Result<BTreeMap<String, ModelProfile>, String> {
-    let mut resolved = BTreeMap::new();
-    for (name, profile) in profiles {
+) -> Result<Vec<CompiledProfile>, String> {
+    let mut resolved = Vec::with_capacity(profiles.0.len());
+    for (name, profile) in &profiles.0 {
         let name = name.trim();
         if name.is_empty() {
             continue;
@@ -2043,9 +2021,105 @@ fn resolve_model_profiles(
                 "model_profiles[{name}]: `reasoning_effort` cannot be combined with `reasoning_effort_map` or `reasoning_effort_default`"
             ));
         }
-        resolved.insert(name.to_string(), profile);
+        let glob =
+            compile_model_glob(name).map_err(|err| format!("model_profiles[{name}]: {err}"))?;
+        resolved.push(CompiledProfile {
+            key: name.to_string(),
+            glob,
+            profile,
+        });
     }
     Ok(resolved)
+}
+
+/// Cross-reference validation for the resolved profiles, run after both the
+/// upstreams and the profile chain are built. Applies to ALL profiles including
+/// glob-keyed ones and the `*` catch-all: `upstream` is required and must name a
+/// known endpoint; each fallback must name a known endpoint distinct from the
+/// primary with no duplicates; an `image_analysis` redirect must target an
+/// existing EXACT-key profile that is neither the profile itself, a glob, nor a
+/// profile that itself declares `image_analysis`.
+fn validate_model_profiles(
+    profiles: &[CompiledProfile],
+    upstreams: &[UpstreamConfig],
+) -> Result<(), String> {
+    let upstream_known = |name: &str| {
+        upstreams
+            .iter()
+            .any(|u| u.name.trim().eq_ignore_ascii_case(name.trim()))
+    };
+    for cp in profiles {
+        let key = cp.key.as_str();
+        let profile = &cp.profile;
+        let primary = profile.upstream.trim();
+        if primary.is_empty() {
+            return Err(format!("model_profiles[{key}]: `upstream` is required"));
+        }
+        if !upstream_known(primary) {
+            return Err(format!(
+                "model_profiles[{key}]: unknown upstream {:?}",
+                profile.upstream
+            ));
+        }
+        let mut seen = HashSet::new();
+        for fallback in &profile.fallbacks {
+            let name = fallback.upstream.trim();
+            if name.eq_ignore_ascii_case(primary) {
+                return Err(format!(
+                    "model_profiles[{key}]: fallback {:?} is the primary upstream",
+                    fallback.upstream
+                ));
+            }
+            if !upstream_known(name) {
+                return Err(format!(
+                    "model_profiles[{key}]: unknown upstream {:?} in fallbacks",
+                    fallback.upstream
+                ));
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(format!(
+                    "model_profiles[{key}]: duplicate fallback upstream {:?}",
+                    fallback.upstream
+                ));
+            }
+        }
+        if let Some(image_analysis) = &profile.image_analysis {
+            let target = image_analysis.model.trim();
+            if target.eq_ignore_ascii_case(key.trim()) {
+                return Err(format!(
+                    "model_profiles[{key}]: image_analysis cannot redirect to itself"
+                ));
+            }
+            let exact_target = profiles.iter().find(|other| {
+                other.glob.is_none() && other.key.trim().eq_ignore_ascii_case(target)
+            });
+            match exact_target {
+                Some(other) if other.profile.image_analysis.is_some() => {
+                    return Err(format!(
+                        "model_profiles[{key}]: image_analysis target {:?} itself sets image_analysis",
+                        image_analysis.model
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    let glob_target = profiles.iter().any(|other| {
+                        other.glob.is_some() && other.key.trim().eq_ignore_ascii_case(target)
+                    });
+                    if glob_target {
+                        return Err(format!(
+                            "model_profiles[{key}]: image_analysis target {:?} is a glob profile",
+                            image_analysis.model
+                        ));
+                    }
+                    return Err(format!(
+                        "model_profiles[{key}]: unknown image_analysis target {:?}",
+                        image_analysis.model
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_persisted_model_profile(
@@ -2078,7 +2152,7 @@ fn resolve_persisted_model_profile(
         stack.pop();
         merge_resolved_model_profile(&mut resolved, template);
     }
-    merge_persisted_model_profile(&mut resolved, profile);
+    merge_persisted_model_profile(&mut resolved, profile)?;
     Ok(resolved)
 }
 
@@ -2086,14 +2160,20 @@ fn merge_resolved_model_profile(
     destination: &mut ResolvedModelProfile,
     source: ResolvedModelProfile,
 ) {
+    if source.upstream.is_some() {
+        destination.upstream = source.upstream;
+    }
     if source.upstream_model.is_some() {
         destination.upstream_model = source.upstream_model;
     }
     if source.template_family.is_some() {
         destination.template_family = source.template_family;
     }
-    if source.native_vision.is_some() {
-        destination.native_vision = source.native_vision;
+    if source.fallbacks.is_some() {
+        destination.fallbacks = source.fallbacks;
+    }
+    if source.image_analysis.is_some() {
+        destination.image_analysis = source.image_analysis;
     }
     if source.roles.is_some() {
         destination.roles = source.roles;
@@ -2128,15 +2208,29 @@ fn merge_resolved_model_profile(
 fn merge_persisted_model_profile(
     destination: &mut ResolvedModelProfile,
     source: &PersistedModelProfile,
-) {
+) -> Result<(), String> {
+    if source.native_vision.is_some() {
+        return Err(
+            "`native_vision` was removed; native image passthrough is the default and `image_analysis` enables the redirect (see README \"Migrating\")"
+                .to_string(),
+        );
+    }
+    if let Some(upstream) = trim_nonempty(source.upstream.as_deref()) {
+        destination.upstream = Some(upstream);
+    }
     if let Some(upstream_model) = trim_nonempty(source.upstream_model.as_deref()) {
         destination.upstream_model = Some(upstream_model);
     }
     if let Some(template_family) = trim_nonempty(source.template_family.as_deref()) {
         destination.template_family = Some(template_family);
     }
-    if source.native_vision.is_some() {
-        destination.native_vision = source.native_vision;
+    if let Some(fallbacks) = &source.fallbacks {
+        destination.fallbacks = Some(fallbacks.clone());
+    }
+    if source.image_analysis.is_some() {
+        destination
+            .image_analysis
+            .clone_from(&source.image_analysis);
     }
     if source.roles.is_some() {
         destination.roles.clone_from(&source.roles);
@@ -2172,6 +2266,7 @@ fn merge_persisted_model_profile(
             .reasoning_effort_default
             .clone_from(&source.reasoning_effort_default);
     }
+    Ok(())
 }
 
 fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<String> {
@@ -2187,62 +2282,122 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
     }
 }
 
-fn parse_upstream(
-    (index, provider): (usize, &PersistedUpstream),
-) -> Result<UpstreamConfig, String> {
-    let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
-        .map_err(|err| format!("invalid upstreams[{index}].upstream_base_url: {err}"))?;
-    let fallback_upstreams = provider
-        .fallback_upstreams
-        .iter()
-        .enumerate()
-        .map(|(fallback_index, fallback)| {
-            parse_fallback_upstream(
-                fallback,
-                fallback_index,
-                &format!("upstreams[{index}].fallback_upstreams"),
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(UpstreamConfig {
-        name: provider
-            .name
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("upstream-{}", index + 1)),
-        upstream_base_url,
-        upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
-        upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
-        upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
-        upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
-            .map(PathBuf::from),
-        fallback_upstreams,
-    })
+/// Parses `upstreams:` entries into pure named endpoints. A request model's
+/// routing target is now named by a model profile (see README "Migrating"),
+/// so an entry no longer carries its own `upstream_model` remap or nested
+/// `fallback_upstreams` chain -- those keys are detected here and rejected
+/// with the replacement they migrate to, rather than silently ignored.
+fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>, String> {
+    let mut seen_names = HashSet::new();
+    let mut upstreams = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry.name.trim();
+        if name.is_empty() {
+            return Err(format!("upstreams[{index}]: name must not be blank"));
+        }
+        if entry.upstream_model.is_some() {
+            return Err(format!(
+                "upstreams[{name}]: `upstream_model` was removed; set `upstream_model` on the model profile instead (see README \"Migrating\")"
+            ));
+        }
+        if entry.fallback_upstreams.is_some() {
+            return Err(format!(
+                "upstreams[{name}]: nested `fallback_upstreams` were removed; declare `fallbacks` on the model profile instead (see README \"Migrating\")"
+            ));
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "upstreams[{index}]: duplicate upstream name {name:?}"
+            ));
+        }
+        let url = Url::parse(entry.url.trim())
+            .map_err(|err| format!("invalid upstreams[{index}].url: {err}"))?;
+        // `api_key_env` resolves once at startup so the secret stays out of the
+        // config file; a declared-but-missing variable fails loud here rather
+        // than surfacing later as upstream 401s.
+        let api_key = match (
+            trim_nonempty(entry.api_key.as_deref()),
+            trim_nonempty(entry.api_key_env.as_deref()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "upstreams[{name}]: `api_key` and `api_key_env` are mutually exclusive; set one or the other"
+                ));
+            }
+            (key, None) => key,
+            (None, Some(var)) => match env::var(&var)
+                .ok()
+                .and_then(|value| trim_nonempty(Some(&value)))
+            {
+                Some(key) => Some(key),
+                None => {
+                    return Err(format!(
+                        "upstreams[{name}]: `api_key_env` names {var:?}, but that environment variable is unset or blank"
+                    ));
+                }
+            },
+        };
+        upstreams.push(UpstreamConfig {
+            name: name.to_string(),
+            url,
+            api_key,
+            chat_kwargs: entry.chat_kwargs.clone(),
+            request_log_path: trim_nonempty(entry.request_log_path.as_deref()).map(PathBuf::from),
+        });
+    }
+    Ok(upstreams)
 }
 
-fn parse_fallback_upstream(
-    provider: &PersistedFallbackUpstream,
-    index: usize,
-    path: &str,
-) -> Result<FallbackUpstreamConfig, String> {
-    let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
-        .map_err(|err| format!("invalid {path}[{index}].upstream_base_url: {err}"))?;
-    Ok(FallbackUpstreamConfig {
-        name: provider
-            .name
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("fallback-{}", index + 1)),
-        upstream_base_url,
-        upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
-        upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
-        exposed_model: trim_nonempty(provider.exposed_model.as_deref()),
-        upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
-        upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
-            .map(PathBuf::from),
-    })
+/// Reject the legacy top-level knobs that profile routing replaced.
+/// Each removed key is a HARD startup error naming the replacement rather than a
+/// silently-ignored value, so an upgraded config fails loud instead of behaving
+/// unexpectedly. Only one key needs reporting to send the operator to the README;
+/// the checks run in a fixed order and return the first match.
+fn reject_removed_global_knobs(config: &PersistedConfig) -> Result<(), String> {
+    let removed: [(&Option<JsonValue>, &str); 9] = [
+        (
+            &config.upstream_base_url,
+            "`upstream_base_url` was removed; declare the endpoint as an `upstreams:` entry and point a model profile at it",
+        ),
+        (
+            &config.upstream_api_key,
+            "`upstream_api_key` was removed; set `api_key` on the `upstreams:` entry instead",
+        ),
+        (
+            &config.upstream_model,
+            "`upstream_model` was removed; set `upstream_model` on the model profile instead",
+        ),
+        (
+            &config.fallback_upstreams,
+            "`fallback_upstreams` was removed; declare `fallbacks` on the model profile instead",
+        ),
+        (
+            &config.model_routes,
+            "`model_routes` was removed; use glob `model_profiles` keys instead",
+        ),
+        (
+            &config.image_agent_enabled,
+            "`image_agent_enabled` was removed; configure `image_analysis` on the model profile instead",
+        ),
+        (
+            &config.vision_url,
+            "`vision_url` was removed; configure `image_analysis` on the model profile instead",
+        ),
+        (
+            &config.vision_model,
+            "`vision_model` was removed; configure `image_analysis` on the model profile instead",
+        ),
+        (
+            &config.unsupported_image_policy,
+            "`unsupported_image_policy` was removed; set `image_analysis.residual_images` on the model profile instead",
+        ),
+    ];
+    for (value, hint) in removed {
+        if value.is_some() {
+            return Err(format!("{hint} (see README \"Migrating\")"));
+        }
+    }
+    Ok(())
 }
 
 fn trim_nonempty(value: Option<&str>) -> Option<String> {
@@ -2345,26 +2500,6 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.bind_addr = value;
     }
-    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_BASE_URL")
-        && !value.trim().is_empty()
-    {
-        config.upstream_base_url = value;
-    }
-    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_API_KEY")
-        && !value.trim().is_empty()
-    {
-        config.upstream_api_key = Some(value);
-    } else if config.upstream_api_key.is_none()
-        && let Ok(value) = env::var("OPENAI_API_KEY")
-        && !value.trim().is_empty()
-    {
-        config.upstream_api_key = Some(value);
-    }
-    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_MODEL")
-        && !value.trim().is_empty()
-    {
-        config.upstream_model = Some(value);
-    }
     if let Ok(value) = env::var("LLMCONDUIT_TEMPLATE_FAMILY")
         && !value.trim().is_empty()
     {
@@ -2459,21 +2594,6 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.max_request_body_bytes = parsed;
     }
-    if let Ok(value) = env::var("LLMCONDUIT_IMAGE_AGENT_ENABLED")
-        && let Ok(parsed) = value.trim().parse::<bool>()
-    {
-        config.image_agent_enabled = parsed;
-    }
-    if let Ok(value) = env::var("LLMCONDUIT_VISION_URL")
-        && !value.trim().is_empty()
-    {
-        config.vision_url = Some(value);
-    }
-    if let Ok(value) = env::var("LLMCONDUIT_VISION_MODEL")
-        && !value.trim().is_empty()
-    {
-        config.vision_model = Some(value);
-    }
     if let Ok(value) = env::var("LLMCONDUIT_IMAGE_CACHE_MAX_SIZE")
         && let Ok(parsed) = value.trim().parse::<usize>()
         && parsed >= 1
@@ -2484,15 +2604,6 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && let Ok(parsed) = value.trim().parse::<u64>()
     {
         config.image_cache_ttl_secs = parsed;
-    }
-    if let Ok(value) = env::var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "placeholder" => config.unsupported_image_policy = UnsupportedImagePolicy::Placeholder,
-            "reject" => config.unsupported_image_policy = UnsupportedImagePolicy::Reject,
-            // Unrecognized value: ignore rather than silently defaulting to a
-            // DIFFERENT policy than a typo'd env var probably intended.
-            _ => {}
-        }
     }
     // T13/D13: the per-model price table can be supplied wholesale as a JSON map
     // via the environment (mirrors `LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON`). The
@@ -2531,13 +2642,11 @@ mod tests {
     use super::JsonMap;
     use super::JsonValue;
     use super::ModelPrice;
-    use super::OrderedModelRoutes;
+    use super::OrderedModelProfiles;
     use super::PersistedConfig;
-    use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
     use super::RolesConfig;
-    use super::UnsupportedImagePolicy;
     use super::apply_env_overrides;
     use super::default_config_path;
     use super::load_persisted_config;
@@ -2649,6 +2758,7 @@ mod tests {
     fn resolves_reasoning_effort_policy_from_profile_chain() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profile_templates:
   glm-effort:
     reasoning_effort_default: max
@@ -2658,6 +2768,7 @@ model_profile_templates:
       none: { chat_template_kwargs: { enable_thinking: false } }
 model_profiles:
   GLM-5.2-NVFP4-MTP:
+    upstream: backend
     extends: [glm-effort]
     reasoning_effort_map:
       xhigh: { chat_template_kwargs: { reasoning_effort: max } }
@@ -2691,8 +2802,10 @@ model_profiles:
     fn upstream_reasoning_syntax_uses_leaf_resolution_and_dynamic_thinking_kwarg() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profiles:
   served-model:
+    upstream: backend
     reasoning_effort:
       default: medium
       map:
@@ -2779,32 +2892,6 @@ model_profiles:
         }
     }
 
-    #[test]
-    fn from_persisted_invalid_base_url() {
-        let config = PersistedConfig {
-            upstream_base_url: "not a url".to_string(),
-            ..PersistedConfig::default()
-        };
-        assert!(Config::from_persisted(&config).is_err());
-    }
-
-    #[test]
-    fn whitespace_api_key_trimmed() {
-        let config = PersistedConfig {
-            upstream_api_key: Some("  secret  ".to_string()),
-            ..PersistedConfig::default()
-        };
-        let result = Config::from_persisted(&config).unwrap();
-        assert_eq!(result.upstream_api_key, Some("secret".to_string()));
-
-        let config2 = PersistedConfig {
-            upstream_api_key: Some("   ".to_string()),
-            ..PersistedConfig::default()
-        };
-        let result2 = Config::from_persisted(&config2).unwrap();
-        assert_eq!(result2.upstream_api_key, None);
-    }
-
     /// AC-1 (F1a): `turn_capture_dir` trims like `upstream_request_log_path`
     /// (mirrors `whitespace_api_key_trimmed`'s trim-to-`None` shape) --
     /// surrounding whitespace is trimmed, and a blank/whitespace-only value
@@ -2856,7 +2943,9 @@ model_profiles:
         ));
         std::fs::write(
             &yaml_path,
-            "upstream_base_url: http://127.0.0.1:8000/v1\nturn_capture_dir: /tmp/llmconduit-turns\n",
+            "turn_capture_dir: /tmp/llmconduit-turns\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
         )
         .expect("write yaml");
         let yaml_config = Config::from_env_and_file(Some(&yaml_path)).expect("load yaml config");
@@ -2872,7 +2961,9 @@ model_profiles:
         ));
         std::fs::write(
             &toml_path,
-            "upstream_base_url = \"http://127.0.0.1:8000/v1\"\nturn_capture_dir = \"/tmp/llmconduit-turns\"\n",
+            "turn_capture_dir = \"/tmp/llmconduit-turns\"\n\n\
+             [[upstreams]]\nname = \"u\"\nurl = \"http://h/v1\"\n\n\
+             [model_profiles.\"*\"]\nupstream = \"u\"\n",
         )
         .expect("write toml");
         let toml_config = Config::from_env_and_file(Some(&toml_path)).expect("load toml config");
@@ -2884,104 +2975,28 @@ model_profiles:
     }
 
     #[test]
-    fn from_persisted_parses_fallback_upstreams() {
-        let config = PersistedConfig {
-            fallback_upstreams: vec![
-                PersistedFallbackUpstream {
-                    name: Some(" backup ".to_string()),
-                    upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
-                    upstream_api_key: Some(" backup-secret ".to_string()),
-                    upstream_model: Some(" fallback-model ".to_string()),
-                    exposed_model: Some(" fallback-alias ".to_string()),
-                    upstream_chat_kwargs: JsonMap::from_iter([(
-                        "provider".to_string(),
-                        json!({
-                            "order": ["z-ai"],
-                            "allow_fallbacks": true
-                        }),
-                    )]),
-                    upstream_request_log_path: Some(" /tmp/llmconduit-fallback.jsonl ".to_string()),
-                },
-                PersistedFallbackUpstream {
-                    name: Some("   ".to_string()),
-                    upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
-                    upstream_api_key: Some("   ".to_string()),
-                    upstream_model: None,
-                    exposed_model: None,
-                    upstream_chat_kwargs: JsonMap::new(),
-                    upstream_request_log_path: None,
-                },
-            ],
-            upstream_failure_cooldown_secs: 12,
-            ..PersistedConfig::default()
-        };
-
-        let result = Config::from_persisted(&config).expect("config");
-
-        assert_eq!(result.upstream_failure_cooldown_secs, 12);
-        assert_eq!(result.fallback_upstreams.len(), 2);
-        assert_eq!(result.fallback_upstreams[0].name, "backup");
-        assert_eq!(
-            result.fallback_upstreams[0].upstream_base_url.as_str(),
-            "http://127.0.0.1:8001/v1"
-        );
-        assert_eq!(
-            result.fallback_upstreams[0].upstream_api_key.as_deref(),
-            Some("backup-secret")
-        );
-        assert_eq!(
-            result.fallback_upstreams[0].upstream_model.as_deref(),
-            Some("fallback-model")
-        );
-        assert_eq!(
-            result.fallback_upstreams[0].exposed_model.as_deref(),
-            Some("fallback-alias")
-        );
-        assert_eq!(
-            result.fallback_upstreams[0]
-                .upstream_chat_kwargs
-                .get("provider"),
-            Some(&json!({
-                "order": ["z-ai"],
-                "allow_fallbacks": true
-            }))
-        );
-        assert_eq!(
-            result.fallback_upstreams[0]
-                .upstream_request_log_path
-                .as_deref(),
-            Some(std::path::Path::new("/tmp/llmconduit-fallback.jsonl"))
-        );
-        assert_eq!(result.fallback_upstreams[1].name, "fallback-2");
-        assert_eq!(result.fallback_upstreams[1].upstream_api_key, None);
-    }
-
-    #[test]
-    fn from_persisted_parses_explicit_upstreams_with_nested_fallbacks() {
+    fn from_persisted_parses_explicit_upstreams_as_named_endpoints() {
         let config = PersistedConfig {
             upstreams: vec![PersistedUpstream {
-                name: Some(" local ".to_string()),
-                upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
-                upstream_api_key: Some(" local-secret ".to_string()),
-                upstream_model: Some(" local-model ".to_string()),
-                upstream_chat_kwargs: JsonMap::from_iter([(
+                name: " local ".to_string(),
+                url: " http://127.0.0.1:8000/v1 ".to_string(),
+                api_key: Some(" local-secret ".to_string()),
+                api_key_env: None,
+                chat_kwargs: JsonMap::from_iter([(
                     "chat_template_kwargs".to_string(),
                     json!({"thinking": true}),
                 )]),
-                upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
-                fallback_upstreams: vec![PersistedFallbackUpstream {
-                    name: Some(" backup ".to_string()),
-                    upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
-                    upstream_api_key: Some(" backup-secret ".to_string()),
-                    upstream_model: Some(" backup-model ".to_string()),
-                    exposed_model: Some(" backup-alias ".to_string()),
-                    upstream_chat_kwargs: JsonMap::from_iter([(
-                        "provider".to_string(),
-                        json!({"order": ["openai"]}),
-                    )]),
-                    upstream_request_log_path: Some(" /tmp/llmconduit-backup.jsonl ".to_string()),
-                }],
+                request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("local".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         };
 
@@ -2990,45 +3005,45 @@ model_profiles:
         assert_eq!(result.upstreams.len(), 1);
         let upstream = &result.upstreams[0];
         assert_eq!(upstream.name, "local");
+        assert_eq!(upstream.url.as_str(), "http://127.0.0.1:8000/v1");
+        assert_eq!(upstream.api_key.as_deref(), Some("local-secret"));
         assert_eq!(
-            upstream.upstream_base_url.as_str(),
-            "http://127.0.0.1:8000/v1"
-        );
-        assert_eq!(upstream.upstream_api_key.as_deref(), Some("local-secret"));
-        assert_eq!(upstream.upstream_model.as_deref(), Some("local-model"));
-        assert_eq!(
-            upstream.upstream_chat_kwargs.get("chat_template_kwargs"),
+            upstream.chat_kwargs.get("chat_template_kwargs"),
             Some(&json!({"thinking": true}))
         );
         assert_eq!(
-            upstream.upstream_request_log_path.as_deref(),
+            upstream.request_log_path.as_deref(),
             Some(std::path::Path::new("/tmp/llmconduit-local.jsonl"))
-        );
-        assert_eq!(upstream.fallback_upstreams.len(), 1);
-        assert_eq!(upstream.fallback_upstreams[0].name, "backup");
-        assert_eq!(
-            upstream.fallback_upstreams[0].upstream_model.as_deref(),
-            Some("backup-model")
-        );
-        assert_eq!(
-            upstream.fallback_upstreams[0].exposed_model.as_deref(),
-            Some("backup-alias")
         );
     }
 
+    /// A request model's routing target is now named by a model profile, so an
+    /// entry's own nested `fallback_upstreams` (the pre-profile-routing failover
+    /// chain) is a removed key, not silently ignored -- a startup error names
+    /// the profile-level replacement.
     #[test]
-    fn from_persisted_rejects_invalid_fallback_upstream_url() {
+    fn from_persisted_rejects_nested_fallback_upstreams_on_entries() {
         let config = PersistedConfig {
-            fallback_upstreams: vec![PersistedFallbackUpstream {
-                upstream_base_url: "not a url".to_string(),
-                ..PersistedFallbackUpstream::default()
+            upstreams: vec![PersistedUpstream {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                api_key_env: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: Some(
+                    json!([{"upstream_base_url": "https://openrouter.ai/api/v1"}]),
+                ),
             }],
             ..PersistedConfig::default()
         };
 
-        let error = Config::from_persisted(&config).expect_err("invalid fallback URL");
-
-        assert!(error.contains("invalid fallback_upstreams[0].upstream_base_url"));
+        let error = Config::from_persisted(&config).expect_err("nested fallback_upstreams");
+        assert!(
+            error.contains("fallback_upstreams") && error.contains("Migrating"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3040,44 +3055,151 @@ model_profiles:
         assert_eq!(result.unwrap(), PersistedConfig::default());
     }
 
+    /// An upstream authenticates only with its own `api_key`; an ambient
+    /// `OPENAI_API_KEY` must never leak to entries that declare none, since a
+    /// keyless entry may be a local or third-party endpoint.
     #[test]
-    fn apply_env_overrides_upstream_api_key() {
+    fn openai_env_does_not_seed_entries_without_an_explicit_api_key() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
-            std::env::set_var("LLMCONDUIT_UPSTREAM_API_KEY", "test-key-12345");
+            std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
-        let mut config = PersistedConfig::default();
-        apply_env_overrides(&mut config);
-        assert_eq!(config.upstream_api_key, Some("test-key-12345".to_string()));
-        unsafe {
-            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
-            std::env::remove_var("OPENAI_API_KEY");
+        let config = PersistedConfig {
+            upstreams: vec![
+                PersistedUpstream {
+                    name: "no-key".to_string(),
+                    url: "http://127.0.0.1:8000/v1".to_string(),
+                    api_key: None,
+                    api_key_env: None,
+                    chat_kwargs: JsonMap::new(),
+                    request_log_path: None,
+                    upstream_model: None,
+                    fallback_upstreams: None,
+                },
+                PersistedUpstream {
+                    name: "own-key".to_string(),
+                    url: "http://127.0.0.1:8001/v1".to_string(),
+                    api_key: Some("explicit".to_string()),
+                    api_key_env: None,
+                    chat_kwargs: JsonMap::new(),
+                    request_log_path: None,
+                    upstream_model: None,
+                    fallback_upstreams: None,
+                },
+            ],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("no-key".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            ..PersistedConfig::default()
         };
+        let result = Config::from_persisted(&config).expect("config");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        assert_eq!(
+            result.upstreams[0].api_key, None,
+            "an entry with no api_key must not inherit OPENAI_API_KEY"
+        );
+        assert_eq!(
+            result.upstreams[1].api_key.as_deref(),
+            Some("explicit"),
+            "an entry with its own api_key is unaffected"
+        );
+    }
+
+    fn config_with_one_upstream(upstream: PersistedUpstream) -> PersistedConfig {
+        let name = upstream.name.clone();
+        PersistedConfig {
+            upstreams: vec![upstream],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some(name),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            ..PersistedConfig::default()
+        }
+    }
+
+    /// `api_key_env` resolves the named variable once at startup; the value is
+    /// trimmed like a literal `api_key`. Parses from YAML so the on-disk field
+    /// spelling is covered as well.
+    #[test]
+    fn api_key_env_resolves_from_environment() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TEST_ENTRY_KEY", "  env-secret  ");
+        }
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - { name: env-auth, url: "http://127.0.0.1:8000/v1", api_key_env: LLMCONDUIT_TEST_ENTRY_KEY }
+model_profiles:
+  "*":
+    upstream: env-auth
+"#,
+        )
+        .expect("yaml");
+        let result = Config::from_persisted(&persisted);
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY");
+        }
+        let result = result.expect("config");
+        assert_eq!(result.upstreams[0].api_key.as_deref(), Some("env-secret"));
+    }
+
+    /// Declaring `api_key_env` states intent to authenticate, so a missing or
+    /// blank variable must fail at startup instead of surfacing as 401s later.
+    #[test]
+    fn api_key_env_with_unset_variable_is_a_startup_error() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY_UNSET");
+        }
+        let config = config_with_one_upstream(PersistedUpstream {
+            name: "env-auth".to_string(),
+            url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: None,
+            api_key_env: Some("LLMCONDUIT_TEST_ENTRY_KEY_UNSET".to_string()),
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        });
+        let error = Config::from_persisted(&config).expect_err("startup error");
+        assert!(
+            error.contains("env-auth") && error.contains("LLMCONDUIT_TEST_ENTRY_KEY_UNSET"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn apply_env_overrides_openai_fallback() {
+    fn api_key_and_api_key_env_are_mutually_exclusive() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
-            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
+            std::env::set_var("LLMCONDUIT_TEST_ENTRY_KEY_BOTH", "env-secret");
         }
-        let mut config = PersistedConfig {
-            upstream_api_key: None,
-            ..Default::default()
-        };
-        apply_env_overrides(&mut config);
-        assert_eq!(
-            config.upstream_api_key,
-            Some("fallback-key-67890".to_string())
-        );
+        let config = config_with_one_upstream(PersistedUpstream {
+            name: "env-auth".to_string(),
+            url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: Some("literal".to_string()),
+            api_key_env: Some("LLMCONDUIT_TEST_ENTRY_KEY_BOTH".to_string()),
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        });
+        let result = Config::from_persisted(&config);
         unsafe {
-            std::env::remove_var("LLMCONDUIT_UPSTREAM_API_KEY");
-            std::env::remove_var("OPENAI_API_KEY");
-        };
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY_BOTH");
+        }
+        let error = result.expect_err("startup error");
+        assert!(error.contains("mutually exclusive"), "{error}");
     }
 
     #[test]
@@ -3159,77 +3281,6 @@ model_profiles:
     }
 
     #[test]
-    fn unsupported_image_policy_defaults_to_placeholder_when_omitted() {
-        // `#[serde(default = "default_unsupported_image_policy")]` must fill in
-        // `Placeholder` for a config file written before E2b existed.
-        let parsed: PersistedConfig =
-            serde_yaml::from_str("upstream_base_url: http://127.0.0.1:8000/v1\n").expect("yaml");
-        assert_eq!(
-            parsed.unsupported_image_policy,
-            UnsupportedImagePolicy::Placeholder
-        );
-        let resolved = Config::from_persisted(&parsed).expect("config");
-        assert_eq!(
-            resolved.unsupported_image_policy,
-            UnsupportedImagePolicy::Placeholder
-        );
-    }
-
-    #[test]
-    fn unsupported_image_policy_parses_and_serializes_snake_case() {
-        let parsed: PersistedConfig =
-            serde_yaml::from_str("unsupported_image_policy: reject\n").expect("yaml");
-        assert_eq!(
-            parsed.unsupported_image_policy,
-            UnsupportedImagePolicy::Reject
-        );
-        let yaml = serde_yaml::to_string(&parsed).expect("serialize");
-        assert!(
-            yaml.contains("unsupported_image_policy: reject"),
-            "expected snake_case `reject`, got: {yaml}"
-        );
-    }
-
-    #[test]
-    fn apply_env_overrides_unsupported_image_policy_reject() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        unsafe {
-            std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "Reject");
-        }
-        let mut config = PersistedConfig::default();
-        apply_env_overrides(&mut config);
-        assert_eq!(
-            config.unsupported_image_policy,
-            UnsupportedImagePolicy::Reject
-        );
-        unsafe {
-            std::env::remove_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY");
-        };
-    }
-
-    #[test]
-    fn apply_env_overrides_unsupported_image_policy_ignores_unrecognized_value() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        unsafe {
-            std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "bogus");
-        }
-        let mut config = PersistedConfig {
-            unsupported_image_policy: UnsupportedImagePolicy::Reject,
-            ..PersistedConfig::default()
-        };
-        apply_env_overrides(&mut config);
-        // A typo'd value must not silently coerce to the OTHER policy — left
-        // unchanged rather than guessing which one was intended.
-        assert_eq!(
-            config.unsupported_image_policy,
-            UnsupportedImagePolicy::Reject
-        );
-        unsafe {
-            std::env::remove_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY");
-        };
-    }
-
-    #[test]
     fn apply_env_overrides_upstream_failure_cooldown() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
@@ -3251,9 +3302,9 @@ model_profiles:
         ));
         let config = PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-            upstream_api_key: Some("upstream-secret".to_string()),
-            upstream_model: Some("grok-4".to_string()),
+            upstream_base_url: None,
+            upstream_api_key: None,
+            upstream_model: None,
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
@@ -3262,7 +3313,7 @@ model_profiles:
                 JsonValue::Bool(false),
             )]),
             upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
@@ -3279,7 +3330,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming-reasoning".to_string()],
@@ -3309,13 +3360,13 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         };
@@ -3329,7 +3380,7 @@ model_profiles:
     fn resolves_profile_specific_upstream_chat_kwargs() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_base_url: None,
             upstream_api_key: None,
             upstream_model: None,
             system_prompt_prefix: None,
@@ -3346,14 +3397,15 @@ model_profiles:
                     "global_only": true
                 }),
             )]),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Reasoner-A26".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3380,13 +3432,13 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -3425,9 +3477,26 @@ model_profiles:
         );
     }
 
-    /// Build a `PersistedModelProfile` with only a `template_family` set.
+    /// A single named `backend` upstream, so profile tests that only exercise
+    /// shaping still satisfy the required `upstream` reference.
+    fn backend_upstreams() -> Vec<PersistedUpstream> {
+        vec![PersistedUpstream {
+            name: "backend".to_string(),
+            url: "http://h/v1".to_string(),
+            api_key: None,
+            api_key_env: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        }]
+    }
+
+    /// Build a `PersistedModelProfile` with only a `template_family` set (plus
+    /// the required `upstream`, satisfied by the default `default` endpoint).
     fn profile_with_family(family: &str) -> PersistedModelProfile {
         PersistedModelProfile {
+            upstream: Some("default".to_string()),
             template_family: Some(family.to_string()),
             native_vision: None,
             ..PersistedModelProfile::default()
@@ -3441,7 +3510,7 @@ model_profiles:
         // is what drives injection at the leaf.
         let config = Config::from_persisted(&PersistedConfig {
             template_family: Some("deepseek".to_string()),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Router-X".to_string(),
                 profile_with_family("KIMI"),
             )]),
@@ -3471,6 +3540,84 @@ model_profiles:
         assert_eq!(
             leaf_family_kwargs(&config, "plain-model"),
             json!({"enable_thinking": true})
+        );
+    }
+
+    /// A GLOB profile with no `upstream_model` serves the passthrough request
+    /// model, so its leaf policy is found by pattern-matching the POSTed id.
+    #[test]
+    fn leaf_finds_glob_policy_by_pattern_without_upstream_model() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "router-*": { upstream: backend, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // The POSTed id `router-7` matches the `router-*` pattern at the leaf.
+        assert_eq!(
+            leaf_family_kwargs(&config, "router-7"),
+            json!({"thinking": true, "preserve_thinking": true})
+        );
+    }
+
+    /// A GLOB profile that pins `upstream_model` serves that FIXED id, so its
+    /// leaf policy is registered as an EXACT entry under the served id (not in
+    /// the glob list). Looking up the served id finds it; the pattern itself is
+    /// never POSTed for such a profile and must NOT resolve a policy.
+    #[test]
+    fn leaf_finds_glob_with_upstream_model_by_served_id_not_pattern() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "alias-*": { upstream: backend, upstream_model: backend-fixed, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // The leaf POSTs the pinned `backend-fixed`; the exact registration hits.
+        assert_eq!(
+            leaf_family_kwargs(&config, "backend-fixed"),
+            json!({"thinking": true, "preserve_thinking": true})
+        );
+        // The pattern is NOT in the glob list, so a would-be `alias-*` POST id
+        // resolves no policy (it is never actually POSTed for this profile).
+        assert!(!leaf_request_has_family_kwargs(&config, "alias-9"));
+    }
+
+    /// An EXACT profile entry beats a matching GLOB entry at the leaf.
+    #[test]
+    fn leaf_exact_policy_beats_matching_glob_policy() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "served-x": { upstream: backend, template_family: deepseek }
+  "served-*": { upstream: backend, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // `served-x` has an exact entry (deepseek), which wins over the matching
+        // `served-*` glob (kimi).
+        assert_eq!(
+            leaf_family_kwargs(&config, "served-x"),
+            json!({"enable_thinking": true})
+        );
+        // A non-exact id still falls through to the glob (kimi), proving the
+        // glob entry is present and only loses to the exact match.
+        assert_eq!(
+            leaf_family_kwargs(&config, "served-9"),
+            json!({"thinking": true, "preserve_thinking": true})
         );
     }
 
@@ -3515,21 +3662,22 @@ model_profiles:
     fn resolves_model_profiles_case_insensitively() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_base_url: None,
             upstream_api_key: None,
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: Some("mimo-v2.5".to_string()),
                     system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -3559,21 +3707,21 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
-        // The LEAF's `policy_for_model` matches the profile keyed `MiMo-V2.5`
-        // against the FINAL backend model `mimo-v2.5` via canonical key (case-
-        // insensitive), surfacing that profile's `upstream_chat_kwargs`.
+        // The profile keyed `MiMo-V2.5` sets `upstream_model: mimo-v2.5`, so the
+        // leaf keys its `upstream_chat_kwargs` by that effective backend model
+        // and surfaces them for the FINAL backend `mimo-v2.5` on an exact match.
         assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
         assert_eq!(
             leaf_chat_kwargs(&config, "mimo-v2.5"),
@@ -3591,86 +3739,6 @@ model_profiles:
     }
 
     #[test]
-    fn resolves_upstream_model_profile_after_global_model_remap() {
-        let config = Config::from_persisted(&PersistedConfig {
-            bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
-            upstream_api_key: None,
-            upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            turn_capture_dir: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
-                "xiaomi/mimo-v2.5-pro".to_string(),
-                PersistedModelProfile {
-                    extends: Vec::new(),
-                    upstream_model: None,
-                    system_prompt_prefix: Some("Use MiMo-compatible behavior.".to_string()),
-                    upstream_chat_kwargs: JsonMap::from_iter([(
-                        "reasoning".to_string(),
-                        json!({
-                            "enabled": true
-                        }),
-                    )]),
-                    template_family: None,
-                    native_vision: None,
-                    ..Default::default()
-                },
-            )]),
-            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
-            brave_api_key: None,
-            brave_max_results: 5,
-            request_timeout_secs: 60,
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-            debug_log_max_age_hours: None,
-            min_completion_tokens: 4096,
-            max_sse_frame_bytes: 8 * 1024 * 1024,
-            max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
-            image_cache_max_size: 100,
-            image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
-            template_family: None,
-            price_table: std::collections::HashMap::new(),
-        })
-        .expect("config");
-
-        assert_eq!(
-            config.resolve_upstream_model("client-default-model"),
-            "xiaomi/mimo-v2.5-pro"
-        );
-        // The engine remaps the request model to the configured upstream model,
-        // and the LEAF resolves kwargs against that FINAL backend id — the
-        // profile keyed on the remap target supplies the kwargs.
-        assert_eq!(
-            leaf_chat_kwargs(&config, "xiaomi/mimo-v2.5-pro"),
-            JsonMap::from_iter([(
-                "reasoning".to_string(),
-                json!({
-                    "enabled": true
-                }),
-            )])
-        );
-        assert_eq!(
-            config
-                .resolve_system_prompt_prefix("client-default-model")
-                .as_deref(),
-            Some("Use MiMo-compatible behavior.")
-        );
-    }
-
-    #[test]
     fn leaf_resolves_only_final_model_profile_not_request_alias() {
         // The OLD config merge layered the request-alias profile over the
         // backend profile and produced `{enabled:true, effort:high}` — a merge
@@ -3679,22 +3747,23 @@ model_profiles:
         // request-alias profile's kwargs do NOT bleed into the backend request.
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
+            upstream_base_url: None,
             upstream_api_key: None,
-            upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
+            upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([
+            model_profiles: OrderedModelProfiles(vec![
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
+                        upstream: Some("backend".to_string()),
                         upstream_model: None,
                         system_prompt_prefix: Some("Backend prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3713,6 +3782,7 @@ model_profiles:
                     "client-default-model".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
+                        upstream: Some("backend".to_string()),
                         upstream_model: None,
                         system_prompt_prefix: Some("Client prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3739,13 +3809,13 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -3789,23 +3859,23 @@ model_profiles:
     fn resolves_exact_model_profile_before_case_insensitive_fallback() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_base_url: None,
             upstream_api_key: None,
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([
+            model_profiles: OrderedModelProfiles(vec![
                 (
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
-                        upstream_model: Some("upper-profile".to_string()),
+                        upstream: Some("backend".to_string()),
                         system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
@@ -3820,7 +3890,7 @@ model_profiles:
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
-                        upstream_model: Some("lower-profile".to_string()),
+                        upstream: Some("backend".to_string()),
                         system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
@@ -3844,23 +3914,27 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
-        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "lower-profile");
-        // The LEAF's `policy_for_model` prefers the EXACT-id profile over the
-        // case-insensitive (canonical-key) sibling: for FINAL backend `mimo-v2.5`
-        // the lowercase profile (`false`) wins over `MiMo-V2.5` (`true`), even
-        // though both share a canonical key.
+        // `resolve_route` prefers the EXACT-case key over its case-insensitive
+        // sibling: with no `upstream_model`, the served model is the matched key
+        // itself, so the lowercase profile wins for `mimo-v2.5`.
+        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
+        // The LEAF keys per-model policies by the effective backend model (here
+        // the profile key, since neither sets `upstream_model`) and prefers the
+        // EXACT-id entry over its canonical-key sibling: for FINAL backend
+        // `mimo-v2.5` the lowercase profile (`false`) wins over `MiMo-V2.5`
+        // (`true`), even though both share a canonical key.
         assert_eq!(
             leaf_chat_kwargs(&config, "mimo-v2.5"),
             JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(false))])
@@ -3872,13 +3946,39 @@ model_profiles:
     }
 
     #[test]
+    fn normalizes_profile_fallback_model_overrides() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - { name: backend, url: "http://h/v1" }
+  - { name: padded, url: "http://h/v1" }
+  - { name: blank, url: "http://h/v1" }
+model_profiles:
+  served-model:
+    upstream: backend
+    fallbacks:
+      - { upstream: padded, model: "  model-x  " }
+      - { upstream: blank, model: "   " }
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        let profile = config.model_profile("served-model").expect("profile");
+        assert_eq!(profile.fallbacks[0].model.as_deref(), Some("model-x"));
+        // Whitespace-only must clear to None so failover dispatch falls back
+        // to the served model instead of posting a blank one.
+        assert_eq!(profile.fallbacks[1].model, None);
+    }
+
+    #[test]
     fn resolves_global_system_prompt_prefix_with_profile_prefix() {
         let config = Config::from_persisted(&PersistedConfig {
             system_prompt_prefix: Some("Global prefix.".to_string()),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("default".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
@@ -3965,10 +4065,11 @@ model_profiles:
                     },
                 ),
             ]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
+                    upstream: Some("default".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: Some("Model prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -4035,6 +4136,7 @@ model_profiles:
     fn model_profile_shorthand_kwargs_merge_with_explicit_wrapper() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profile_templates:
   reasoning:
     separate_reasoning: true
@@ -4043,6 +4145,7 @@ model_profile_templates:
 
 model_profiles:
   Reasoner-D4:
+    upstream: backend
     extends:
       - reasoning
     stream_reasoning: true
@@ -4081,7 +4184,7 @@ model_profiles:
     #[test]
     fn model_profiles_reject_unknown_template() {
         let error = Config::from_persisted(&PersistedConfig {
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["missing".to_string()],
@@ -4129,7 +4232,7 @@ model_profiles:
                     },
                 ),
             ]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["a".to_string()],
@@ -4212,26 +4315,29 @@ model_profiles:
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn passes_prefixed_model_name_unmodified_when_no_profile() {
-        let config = Config::from_persisted(&PersistedConfig {
-            bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-            upstream_api_key: None,
-            upstream_model: None,
+    /// Builds a resolved `Config` directly, bypassing `PersistedConfig` /
+    /// `from_persisted`. Some tests need zero `upstreams` - a state no
+    /// `model_profiles` entry can ever validate against (every profile must
+    /// name a real upstream), so `from_persisted`'s non-empty-profiles guard
+    /// makes it unreachable through the normal persisted-config path.
+    fn config_with_no_upstreams(
+        upstream_request_log_path: Option<PathBuf>,
+        turn_capture_dir: Option<PathBuf>,
+    ) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:4010".parse().expect("socket addr"),
             system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            turn_capture_dir: None,
+            upstream_request_log_path,
+            turn_capture_dir,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::new(),
-            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            model_profiles: Vec::new(),
+            template_family: None,
+            brave_base_url: "https://api.search.brave.com/res/v1".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
-            request_timeout_secs: 60,
+            request_timeout: std::time::Duration::from_secs(60),
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
@@ -4240,17 +4346,15 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
-            template_family: None,
-            price_table: std::collections::HashMap::new(),
-        })
-        .expect("config");
+            price_table: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn passes_prefixed_model_name_unmodified_when_no_profile() {
+        let config = config_with_no_upstreams(None, None);
 
         assert_eq!(
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
@@ -4266,21 +4370,22 @@ model_profiles:
     fn resolves_exact_prefix_model_profile_when_present() {
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_base_url: None,
             upstream_api_key: None,
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
+            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: Some("anthropic-custom".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
                     system_prompt_prefix: None,
@@ -4301,13 +4406,13 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
+            image_agent_enabled: None,
             vision_url: None,
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            model_routes: OrderedModelRoutes::default(),
+            unsupported_image_policy: None,
+            model_routes: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -4320,63 +4425,49 @@ model_profiles:
     }
 
     #[test]
-    fn debug_log_dirs_single_failover_mode_includes_top_level_and_global_fallbacks() {
-        // No `upstreams` => single/failover mode, matching the `upstreams`
+    fn debug_log_dirs_single_mode_includes_top_level_path() {
+        // Empty `upstreams` => single/failover mode, matching the `upstreams`
         // empty branch in `build_app_with_gateway_and_options`. The top-level
-        // primary path and the global fallback paths are the active log paths.
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
-            fallback_upstreams: vec![PersistedFallbackUpstream {
-                upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
-                upstream_request_log_path: Some("/tmp/llmconduit-global/backup.jsonl".to_string()),
-                ..PersistedFallbackUpstream::default()
-            }],
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        // primary path is the active log path.
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-top/primary.jsonl")),
+            None,
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(
             dirs,
-            vec![
-                PathBuf::from("/tmp/llmconduit-top"),
-                PathBuf::from("/tmp/llmconduit-global"),
-            ],
-            "single/failover mode must include the top-level and global fallback log dirs"
+            vec![PathBuf::from("/tmp/llmconduit-top")],
+            "single/failover mode must include the top-level log dir"
         );
     }
 
     #[test]
-    fn debug_log_dirs_routing_mode_excludes_inactive_top_level_and_global_fallbacks() {
+    fn debug_log_dirs_routing_mode_excludes_inactive_top_level_path() {
         // Non-empty `upstreams` => routing mode. The gateway uses only the
-        // per-routing-upstream clients and their nested fallbacks; the
-        // top-level `upstream_request_log_path` and global `fallback_upstreams`
-        // are never written to, so they must NOT be collected for cleanup.
+        // per-routing-upstream clients; the top-level `upstream_request_log_path`
+        // is never written to, so it must NOT be collected for cleanup.
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some(
                 "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
             ),
-            fallback_upstreams: vec![PersistedFallbackUpstream {
-                upstream_base_url: "http://127.0.0.1:9001/v1".to_string(),
-                upstream_request_log_path: Some(
-                    "/tmp/llmconduit-inactive-global/backup.jsonl".to_string(),
-                ),
-                ..PersistedFallbackUpstream::default()
-            }],
             upstreams: vec![PersistedUpstream {
-                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-                upstream_request_log_path: Some(
-                    "/tmp/llmconduit-routing/primary.jsonl".to_string(),
-                ),
-                fallback_upstreams: vec![PersistedFallbackUpstream {
-                    upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
-                    upstream_request_log_path: Some(
-                        "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
-                    ),
-                    ..PersistedFallbackUpstream::default()
-                }],
-                ..PersistedUpstream::default()
+                name: "routing".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                api_key_env: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: Some("/tmp/llmconduit-routing/primary.jsonl".to_string()),
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("routing".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4384,19 +4475,12 @@ model_profiles:
         let dirs = config.debug_log_dirs();
         assert_eq!(
             dirs,
-            vec![
-                PathBuf::from("/tmp/llmconduit-routing"),
-                PathBuf::from("/tmp/llmconduit-routing-fallback"),
-            ],
-            "routing mode must collect only routing-upstream + nested-fallback log dirs"
+            vec![PathBuf::from("/tmp/llmconduit-routing")],
+            "routing mode must collect only routing-upstream log dirs"
         );
         assert!(
             !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-top")),
             "routing mode must exclude the inactive top-level log dir"
-        );
-        assert!(
-            !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-global")),
-            "routing mode must exclude the inactive global fallback log dir"
         );
     }
 
@@ -4407,12 +4491,10 @@ model_profiles:
     /// request-log FILE paths above whose *parent* directory is extracted).
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir() {
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
-            turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-top/primary.jsonl")),
+            Some(PathBuf::from("/tmp/llmconduit-turns")),
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(
@@ -4433,9 +4515,22 @@ model_profiles:
         let config = Config::from_persisted(&PersistedConfig {
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: vec![PersistedUpstream {
-                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-                ..PersistedUpstream::default()
+                name: "routing".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                api_key_env: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("routing".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4452,12 +4547,10 @@ model_profiles:
     /// directory already collected from a request-log path.
     #[test]
     fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
-            turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-shared/requests.jsonl")),
+            Some(PathBuf::from("/tmp/llmconduit-shared")),
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(dirs, vec![PathBuf::from("/tmp/llmconduit-shared")]);
@@ -4472,7 +4565,9 @@ model_profiles:
     fn price_table_loads_from_yaml_and_price_for_resolves() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             "price_table:\n  glm-5.1:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n    \
-             cached_per_1k: 0.5\n  cheap-model:\n    input_per_1k: 0.1\n    output_per_1k: 0.2\n",
+             cached_per_1k: 0.5\n  cheap-model:\n    input_per_1k: 0.1\n    output_per_1k: 0.2\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
         )
         .expect("yaml parses");
         let config = Config::from_persisted(&persisted).expect("config");
@@ -4564,7 +4659,9 @@ model_profiles:
         // sibling kept.
         let persisted: PersistedConfig = serde_yaml::from_str(
             "price_table:\n  good:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n  bad-inf:\n    \
-             input_per_1k: .inf\n    output_per_1k: 1.0\n",
+             input_per_1k: .inf\n    output_per_1k: 1.0\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
         )
         .expect("yaml parses");
         let config = Config::from_persisted(&persisted).expect("config");

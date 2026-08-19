@@ -14,7 +14,6 @@ use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
 use llmconduit::config::PersistedConfig;
-use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::engine::Gateway;
 use llmconduit::engine::SseEvent;
 use llmconduit::error::AppError;
@@ -46,7 +45,6 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// One queued upstream turn: the ordered chunk results a single
@@ -64,11 +62,6 @@ pub struct MockUpstream {
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
     context_limits: Arc<Mutex<Vec<(String, i64)>>>,
-    /// When `Some`, the full pre-first-chunk candidate backend model set this
-    /// upstream reports for G4 native-vision gating (round-2 #1) — used to
-    /// simulate a failover chain (primary + fallbacks). `None` falls back to the
-    /// single-candidate `context_limits` plan used by G3 budgeting tests.
-    candidate_models: Arc<std::sync::Mutex<Option<Vec<String>>>>,
     /// Per-model finalization policies (effort/family/kwargs), built from the
     /// test config by the gateway harness so the mock's leaf-mirror applies the
     /// SAME profile kwargs the production leaf would (T1). Empty by default.
@@ -114,19 +107,6 @@ impl MockUpstream {
     {
         *self.context_limits.lock().await =
             limits.into_iter().map(|(id, n)| (id.into(), n)).collect();
-    }
-
-    /// Set the candidate backend model set reported to G4 native-vision gating
-    /// (round-2 #1), simulating a failover chain's primary + fallback models.
-    /// When set, this drives `backend_candidate_plan` instead of the
-    /// single-candidate `context_limits` projection.
-    pub fn set_candidate_models<I, S>(&self, models: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        *self.candidate_models.lock().expect("candidate models lock") =
-            Some(models.into_iter().map(Into::into).collect());
     }
 }
 
@@ -184,32 +164,13 @@ impl UpstreamClient for MockUpstream {
             .collect())
     }
 
-    // `backend_candidate_plan` is the single source of truth the engine projects
-    // `candidate_backend_models` from. Two modes:
-    // - G4 native-vision gating (`set_candidate_models`): the explicit failover
-    //   chain (primary + fallbacks), each with no context limit.
-    // - G3 budgeting (`set_context_limits`): a single `requested_model` candidate
-    //   carrying its configured context limit (the trait default returns `None`,
-    //   which would make budgeting a no-op).
+    // G3 budgeting projection: a single `requested_model` candidate carrying its
+    // configured context limit (from `set_context_limits`). The trait default
+    // returns `None`, which would make budgeting a no-op.
     async fn backend_candidate_plan(
         &self,
         requested_model: &str,
     ) -> llmconduit::upstream::BackendCandidatePlan {
-        if let Some(models) = self
-            .candidate_models
-            .lock()
-            .expect("candidate models lock")
-            .clone()
-        {
-            let candidates = models
-                .into_iter()
-                .map(|model| llmconduit::upstream::BackendCandidate {
-                    model,
-                    context_limit: None,
-                })
-                .collect();
-            return llmconduit::upstream::BackendCandidatePlan { candidates };
-        }
         let limits = self.context_limits.lock().await.clone();
         let context_limit = limits
             .iter()
@@ -271,19 +232,15 @@ pub fn test_gateway_with_config(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    // These shared port_* tests never exercise the image agent (off in
-    // `test_config`), so a real `ReqwestVisionClient` that is never called and a
-    // cache derived from config satisfy the constructor.
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
+    // The shared image cache satisfies the constructor; a profile without
+    // `image_analysis` never activates the agent, so these port_* tests pass
+    // images through untouched.
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -306,16 +263,12 @@ pub fn test_gateway_with_config_and_replay_store(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         replay_store,
         Arc::new(upstream),
         Arc::new(search),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -324,119 +277,26 @@ pub fn test_gateway_with_config_and_replay_store(
 }
 
 // ---------------------------------------------------------------------------
-// G4 image-agent fixtures: a recording mock vision backend plus the gateway /
-// config / request builders the `tests/image_agent.rs` suite shares.
+// G4 image-agent fixtures: the gateway / config / request builders the
+// `tests/image_agent.rs` suite shares. The analyzer is dispatched through the
+// gateway's own upstreams, so the suite asserts against the mock upstream (or a
+// second wiremock server) rather than a dedicated vision-client mock.
 // ---------------------------------------------------------------------------
 
-/// G4 mock vision backend. Records each `VisionRequest` it receives and replays
-/// queued outcomes (or a default description), so image-agent tests can assert
-/// what reached the vision model (image ids/urls/task) without a real backend.
-#[derive(Clone, Default)]
-pub struct MockVisionClient {
-    requests: Arc<Mutex<Vec<llmconduit::vision::VisionRequest>>>,
-    outcomes: Arc<
-        Mutex<VecDeque<Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError>>>,
-    >,
-    /// When set, `analyze` waits on this notify before returning, so a test can
-    /// drive cancellation/timeout deterministically.
-    block_until: Arc<Mutex<Option<Arc<Notify>>>>,
-    /// Fired at the top of `analyze` once the request has been recorded, so a
-    /// test can await the vision future actually starting (and `requests()`
-    /// already observing the call) before it drops the stream.
-    entered: Arc<Notify>,
-    /// Fired from a drop guard inside `analyze`, so a test can await the spawned
-    /// turn reacting to cancellation (the future is dropped at its blocked await
-    /// point) instead of guessing with a wall-clock sleep.
-    dropped: Arc<Notify>,
-}
-
-impl MockVisionClient {
-    pub async fn push_outcome(
-        &self,
-        outcome: Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError>,
-    ) {
-        self.outcomes.lock().await.push_back(outcome);
-    }
-
-    pub async fn requests(&self) -> Vec<llmconduit::vision::VisionRequest> {
-        self.requests.lock().await.clone()
-    }
-
-    pub async fn block_on(&self, notify: Arc<Notify>) {
-        *self.block_until.lock().await = Some(notify);
-    }
-
-    /// `notified()` future for "analyze entered" (request already recorded).
-    /// Capture this BEFORE the action that triggers `analyze` so the wake is not
-    /// missed (`notify_waiters()` stores no permit).
-    pub fn entered(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.entered.notified()
-    }
-
-    /// `notified()` future for "analyze future dropped" (cancellation path).
-    /// Capture this BEFORE dropping the stream so the wake is not missed.
-    pub fn dropped(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.dropped.notified()
-    }
-}
-
-/// RAII guard that signals when the `analyze` future is dropped at its blocked
-/// await point, mirroring `NotifyOnDrop` in `tests/gateway.rs`. Because the
-/// future stays blocked in the cancellation test, this fires only on the
-/// drop/cancel path, so there is no need to disarm it on normal return.
-struct NotifyOnDrop {
-    notify: Arc<Notify>,
-}
-
-impl Drop for NotifyOnDrop {
-    fn drop(&mut self) {
-        self.notify.notify_waiters();
-    }
-}
-
-#[async_trait]
-impl llmconduit::vision::VisionClient for MockVisionClient {
-    async fn analyze(
-        &self,
-        request: &llmconduit::vision::VisionRequest,
-    ) -> Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError> {
-        self.requests.lock().await.push(request.clone());
-        // Signal "analyze entered" only after the request is recorded, so a test
-        // awaiting `entered()` is guaranteed that `requests()` already sees it.
-        self.entered.notify_waiters();
-        // Fire `dropped` if this future is cancelled (dropped) while blocked.
-        let _drop_guard = NotifyOnDrop {
-            notify: Arc::clone(&self.dropped),
-        };
-        let blocker = self.block_until.lock().await.clone();
-        if let Some(notify) = blocker {
-            notify.notified().await;
-        }
-        match self.outcomes.lock().await.pop_front() {
-            Some(outcome) => outcome,
-            None => Ok(llmconduit::vision::VisionOutcome {
-                text: format!("Vision description for {:?}", request.image_ids),
-            }),
-        }
-    }
-}
-
-/// Build a gateway with an explicit `MockVisionClient` and config for G4
-/// image-agent tests. The shared `ImageCache` is derived from the config so
-/// cache sizing/TTL match production wiring.
-pub fn test_gateway_with_vision(
-    upstream: MockUpstream,
-    vision: MockVisionClient,
-    config: Config,
-) -> Arc<Gateway> {
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(vision);
+/// Build a gateway from a `MockUpstream` and an explicit config, wiring a shared
+/// `ImageCache` sized from the config. Both the strip seam and the `analyzeImage`
+/// executor read that one cache. The analyzer's own dispatch goes back through
+/// this same `MockUpstream`, so image-agent tests queue the analyzer round on it.
+pub fn image_agent_gateway(upstream: MockUpstream, config: Config) -> Arc<Gateway> {
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(MockSearch::default()),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -444,18 +304,33 @@ pub fn test_gateway_with_vision(
     ))
 }
 
-/// Config with the image agent enabled and a (mock-backed) vision endpoint, so
-/// gating activates for a text backend with images in the latest user turn.
-pub fn image_agent_config() -> Config {
+/// Config whose catch-all profile redirects images to an `analyzer` profile via
+/// `image_analysis`, so a request resolving to it activates the image agent
+/// (strip + `analyzeImage`). `residual_images` sets the policy the residual
+/// sweep applies to an image the strip did not consume. `web_search` is
+/// disabled so the image agent is isolated from web-search gating.
+pub fn image_analysis_config(residual: llmconduit::config::ResidualImagePolicy) -> Config {
     let mut config = test_config();
-    config.brave_api_key = None; // isolate the image agent from web_search gating
-    config.image_agent_enabled = true;
-    config.vision_url = Some(
-        "http://127.0.0.1:9000/v1/chat/completions"
-            .parse()
-            .expect("url"),
-    );
-    config.vision_model = Some("vision-model".to_string());
+    config.brave_api_key = None;
+    let text_profile = llmconduit::config::ModelProfile {
+        image_analysis: Some(llmconduit::config::ImageAnalysisConfig {
+            model: "analyzer".to_string(),
+            residual_images: residual,
+        }),
+        ..llmconduit::config::ModelProfile::default()
+    };
+    config.model_profiles = vec![
+        llmconduit::config::CompiledProfile {
+            key: "*".to_string(),
+            glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+            profile: text_profile,
+        },
+        llmconduit::config::CompiledProfile {
+            key: "analyzer".to_string(),
+            glob: None,
+            profile: llmconduit::config::ModelProfile::default(),
+        },
+    ];
     config
 }
 
@@ -485,18 +360,21 @@ pub const TEST_IMAGE_DATA_URL: &str =
 pub fn test_config() -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: BTreeMap::new(),
-        model_routes: Vec::new(),
+        // A `"*"` catch-all so a bare request model resolves to a pass-through
+        // route (served model = request model). Tests that inject their own
+        // upstream client bypass the router, but the engine still resolves the
+        // served-model label through the profiles.
+        model_profiles: vec![llmconduit::config::CompiledProfile {
+            key: "*".to_string(),
+            glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+            profile: llmconduit::config::ModelProfile::default(),
+        }],
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
@@ -510,12 +388,8 @@ pub fn test_config() -> Config {
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
         max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     }
 }

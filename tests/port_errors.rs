@@ -323,25 +323,36 @@ mod integration {
     use axum::body::Body;
     use axum::http::Request;
     use llmconduit::config::Config;
-    use llmconduit::config::FallbackUpstreamConfig;
-    use llmconduit::config::UnsupportedImagePolicy;
+    use llmconduit::config::PersistedConfig;
     use uuid::Uuid;
 
+    /// Parse an `upstreams:` / `model_profiles:` YAML through the production
+    /// loader and return the resolved routing fields, so a test config's compiled
+    /// "*" glob and fallbacks match production.
+    fn routing_from_yaml(
+        yaml: &str,
+    ) -> (
+        Vec<llmconduit::config::UpstreamConfig>,
+        Vec<llmconduit::config::CompiledProfile>,
+    ) {
+        let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("routing yaml");
+        let routed = Config::from_persisted(&persisted).expect("routing config");
+        (routed.upstreams, routed.model_profiles)
+    }
+
     fn config_for(server_uri: &str) -> Config {
+        let (upstreams, model_profiles) = routing_from_yaml(&format!(
+            "upstreams:\n  - name: primary\n    url: \"{server_uri}/v1/\"\nmodel_profiles:\n  \"*\":\n    upstream: primary\n"
+        ));
         Config {
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: format!("{server_uri}/v1/").parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: serde_json::Map::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
+            upstreams,
             upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::new(),
-            model_routes: Vec::new(),
+            model_profiles,
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
@@ -355,12 +366,8 @@ mod integration {
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         }
     }
@@ -637,17 +644,17 @@ mod integration {
             .mount(&fallback)
             .await;
 
+        // The `primary-model` profile serves the primary upstream and declares a
+        // `fallback` hop (rewriting to `fallback-model`); a persistent overflow must
+        // surface terminally rather than trip that fallback.
         let mut config = config_for(&primary.uri());
-        config.upstream_model = Some("primary-model".to_string());
-        config.fallback_upstreams = vec![FallbackUpstreamConfig {
-            name: "fallback".to_string(),
-            upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("fallback-model".to_string()),
-            exposed_model: None,
-            upstream_chat_kwargs: serde_json::Map::new(),
-            upstream_request_log_path: None,
-        }];
+        let (upstreams, model_profiles) = routing_from_yaml(&format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\n  - name: fallback\n    url: \"{}/v1/\"\nmodel_profiles:\n  primary-model:\n    upstream: primary\n    fallbacks:\n      - upstream: fallback\n        model: fallback-model\n",
+            primary.uri(),
+            fallback.uri()
+        ));
+        config.upstreams = upstreams;
+        config.model_profiles = model_profiles;
         config.upstream_failure_cooldown_secs = 3600;
 
         let app = llmconduit::build_app(config);
@@ -765,7 +772,7 @@ mod integration {
             Uuid::new_v4().simple()
         ));
         let mut config = config_for(&server.uri());
-        config.upstream_request_log_path = Some(log_path.clone());
+        config.upstreams[0].request_log_path = Some(log_path.clone());
 
         let app = llmconduit::build_app(config);
         let response = app

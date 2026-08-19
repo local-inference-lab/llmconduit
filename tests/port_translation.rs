@@ -141,11 +141,8 @@ fn policies_with_global_kwargs(
     kwargs: serde_json::Map<String, serde_json::Value>,
 ) -> BackendFinalizationPolicies {
     BackendFinalizationPolicies {
-        effort: Arc::new(std::collections::BTreeMap::new()),
-        template_family: Arc::new(std::collections::BTreeMap::new()),
-        global_template_family: None,
-        upstream_chat_kwargs: Arc::new(std::collections::BTreeMap::new()),
         global_upstream_chat_kwargs: Arc::new(kwargs),
+        ..Default::default()
     }
 }
 

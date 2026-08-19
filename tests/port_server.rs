@@ -43,7 +43,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use axum::body::Body;
 use axum::http::Request;
 use llmconduit::config::Config;
-use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::models::chat::ChatCompletionRequest;
 use llmconduit::models::responses::ContentItem;
 use llmconduit::models::responses::ReasoningRequest;
@@ -354,43 +353,18 @@ async fn preflight_multipart_text_budgets_like_flattened_string() {
     );
 }
 
-/// Non-streaming `/v1/responses` config pointed at a wiremock upstream.
+/// Non-streaming `/v1/responses` config pointed at a wiremock upstream: a single
+/// `primary` named upstream with a `"*"` catch-all profile - the profile-era
+/// replacement for the removed single `upstream_base_url`.
 fn config_for(server_uri: &str) -> Config {
-    Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{server_uri}/v1/").parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: serde_json::Map::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    }
+    let routed = common::config_from_yaml(&format!(
+        "upstreams:\n  - name: primary\n    url: \"{server_uri}/v1/\"\nmodel_profiles:\n  \"*\":\n    upstream: primary\n"
+    ));
+    let mut config = common::test_config();
+    config.brave_api_key = None;
+    config.upstreams = routed.upstreams;
+    config.model_profiles = routed.model_profiles;
+    config
 }
 
 #[tokio::test]
@@ -411,13 +385,15 @@ async fn preflight_defers_estimated_context_exhaustion_to_upstream() {
         .await;
 
     // Mounted so the approximate local estimate can defer to the provider's
-    // tokenizer instead of rejecting a potentially compressible prompt.
+    // tokenizer instead of rejecting a potentially compressible prompt. The body
+    // carries a first chunk so the failover client's pre-first-chunk prefetch
+    // sees a served response rather than an empty stream.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string("data: [DONE]\n\n"),
+                .set_body_string(minimal_chat_sse_body()),
         )
         .mount(&server)
         .await;
@@ -487,16 +463,7 @@ async fn preflight_routing_caps_against_provider_context_window() {
         .mount(&server)
         .await;
 
-    let mut config = config_for(&server.uri());
-    config.upstreams = vec![llmconduit::config::UpstreamConfig {
-        name: "routed".to_string(),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        upstream_chat_kwargs: serde_json::Map::new(),
-        upstream_request_log_path: None,
-        fallback_upstreams: Vec::new(),
-    }];
+    let config = config_for(&server.uri());
 
     let app = llmconduit::build_app(config);
     let response = app
@@ -546,94 +513,5 @@ async fn preflight_routing_caps_against_provider_context_window() {
     assert!(
         capped > 0 && capped < 4_096,
         "budget capped against the routing provider's 4_096 window: got {capped}"
-    );
-}
-
-/// T9 HIGH-fix guard: in top-level-failover mode (`fallback_upstreams` set, no
-/// `upstreams`/`model_routes`), `is_plain_single_provider()` is FALSE, so the
-/// engine-union catalog is NOT a budgeting fallback. The `FailoverUpstreamClient`
-/// candidate plan carries `None` limits (it does not load `/v1/models`), so
-/// budgeting must NO-OP — even though the primary's `/v1/models` reports a
-/// window (the engine union WOULD have it). This distinguishes the candidate-
-/// plan path from the pre-T9 engine-union path: pre-T9 budgeted against the
-/// engine union for `resolved_model` and would CAP here; post-T9 it no-ops
-/// (G1 reactive retry stays the net for the failover chain).
-#[tokio::test]
-async fn preflight_top_level_failover_no_ops_without_candidate_limit() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "primary-model", "max_model_len": 4_096}]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(minimal_chat_sse_body()),
-        )
-        .mount(&server)
-        .await;
-
-    let mut config = config_for(&server.uri());
-    config.fallback_upstreams = vec![llmconduit::config::FallbackUpstreamConfig {
-        name: "fallback".to_string(),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: Some("fallback-model".to_string()),
-        exposed_model: None,
-        upstream_chat_kwargs: serde_json::Map::new(),
-        upstream_request_log_path: None,
-    }];
-    // The primary also serves (top-level fallback_upstreams ⇒ FailoverUpstreamClient
-    // with the primary as provider 0 + the fallback as provider 1).
-    assert!(!config.is_plain_single_provider());
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "primary-model",
-                        "stream": false,
-                        "input": "hello",
-                        "max_output_tokens": 1_000_000,
-                    })
-                    .to_string(),
-                ))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "no false 400 in top-level-failover mode without a candidate limit"
-    );
-    let chat_posts: Vec<_> = server
-        .received_requests()
-        .await
-        .expect("requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .collect();
-    assert_eq!(chat_posts.len(), 1, "exactly one upstream chat POST");
-    let posted: serde_json::Value =
-        serde_json::from_slice(&chat_posts[0].body).expect("posted json");
-    // Budgeting no-op'd: the huge request value flows through UNCAPPED. (G3
-    // never synthesizes a cap; G1 reactive retry handles overflow downstream.)
-    assert_eq!(
-        posted["max_tokens"].as_i64(),
-        Some(1_000_000),
-        "top-level-failover with no candidate limit ⇒ budgeting no-op (uncapped)"
     );
 }

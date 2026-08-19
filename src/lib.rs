@@ -58,15 +58,10 @@ use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
 use crate::search::BraveSearchClient;
-use crate::upstream::FailoverUpstreamClient;
 use crate::upstream::FailoverUpstreamProvider;
-use crate::upstream::ModelRouteSpec;
+use crate::upstream::ProfileRoutingClient;
 use crate::upstream::ReqwestUpstreamClient;
-use crate::upstream::RouteUpstreamProvider;
-use crate::upstream::RoutingUpstreamClient;
-use crate::upstream::RoutingUpstreamProvider;
 use crate::vision::ImageCache;
-use crate::vision::ReqwestVisionClient;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,10 +124,6 @@ pub fn build_app_with_gateway_and_options(
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
         None => crate::turn_capture::TurnCapture::disabled(),
     };
-    // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
-    // (G7); routes alone are enough to switch the gateway into the routing
-    // client so route-name/glob matching applies.
-    let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
     // Per-backend-model finalization policies (effort map, `template_family`
     // override, `upstream_chat_kwargs`), shared (cheap clone) across all leaf
     // clients so each resolves against the FINAL provider model (T1). Built once
@@ -160,117 +151,37 @@ pub fn build_app_with_gateway_and_options(
             // off) so the single point that sees the on-wire body can capture it.
             .with_flow_store(flow_store.clone())
         };
-    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
-        let providers = config
-            .upstreams
-            .iter()
-            .map(|provider| {
-                let primary_client = make_upstream_client(
-                    provider.upstream_base_url.clone(),
-                    provider.upstream_api_key.clone(),
-                    provider.upstream_request_log_path.clone(),
-                );
-                let fallback_providers = provider
-                    .fallback_upstreams
-                    .iter()
-                    .map(|fallback| {
-                        FailoverUpstreamProvider::new(
-                            fallback.name.clone(),
-                            make_upstream_client(
-                                fallback.upstream_base_url.clone(),
-                                fallback.upstream_api_key.clone(),
-                                fallback.upstream_request_log_path.clone(),
-                            ),
-                            fallback.upstream_model.clone(),
-                            fallback.exposed_model.clone(),
-                            fallback.upstream_chat_kwargs.clone(),
-                        )
-                    })
-                    .collect();
-                RoutingUpstreamProvider::new(
-                    provider.name.clone(),
-                    primary_client,
-                    provider.upstream_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
-                    fallback_providers,
-                    Duration::from_secs(config.upstream_failure_cooldown_secs),
-                )
-            })
-            .collect();
-        // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
-        // a single-upstream client keyed by request-model name/glob; the glob
-        // matcher was compiled at config time.
-        let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
-        let mut route_providers = Vec::with_capacity(config.model_routes.len());
-        let mut route_specs = Vec::with_capacity(config.model_routes.len());
-        for (index, route) in config.model_routes.iter().enumerate() {
-            let client = make_upstream_client(
-                route.upstream_base_url.clone(),
-                config.upstream_api_key.clone(),
-                config.upstream_request_log_path.clone(),
-            );
-            route_providers.push(RouteUpstreamProvider::new(
-                format!("route-{}", route.name),
-                client,
-                cooldown,
-            ));
-            route_specs.push(ModelRouteSpec::new(
-                route.name.clone(),
-                route.glob.clone(),
-                index,
-                route.upstream_model.clone(),
-            ));
-        }
-        Arc::new(RoutingUpstreamClient::with_routes(
-            providers,
-            route_providers,
-            route_specs,
-        ))
-    } else {
-        let primary_upstream = make_upstream_client(
-            config.upstream_base_url.clone(),
-            config.upstream_api_key.clone(),
-            config.upstream_request_log_path.clone(),
-        );
-        if config.fallback_upstreams.is_empty() {
-            // D2: the BARE leaf is the engine's upstream directly — no routing/
-            // failover layer owns the `provider` serving field, so mark this leaf to
-            // synthesize `provider = "primary"`.
-            Arc::new(primary_upstream.into_bare_primary())
-        } else {
-            let mut providers = vec![FailoverUpstreamProvider::new(
-                "primary",
-                primary_upstream,
+    // One provider per named upstream (pure endpoints: no per-provider model
+    // rewrite; a profile chain supplies the model per step). The
+    // `ProfileRoutingClient` resolves each request model to its profile's chain
+    // and dispatches over these shared providers, so cooldown is keyed by
+    // upstream name across every profile that routes to it.
+    let providers: Vec<FailoverUpstreamProvider> = config
+        .upstreams
+        .iter()
+        .map(|entry| {
+            FailoverUpstreamProvider::new(
+                entry.name.clone(),
+                make_upstream_client(
+                    entry.url.clone(),
+                    entry.api_key.clone(),
+                    entry.request_log_path.clone(),
+                ),
                 None,
-                None,
-                serde_json::Map::new(),
-            )];
-            providers.extend(config.fallback_upstreams.iter().map(|provider| {
-                FailoverUpstreamProvider::new(
-                    provider.name.clone(),
-                    make_upstream_client(
-                        provider.upstream_base_url.clone(),
-                        provider.upstream_api_key.clone(),
-                        provider.upstream_request_log_path.clone(),
-                    ),
-                    provider.upstream_model.clone(),
-                    provider.exposed_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
-                )
-            }));
-            Arc::new(FailoverUpstreamClient::new(
-                providers,
-                Duration::from_secs(config.upstream_failure_cooldown_secs),
-            ))
-        }
-    };
+                entry.chat_kwargs.clone(),
+            )
+        })
+        .collect();
+    let config_arc = Arc::new(config.clone());
+    let upstream: Arc<dyn crate::upstream::UpstreamClient> =
+        Arc::new(ProfileRoutingClient::new(config_arc, providers));
     let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
-    // G4 image agent: a vision client + a shared per-session image cache. The
-    // cache is constructed once and shared so the strip seam (in
-    // `stream_responses`) and the executor (`run_image_analysis`) see the same
-    // store. Construction is unconditional and cheap; gating happens per-turn.
-    let vision: Arc<dyn crate::vision::VisionClient> =
-        Arc::new(ReqwestVisionClient::new(http_client, &config));
+    // G4 image agent: a shared per-session image cache. Constructed once and
+    // shared so the strip seam (in `stream_responses`) and the executor
+    // (`run_image_analysis`) see the same store. The analyzer is dispatched
+    // through the gateway's own upstreams by model name, so no separate vision
+    // client is wired here. Construction is unconditional and cheap; activation
+    // is per-turn on the resolved profile's `image_analysis`.
     let image_cache = Arc::new(ImageCache::from_config(&config));
 
     // D7 dashboard/`/debug` auth, built from the ENVIRONMENT (never from the
@@ -298,7 +209,6 @@ pub fn build_app_with_gateway_and_options(
             replay_store,
             upstream,
             search,
-            vision,
             image_cache,
             monitor,
             raw_output,

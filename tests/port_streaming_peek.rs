@@ -75,16 +75,12 @@ use tower::ServiceExt;
 /// `common::test_config`.
 fn gateway_with_upstream<U: UpstreamClient + 'static>(upstream: U) -> Arc<Gateway> {
     let config = common::test_config();
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(MockSearch::default()),
-        vision,
         image_cache,
         MonitorHub::disabled(),
         None,
@@ -527,7 +523,7 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
     );
 }
 
-/// Task 0B1: prove the conformance harness is reachable from THIS integration
+/// Prove the conformance harness is reachable from THIS integration
 /// crate at the public path `llmconduit::adapters::responses_to_anthropic::
 /// conformance`, operating on real `AnthropicStreamEvent`s the way the other
 /// tests in this file construct `AnthropicStreamConverter` output. Hand-built

@@ -1,8 +1,11 @@
-//! Per-session LRU+TTL image cache (`ImageCache`) and its stored value types.
+//! Per-session LRU+TTL image cache (`ImageCache`) and its stored value types,
+//! plus [`VisionRequest`] - the parsed `analyzeImage` call with its cached
+//! images resolved against this store.
 //!
-//! This module owns ONLY cache storage and eviction. The request-mutation seam
-//! that strips images out of a [`ResponsesRequest`](crate::models::responses::ResponsesRequest)
-//! and populates this cache lives in [`super::strip`]; the per-session reset and
+//! This module owns cache storage/eviction and the cache-resolving request
+//! type. The request-mutation seam that strips images out of a
+//! [`ResponsesRequest`](crate::models::responses::ResponsesRequest) and
+//! populates this cache lives in [`super::strip`]; the per-session reset and
 //! LRU/TTL invariants documented here are what that seam relies on.
 //!
 //! Separate from `ReplayStore` by design (see the module-level docs on
@@ -12,6 +15,7 @@
 //! placeholder numbering resets like claude-relay's stateless replay.
 
 use crate::config::Config;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -177,6 +181,62 @@ impl ImageCache {
     }
 }
 
+/// Parsed `analyzeImage` arguments with each requested image id resolved against
+/// the session cache. `image_ids` may be empty (the executor then surfaces a
+/// model-visible "no images" message rather than erroring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionRequest {
+    pub image_ids: Vec<String>,
+    pub task: String,
+    pub context: Option<String>,
+    pub images: Vec<CachedImage>,
+}
+
+impl VisionRequest {
+    /// Parse the `analyzeImage` tool arguments into a structured request,
+    /// resolving each requested image id against the cache for `session_id`.
+    /// Missing ids are simply skipped (claude-relay logs + skips); the executor
+    /// decides what model-visible text to inject.
+    pub fn from_arguments(arguments: &Value, session_id: &str, cache: &ImageCache) -> Self {
+        let image_ids = arguments
+            .get("imageId")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(value_to_image_id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let task = arguments
+            .get("task")
+            .and_then(Value::as_str)
+            .filter(|task| !task.trim().is_empty())
+            .unwrap_or("Describe this image in detail")
+            .to_string();
+        let context = arguments
+            .get("context")
+            .and_then(Value::as_str)
+            .filter(|context| !context.trim().is_empty())
+            .map(ToString::to_string);
+        let images = image_ids
+            .iter()
+            .filter_map(|id| cache.get(session_id, &ImageCache::image_key(session_id, id)))
+            .collect();
+        Self {
+            image_ids,
+            task,
+            context,
+            images,
+        }
+    }
+}
+
+/// Coerce a JSON `imageId` array element to a string id. Accepts string or
+/// numeric ids (`["1"]` or `[1]`) since models occasionally emit the latter.
+fn value_to_image_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+        Value::Number(num) => Some(num.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +365,36 @@ mod tests {
         // A get triggers cleanup; the now-empty session must be dropped.
         let _ = cache.get("temp", &ImageCache::image_key("temp", "1"));
         assert_eq!(cache.session_len("temp"), 0);
+    }
+
+    #[test]
+    fn vision_request_parses_arguments_and_resolves_images() {
+        let cache = cache();
+        cache.store("sess", ImageCache::image_key("sess", "1"), img("data:one"));
+        cache.store("sess", ImageCache::image_key("sess", "2"), img("data:two"));
+        let args = serde_json::json!({
+            "imageId": ["1", "2", "9"],
+            "task": "read the sign",
+            "context": "user asked about the sign"
+        });
+        let request = VisionRequest::from_arguments(&args, "sess", &cache);
+        assert_eq!(request.image_ids, vec!["1", "2", "9"]);
+        assert_eq!(request.task, "read the sign");
+        assert_eq!(
+            request.context.as_deref(),
+            Some("user asked about the sign")
+        );
+        // #9 missing from cache, so only two images resolve.
+        assert_eq!(request.images, vec![img("data:one"), img("data:two")]);
+    }
+
+    #[test]
+    fn vision_request_defaults_task_and_accepts_numeric_ids() {
+        let cache = cache();
+        let args = serde_json::json!({ "imageId": [1] });
+        let request = VisionRequest::from_arguments(&args, "sess", &cache);
+        assert_eq!(request.image_ids, vec!["1"]);
+        assert_eq!(request.task, "Describe this image in detail");
+        assert_eq!(request.context, None);
     }
 }

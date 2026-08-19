@@ -29,65 +29,112 @@ The default config path is:
 
 Configuration is loaded at startup. Restart llmconduit after editing the file.
 
-Minimal config:
-
-```yaml
-bind_addr: "127.0.0.1:4000"
-upstream_base_url: "http://127.0.0.1:8000/v1"
-upstream_model: "Qwen3.5"
-```
-
-Multi-upstream model routing:
+All routing goes through named upstreams plus model profiles. The minimal
+config is one upstream and one profile that passes every requested model
+through unchanged:
 
 ```yaml
 upstreams:
-  - name: "local"
-    upstream_base_url: "http://127.0.0.1:8000/v1"
-  - name: "openrouter"
-    upstream_base_url: "https://openrouter.ai/api/v1"
-    upstream_api_key: "..."
+  - name: default
+    url: "http://127.0.0.1:8000/v1"
+model_profiles:
+  "*": { upstream: default }    # pass any requested model through unchanged
 ```
 
-When `upstreams` is configured, llmconduit exposes the ordered union of the
-primary upstream model catalogs. If a request omits `model`, passes a blank
-model, or requests a model that is not currently available, llmconduit uses the
-first model from the first upstream with a catalog entry. Requested model names
-are normalized against the catalogs, so aliases such as different case or
-punctuation route to the exact model id exposed by the backend. If multiple
-upstreams expose the same model id, the first upstream wins.
+### Upstreams
 
-Optional nested fallback providers:
+`upstreams:` is a list of named endpoints. `name` and `url` are required;
+`name` must be unique, case-insensitive. Everything else is optional:
 
 ```yaml
 upstreams:
-  - name: "local"
-    upstream_base_url: "http://127.0.0.1:8000/v1"
-    fallback_upstreams:
-      - name: "backup"
-        upstream_base_url: "https://openrouter.ai/api/v1"
-        upstream_api_key: "..."
-        upstream_model: "openai/gpt-4.1-mini"
-        exposed_model: "GPT-4.1-mini"
-        upstream_chat_kwargs:
-          provider:
-            order:
-              - z-ai
-            allow_fallbacks: true
+  - name: local
+    url: "http://127.0.0.1:8000/v1"
+  - name: openrouter
+    url: "https://openrouter.ai/api/v1"
+    api_key: "sk-or-..."
+    chat_kwargs:
+      provider:
+        order: [z-ai]
+    request_log_path: "/tmp/openrouter-upstream.jsonl"
 ```
 
-If a selected upstream fails before producing the first chat chunk, only that
-upstream's nested `fallback_upstreams` are tried. llmconduit does not treat the
-next model-routing upstream as a failure fallback. Fallback models are not shown
-in `/v1/models` unless `exposed_model` is set. A fallback `upstream_model` is
-optional; when set, fallback requests use that model, otherwise they keep the
-routed primary model id. `exposed_model` advertises a fallback model under a
-client-facing alias and routes requests for that alias to the declaring fallback
-provider.
-Fallback `upstream_chat_kwargs` are merged only when that fallback is selected,
-with per-model kwargs and explicit request values taking precedence.
+Each entry also accepts `upstream_base_url`/`upstream_api_key`/
+`upstream_chat_kwargs`/`upstream_request_log_path` as aliases for
+`url`/`api_key`/`chat_kwargs`/`request_log_path`. An entry that omits
+`api_key` sends no credentials; every entry that needs auth declares its own,
+either inline or as `api_key_env: SOME_VAR`, which reads the key from that
+environment variable at startup. Declaring `api_key_env` for a variable that
+is unset or blank is a startup error, and one entry may not set both
+`api_key` and `api_key_env`.
 
-The legacy top-level `upstream_*` and `fallback_upstreams` settings still work
-when `upstreams` is not configured.
+An upstream is a pure endpoint: it names no model and carries no fallback
+chain of its own. Routing, model overrides, and failover all live on the
+model profile that points at it.
+
+### Model profiles
+
+`model_profiles:` is an ordered map from a served model id (or a glob using
+`*`, `?`, or `[...]`, matched case-insensitively) to a profile. Every profile
+requires `upstream:`, naming the `upstreams:` entry it routes to. Assuming
+`openrouter`, `backup`, and `vision` are also declared under `upstreams:`:
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    upstream: local
+    upstream_model: "z-ai/glm-5.2"        # backend id to POST; defaults to the profile key
+    fallbacks:
+      - openrouter                         # bare upstream name
+      - { upstream: backup, model: "z-ai/glm-5.2-backup" }  # upstream + model override
+    image_analysis:
+      model: Qwen3-VL                      # must name another exact-key profile
+      residual_images: reject              # placeholder (default) or reject
+
+  Qwen3-VL:
+    upstream: vision
+
+  "claude-*":
+    upstream: openrouter                   # glob: passes the request model through
+```
+
+A request resolves to exactly one profile. An exact key (trimmed,
+case-insensitive) always wins over a glob, regardless of declaration order -
+an exact key is never shadowed. Among globs, the first declared match wins,
+so declare a narrower glob before a broader one like `"*"`, or the broader
+pattern shadows it. Duplicate keys collapse to the last one declared. `upstream_model` is the id
+actually POSTed to the backend: it defaults to the profile key for an exact
+key, or to the (trimmed) request model for a glob. A request for a model with
+no matching profile is a 404; a blank/missing model is a 400 unless a glob
+matches the empty string and also sets `upstream_model`.
+
+`fallbacks:` lists upstreams to retry, in order, if the primary fails before
+its first response chunk (never mid-stream). Each entry is either a bare
+upstream name or `{upstream, model}` to also remap the model for that hop.
+Cooldown after a failure is tracked per upstream name and shared across every
+profile that references it.
+
+`image_analysis` opts a profile into stripping images out and routing them to
+another profile for description; see "Image analysis" below. A profile with
+no `image_analysis` passes images to its upstream untouched.
+
+`extends:` shares fields across profiles via `model_profile_templates`,
+including `upstream` and `fallbacks`:
+
+```yaml
+model_profile_templates:
+  routed:
+    upstream: local
+    fallbacks: [openrouter]
+
+model_profiles:
+  Qwen3.5:
+    extends: [routed]
+    upstream_model: "Qwen/Qwen3.5"
+```
+
+When a profile `extends` multiple templates, later entries in the list
+override earlier ones, and the profile's own fields override every template.
 
 Global and per-model request defaults:
 
@@ -106,6 +153,7 @@ model_profile_templates:
 
 model_profiles:
   Kimi-K2.7:
+    upstream: local
     extends:
       - thinking
     system_prompt_prefix: |
@@ -114,6 +162,7 @@ model_profiles:
       preserve_thinking: true
 
   GLM-5.2:
+    upstream: local
     extends:
       - thinking
     chat_template_kwargs:
@@ -133,45 +182,37 @@ works and overrides the shorthand when both set the same key. When a profile
 order: later entries override earlier ones, and the profile's own fields
 override all templates.
 
-### Reserved `*` profile
+### The `*` catch-all profile
 
-A profile keyed `*` is a pure fallback for per-model settings. When a request
-names a model that no specific `model_profiles` entry matches, the `*` profile
-stands in as that model's profile: its `upstream_chat_kwargs` and
-`system_prompt_prefix` apply. When a specific profile DOES match, the `*`
-profile is not consulted at all - an explicit match never inherits unset fields
-from `*`. The `*` profile can itself `extend` templates, so extending a shared
-template is the way to give `*` and explicit profiles common defaults. Use
-`model_profile_templates` (`extends`) to share fields between explicit
-profiles, not `*`.
-
-Per-model profile matching precedence, highest to lowest:
-
-- The request model - matched by name (case-insensitive) against `model_profiles`.
-- The resolved/upstream model (after `upstream_model` rewriting) - matched by name.
-- The reserved `*` profile - used only when neither of the above matches.
-
-Top-level config is the base below all profiles: `upstream_chat_kwargs` is the
-deep-merge base, and `system_prompt_prefix` is always prepended. Client request
-values still override profile settings, as described above.
+`*` is not special syntax; it is a glob pattern like any other, and it
+happens to match every model. It requires `upstream:` like any profile, and
+it follows the same declaration-order rule as every other glob: declare it
+last among your glob keys, or it shadows the more specific globs beneath it.
+An exact key always wins over `*` regardless of where `*` is declared. `*`
+can itself `extend` a template to share defaults with explicit profiles.
 
 ```yaml
 model_profiles:
-  # Fallback for any model without an explicit profile.
-  "*":
-    upstream_chat_kwargs:
-      chat_template_kwargs:
-        enable_thinking: false
-
   GLM-5.2:
+    upstream: local
     upstream_chat_kwargs:
       chat_template_kwargs:
         enable_thinking: true
+
+  # Matches any model without a more specific profile. Declared last so more
+  # specific keys and globs are tried first.
+  "*":
+    upstream: local
+    upstream_chat_kwargs:
+      chat_template_kwargs:
+        enable_thinking: false
 ```
 
 With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
-(`enable_thinking: true`); the `*` profile contributes nothing. A request for
-any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: false`).
+(`enable_thinking: true`) - `*` is a separate profile, not a source of
+inherited defaults, so an explicit match never picks up its fields. A request
+for any other model (e.g. `Qwen-3`) falls through to `*`
+(`enable_thinking: false`).
 
 ### Model capabilities
 
@@ -181,6 +222,7 @@ advertised on `/v1/models` for Anthropic clients.
 ```yaml
 model_profiles:
   GLM-5.2:
+    upstream: local
     capabilities:
       thinking:
         types: [adaptive, enabled]
@@ -218,6 +260,7 @@ on the Anthropic routes (`/v1/messages` and `/v1/messages/count_tokens`).
 ```yaml
 model_profiles:
   GLM-5.2:
+    upstream: local
     reasoning_effort:
       default: high
       map:
@@ -308,6 +351,7 @@ model_profiles:
   # Full-role, system inline ANYWHERE; tool role supported (GLM-5.2, Kimi K2.7).
   # Both group tool runs in-template, so do NOT set merge_adjacent on `tool`.
   GLM-5.2:
+    upstream: local
     roles:
       "*":       { action: reject }
       user:      {}
@@ -320,6 +364,7 @@ model_profiles:
   # system/developer message is rewritten to `user` in place; the index-0
   # message stays system, so Qwen never sees a non-first system.
   Qwen3.5:
+    upstream: local
     roles:
       "*":       { action: reject }
       user:      {}
@@ -335,6 +380,7 @@ model_profiles:
   # System-less model (Gemma): only `user`/`assistant` exist. Fold system and
   # tool into `user` and coalesce the adjacent user runs.
   Gemma:
+    upstream: local
     roles:
       merge_adjacent: [user]
       "*":       { action: reject }
@@ -364,26 +410,139 @@ max_web_search_rounds: 5
 brave_base_url: "https://api.search.brave.com/res/v1"
 ```
 
-Optional vision offload — forward images to a separate vision-capable model instead
-of the primary upstream:
+### Image analysis
+
+Images pass through to a profile's upstream untouched by default. Setting
+`image_analysis` on a profile opts it into stripping images out of the latest
+turn, sending them to another profile for description, and feeding that
+description back into the conversation instead:
 
 ```yaml
+model_profiles:
+  GLM-5.2:
+    upstream: local
+    image_analysis:
+      model: Qwen3-VL          # must be an existing exact-key profile
+      residual_images: reject  # default: placeholder
+
+  Qwen3-VL:
+    upstream: vision
+```
+
+`image_analysis.model` must name another EXACT-key profile (not a glob) that
+itself has no `image_analysis` set - redirect chains are rejected at startup,
+as is a profile redirecting to itself. `residual_images` decides what happens
+to an image the redirect could not strip - a `file_id` image, one outside the
+latest user turn, or an image left over in older history: `placeholder` (the
+default) replaces it with an instructive text note so the model asks for a
+description instead of guessing; `reject` fails the turn before dispatch with
+an HTTP 400 instead of contacting the upstream.
+
+## Migrating
+
+Every removed key below now maps to a named `upstreams:` entry, a
+`model_profiles:` field, or both. Shown together for illustration - a real
+config normally uses only the pieces it needs:
+
+Before:
+
+```yaml
+bind_addr: "127.0.0.1:4000"
+upstream_base_url: "http://127.0.0.1:8000/v1"
+upstream_api_key: "sk-local"
+upstream_model: "Qwen3.5"
+
+model_routes:
+  "claude-opus-*": "https://openrouter.ai/api/v1"
+
 image_agent_enabled: true
 vision_url: "http://127.0.0.1:8001/v1"
 vision_model: "Qwen3-VL"
+
+upstreams:
+  - name: "local"
+    upstream_base_url: "http://127.0.0.1:8000/v1"
+    fallback_upstreams:
+      - name: "backup"
+        upstream_base_url: "https://openrouter.ai/api/v1"
+        upstream_api_key: "sk-or-..."
+        upstream_model: "openai/gpt-4.1-mini"
+        exposed_model: "GPT-4.1-mini"
 ```
 
-Any image that still reaches a backend without native vision support (whether or not
-the agent above is active, e.g. no `vision_url` configured) is degraded instead of
-forwarded raw:
+After:
 
 ```yaml
-# placeholder (default): replace the image in place with an instructive text note so
-#   the model asks the user to describe it / requests text, instead of guessing.
-# reject: fail the turn before dispatch with an HTTP 400 (the provider is never
-#   contacted, so it is never cooled down or failed over).
-unsupported_image_policy: placeholder
+bind_addr: "127.0.0.1:4000"
+
+upstreams:
+  - name: local
+    url: "http://127.0.0.1:8000/v1"
+    api_key: "sk-local"
+  - name: openrouter
+    url: "https://openrouter.ai/api/v1"
+    api_key: "sk-or-..."
+  - name: vision
+    url: "http://127.0.0.1:8001/v1"
+
+model_profiles:
+  "claude-opus-*":
+    upstream: openrouter
+
+  GPT-4.1-mini:
+    upstream: openrouter
+    upstream_model: "openai/gpt-4.1-mini"
+
+  Qwen3-VL:
+    upstream: vision
+
+  "*":
+    upstream: local
+    upstream_model: "Qwen3.5"
+    fallbacks:
+      - { upstream: openrouter, model: "openai/gpt-4.1-mini" }
+    image_analysis:
+      model: Qwen3-VL
 ```
+
+The top-level `upstream_base_url`/`upstream_api_key`/`upstream_model` become
+an `upstreams:` entry plus that entry named on a profile's `upstream:` (and
+`upstream_model:` when the served id differs from the profile key). A
+`model_routes` glob becomes a glob `model_profiles` key pointing at a named
+upstream; the removed `--model-route` CLI flag has no replacement flag for
+the same reason - express it in the config instead. `image_agent_enabled` /
+`vision_url` / `vision_model` become `image_analysis` on whichever profiles
+need it, redirecting to a profile for the vision-capable backend.
+`unsupported_image_policy` becomes `image_analysis.residual_images` on that
+same profile. A nested `fallback_upstreams` entry becomes a real `upstreams:`
+entry plus a `fallbacks:` reference on the profile; an `exposed_model` alias
+becomes its own exact-key profile pointing at that upstream, since `/v1/models`
+now only lists exact profile keys, not fallback aliases.
+
+**Environment overrides.** `LLMCONDUIT_UPSTREAM_BASE_URL`,
+`LLMCONDUIT_UPSTREAM_API_KEY`, and `LLMCONDUIT_UPSTREAM_MODEL` are no longer
+read; set those values on an `upstreams:` entry and a profile instead.
+`OPENAI_API_KEY` is no longer read implicitly: an ambient key must not leak
+to endpoints that never asked for one, so every `upstreams:` entry that needs
+auth declares its own `api_key`. To keep sourcing the key from the
+environment, opt in per entry with `api_key_env: OPENAI_API_KEY` (or any
+other variable name).
+
+**`configure` and existing multi-upstream configs.** `llmconduit configure`
+always writes the minimal shape: one `default` upstream plus a `"*"` profile.
+Running it against a config that already has several `upstreams:` entries or
+several `model_profiles` collapses them down to that single pair (other
+settings, like `model_profile_templates` and `price_table`, are preserved).
+Back up a hand-edited config before running `configure` again.
+
+**Behavioral changes.** A request for a model with no matching profile now
+returns 404 instead of silently falling back to the first catalog entry seen.
+A blank/missing model returns 400 unless a glob profile matches the empty
+string and also sets `upstream_model`. `/v1/models` lists the exact
+(non-glob) profile keys in declaration order instead of the union of upstream
+catalogs. An image reaches the upstream untouched unless the matched profile
+sets `image_analysis` - there is no more implicit backend-capability
+sniffing or global `unsupported_image_policy`.
 
 ## Run
 
@@ -427,9 +586,13 @@ stage; Node and the frontend sources are not present in the final image.
 docker build -t llmconduit .
 docker run --rm -p 4000:4000 \
   --add-host=host.docker.internal:host-gateway \
-  -e LLMCONDUIT_UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+  -v "$(pwd)/config.yaml:/home/nonroot/.config/llmconduit/config.yaml:ro" \
   llmconduit
 ```
+
+`config.yaml` is the same `upstreams:`/`model_profiles:` file described above
+(point `url` at `http://host.docker.internal:8000/v1` to reach a backend
+running on the host).
 
 To expose `/debug` and `/dashboard`, replace the final line with
 `llmconduit start --with-debug-ui`.
@@ -445,7 +608,7 @@ startup logs a prominent warning because `/debug` and `/dashboard` will be open.
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
 | `POST /v1/messages` | Anthropic Messages API |
-| `GET /v1/models` | Proxied model list |
+| `GET /v1/models` | Model list, built from `model_profiles` |
 | `GET /healthz` | Health check |
 | `GET /debug` | Debug UI when started with `--with-debug-ui` |
 
@@ -455,9 +618,6 @@ Common overrides:
 
 ```text
 LLMCONDUIT_BIND_ADDR
-LLMCONDUIT_UPSTREAM_BASE_URL
-LLMCONDUIT_UPSTREAM_API_KEY
-LLMCONDUIT_UPSTREAM_MODEL
 LLMCONDUIT_SYSTEM_PROMPT_PREFIX
 LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON
 LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS
@@ -469,24 +629,36 @@ LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
 BRAVE_SEARCH_API_KEY
-OPENAI_API_KEY
 ```
 
-`OPENAI_API_KEY` is used as a fallback upstream API key.
+`LLMCONDUIT_UPSTREAM_BASE_URL`/`LLMCONDUIT_UPSTREAM_API_KEY`/
+`LLMCONDUIT_UPSTREAM_MODEL`/`OPENAI_API_KEY` are gone; set the URL, key, and
+model on an `upstreams:` entry and a profile instead (see "Migrating"). An
+entry can still source its key from any environment variable by naming it in
+`api_key_env`.
 
 ## Request Logs
 
-Set this in config to write upstream chat requests as JSONL:
+Set `request_log_path` on an `upstreams:` entry to write that upstream's
+chat requests as JSONL:
 
 ```yaml
-upstream_request_log_path: "/tmp/llmconduit-upstream.jsonl"
+upstreams:
+  - name: local
+    url: "http://127.0.0.1:8000/v1"
+    request_log_path: "/tmp/llmconduit-upstream.jsonl"
 ```
 
 Then inspect prefix stability:
 
 ```bash
-llmconduit analyze-log
+llmconduit analyze-log --path /tmp/llmconduit-upstream.jsonl
 ```
+
+`analyze-log` also accepts a top-level `upstream_request_log_path:` as the
+default `--path` when the flag is omitted, but that top-level key has no
+effect on what gets logged while serving requests; only each `upstreams:`
+entry's own `request_log_path` does that.
 
 ## Durable turn capture
 

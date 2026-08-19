@@ -5,15 +5,11 @@
 //! DTO shape, status logic, `consecutive_failures` reset, the no-torn catalog
 //! meta pair, and the publisher's monotonic versioning by driving the private
 //! `mark_failure`/`mark_provider_success` paths directly. This file closes the
-//! two gaps those cannot reach from outside the crate:
-//!
-//! 1. The routing client's catalog metadata (`catalog_fetched_ms`/`catalog_size`)
-//!    is populated by a REAL `/v1/models` refresh (a torn pair is impossible by
-//!    construction — the `Arc<CatalogMeta>` swap happens under the catalog lock).
-//! 2. The IDLE cooling→Healthy flip is published by the `Gateway`'s real
-//!    publication task (1 s tick + cooldown-deadline wake) with ZERO traffic
-//!    after the provider entered cooldown — a provider is driven into cooldown by
-//!    a real failing upstream POST, then recovers purely on the deadline wake.
+//! gap those cannot reach from outside the crate: the IDLE cooling→Healthy flip
+//! published by the `Gateway`'s real publication task (1 s tick + cooldown-
+//! deadline wake) with ZERO traffic after the provider entered cooldown - a
+//! provider is driven into cooldown by a real failing upstream POST, then
+//! recovers purely on the deadline wake.
 
 mod common;
 
@@ -26,7 +22,6 @@ use llmconduit::upstream::BackendChatRequest;
 use llmconduit::upstream::FailoverUpstreamProvider;
 use llmconduit::upstream::ProviderStatus;
 use llmconduit::upstream::ReqwestUpstreamClient;
-use llmconduit::upstream::RoutingUpstreamProvider;
 use llmconduit::upstream::UpstreamClient;
 use serde_json::Map as JsonMap;
 use serde_json::Value;
@@ -83,9 +78,6 @@ fn empty_request() -> ChatCompletionRequest {
 /// default (the publication task only touches `upstream` + the publisher).
 fn gateway_with_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
     let config = test_config();
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     let search = Arc::new(llmconduit::search::BraveSearchClient::new(
         reqwest::Client::new(),
@@ -96,67 +88,11 @@ fn gateway_with_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
         ReplayStore::new(16),
         upstream,
         search,
-        vision,
         image_cache,
         llmconduit::monitor::MonitorHub::disabled(),
         None,
         llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ))
-}
-
-/// A routing client whose primary `/v1/models` is served by a real wiremock
-/// upstream reports populated catalog metadata (`catalog_fetched_ms` +
-/// `catalog_size`) in its health vector once the catalog is loaded — sourced
-/// from the SAME refresh that backs resolution (so the pair is never torn).
-#[tokio::test]
-async fn routing_provider_health_populates_catalog_meta_from_real_refresh() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "object": "list",
-            "data": [{"id": "model-a"}, {"id": "model-b"}],
-        })))
-        .mount(&server)
-        .await;
-
-    let routing_provider = RoutingUpstreamProvider::new(
-        "vllm",
-        leaf(&format!("{}/v1/", server.uri())),
-        None,
-        JsonMap::new(),
-        Vec::new(),
-        Duration::from_secs(30),
-    );
-    let client = llmconduit::upstream::RoutingUpstreamClient::new(vec![routing_provider]);
-
-    // Before any refresh, catalog meta is unknown.
-    let pre = client.provider_health();
-    assert_eq!(pre.len(), 1);
-    assert_eq!(pre[0].catalog_fetched_ms, None);
-    assert_eq!(pre[0].catalog_size, None);
-
-    // A real catalog load populates the (fetched_ms, size) pair.
-    let catalog = client
-        .supported_model_catalog()
-        .await
-        .expect("catalog loads from the mock /v1/models");
-    assert_eq!(catalog.len(), 2);
-
-    let post = client.provider_health();
-    assert_eq!(post[0].route.as_deref(), Some("vllm"));
-    assert_eq!(
-        post[0].catalog_size,
-        Some(2),
-        "catalog_size reflects the union model count"
-    );
-    let fetched = post[0]
-        .catalog_fetched_ms
-        .expect("catalog_fetched_ms is set after the refresh");
-    assert!(
-        fetched > 0,
-        "catalog_fetched_ms is a real epoch-ms timestamp"
-    );
 }
 
 /// `Gateway::upstream_health()` surfaces the underlying client's health; a bare
@@ -175,13 +111,11 @@ async fn gateway_upstream_health_delegates_and_bare_is_empty() {
                 "primary",
                 leaf("https://a.invalid/v1"),
                 None,
-                None,
                 JsonMap::new(),
             ),
             FailoverUpstreamProvider::new(
                 "backup",
                 leaf("https://b.invalid/v1"),
-                None,
                 None,
                 JsonMap::new(),
             ),
@@ -218,7 +152,6 @@ async fn idle_cooling_provider_flips_to_healthy_via_deadline_wake() {
         vec![FailoverUpstreamProvider::new(
             "primary",
             leaf(&format!("{}/v1/", server.uri())),
-            None,
             None,
             JsonMap::new(),
         )],

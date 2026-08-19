@@ -19,11 +19,13 @@ use tower::ServiceExt;
 /// port. Any request that passes the size gate then fails fast with a connection
 /// error (5xx) — never 413 — so a 413 unambiguously means the body cap fired.
 fn config_with_limit(max_request_body_bytes: usize) -> Config {
-    let persisted = PersistedConfig {
-        upstream_base_url: "http://127.0.0.1:1/v1".to_string(),
+    let mut persisted = PersistedConfig {
         max_request_body_bytes,
         ..PersistedConfig::default()
     };
+    // Point the default upstream at a closed port so any request that clears the
+    // size gate then fails fast with a connection error (5xx), never a 413.
+    persisted.upstreams[0].url = "http://127.0.0.1:1/v1".to_string();
     Config::from_persisted(&persisted).expect("resolve config")
 }
 

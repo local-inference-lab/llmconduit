@@ -44,13 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{report}");
             Ok(())
         }
-        Some(Commands::Start {
-            config,
-            raw,
-            model_route,
-        }) => {
+        Some(Commands::Start { config, raw }) => {
             let path = resolve_config_path(config)?;
-            let config = Config::from_env_file_and_routes(Some(&path), &model_route)?;
+            let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
             run_debug_log_cleanup(&config);
             let (app, gateway) = build_app_with_gateway_and_options(
@@ -162,7 +158,6 @@ mod tests {
         assert!(command_uses_dedicated_terminal(&Some(Commands::Start {
             config: None,
             raw: true,
-            model_route: Vec::new(),
         })));
     }
 
@@ -172,7 +167,6 @@ mod tests {
         assert!(!command_uses_dedicated_terminal(&Some(Commands::Start {
             config: None,
             raw: false,
-            model_route: Vec::new(),
         })));
         assert!(!command_uses_dedicated_terminal(&Some(
             Commands::AnalyzeLog {

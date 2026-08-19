@@ -134,11 +134,10 @@ pub(crate) fn redact_payload_secrets_in_value(value: &mut serde_json::Value) {
     }
 }
 
-/// Vision text that becomes model-visible or logged — the successful
-/// `VisionOutcome.text` (round-3 #3) and error bodies/messages (review #3,
-/// round-2 #2, round-3 #4): image URIs redacted via [`redact_image_uris`], then
-/// UTF-8-safely capped so only a bounded, image-free, token-free remainder
-/// survives.
+/// Vision text that becomes model-visible or logged: the analyzer's success
+/// description and its error bodies/messages. Image URIs are redacted via
+/// [`redact_image_uris`], then the result is UTF-8-safely capped so only a
+/// bounded, image-free, token-free remainder survives.
 pub fn redact_vision_text(text: &str) -> String {
     let trimmed = redact_image_uris(text);
     let trimmed = trimmed.trim();

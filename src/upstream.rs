@@ -68,6 +68,14 @@ fn instant_deadline_to_epoch_ms(deadline: Option<Instant>) -> Option<u64> {
     Some(now_epoch_ms().saturating_add(remaining.as_millis() as u64))
 }
 
+/// Convert a PAST monotonic `Instant` (e.g. a catalog fetch time) to an
+/// epoch-ms wall-clock value, by measuring how long ago it was and subtracting
+/// that from the current epoch-ms.
+fn past_instant_to_epoch_ms(instant: Instant) -> u64 {
+    let elapsed = Instant::now().saturating_duration_since(instant);
+    now_epoch_ms().saturating_sub(elapsed.as_millis() as u64)
+}
+
 /// Wall-clock epoch-ms as `u128`, matching the dashboard FlowStore's `started_ms`/phase
 /// stamps (gap 03 attempt timestamps). A clock that is before `UNIX_EPOCH` yields `0`.
 fn now_epoch_ms_u128() -> u128 {
@@ -211,8 +219,8 @@ pub struct ProviderHealth {
     pub id: String,
     /// Human-readable provider name (currently identical to `id`).
     pub name: String,
-    /// The routing-provider name that owns this entry, when it is reached via a
-    /// `RoutingUpstreamClient` (`None` for a bare/failover provider).
+    /// The routing-provider name that owns this entry, when reached via a
+    /// routing wrapper (`None` for a plain failover provider).
     pub route: Option<String>,
     /// The upstream base URL this provider POSTs to (REQUIRED, never null).
     pub base_url: String,
@@ -228,11 +236,13 @@ pub struct ProviderHealth {
     pub failover_count: u64,
     /// Consecutive failures since the last success (reset to 0 on success).
     pub consecutive_failures: u32,
-    /// Epoch-ms instant this provider's `/v1/models` catalog was last fetched
-    /// (`None` until the first refresh; only the routing client populates it).
+    /// Epoch-ms instant the routing client's union catalog was last fetched
+    /// (`None` until the first refresh; the same client-wide value is stamped
+    /// onto every provider, not a per-provider timestamp).
     pub catalog_fetched_ms: Option<u64>,
-    /// Number of models in this provider's last catalog snapshot (`None` until
-    /// the first refresh; only the routing client populates it).
+    /// Number of models in the routing client's union catalog across all
+    /// upstreams (`None` until the first refresh; the same client-wide value is
+    /// stamped onto every provider, not a per-provider count).
     pub catalog_size: Option<u64>,
 }
 
@@ -373,11 +383,11 @@ pub struct UpstreamModelEntry {
 
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
-/// One pre-first-chunk serving backend: its FINAL model id (after any
-/// routing/route/exposed-alias + per-provider `upstream_model` rewrite — no
-/// further remap) and the context-window length the upstream reports for it,
-/// for G3 pre-flight budgeting (T9). `context_limit: None` ⇒ the upstream did
-/// not report a window for this model (budgeting no-ops for it).
+/// One pre-first-chunk serving backend: its FINAL model id (after the profile
+/// chain's per-step model rewrite - no further remap) and the context-window
+/// length the upstream reports for it, for G3 pre-flight budgeting (T9).
+/// `context_limit: None` ⇒ the upstream did not report a window for this model
+/// (budgeting no-ops for it).
 #[derive(Debug, Clone)]
 pub struct BackendCandidate {
     pub model: String,
@@ -386,18 +396,13 @@ pub struct BackendCandidate {
 
 /// Typed backend-candidate plan: the routing/failover layer's answer to "which
 /// backend models could serve this request pre-first-chunk, and what context
-/// window does each report?" G4 native-vision gating consumes the candidate
-/// MODELS instead of re-deriving the set in the engine (T2); G3 pre-flight
-/// budgeting consumes the candidate CONTEXT LIMITS (conservative MIN — the
-/// strictest window across the failover chain — so a failover to a smaller
-/// model cannot overflow; unknown ⇒ no-op) instead of budgeting against the
-/// pre-routing `resolved_model` (T9). The `genuine` signal — whether the
-/// request model truly resolved vs. fell back to a catalog default — is
-/// ENGINE-side (a byproduct of `normalize_upstream_model`, not a re-derived
-/// ladder; see `backend_is_native_vision`).
+/// window does each report?" G3 pre-flight budgeting consumes the candidate
+/// CONTEXT LIMITS (conservative MIN - the strictest window across the failover
+/// chain - so a failover to a smaller model cannot overflow; unknown ⇒ no-op)
+/// instead of budgeting against the pre-routing `resolved_model` (T9).
 ///
-/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): the gate
-/// treats it as strip+offload, budgeting no-ops.
+/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): budgeting
+/// no-ops.
 #[derive(Debug, Clone)]
 pub struct BackendCandidatePlan {
     pub candidates: Vec<BackendCandidate>,
@@ -445,14 +450,11 @@ pub trait UpstreamClient: Send + Sync {
         collect_supported_model_catalog(response).await
     }
 
-    /// Every backend model `requested_model` could ACTUALLY be served by
-    /// pre-first-chunk, after any routing/route/exposed-alias + per-provider
-    /// `upstream_model` rewrite (G4 review #2 + round-2 #1). This enumerates the
-    /// full candidate set — the primary AND all eligible failover providers (and
-    /// the routing target) — because failover happens before the first chunk, so
-    /// the model that ultimately serves may be any of them. Native-vision gating
-    /// uses the SAFE invariant over this set (passthrough only if EVERY candidate
-    /// is native-vision), so it can never disagree with the provider that serves.
+    /// Every backend model `requested_model` could ACTUALLY be served
+    /// pre-first-chunk, after the profile chain's per-step model rewrite. This
+    /// enumerates the full candidate set - the primary AND every declared
+    /// fallback - because failover happens before the first chunk, so the model
+    /// that ultimately serves may be any of them.
     ///
     /// Default impl: thin projection over
     /// [`backend_candidate_plan`](Self::backend_candidate_plan) — the single
@@ -468,9 +470,8 @@ pub trait UpstreamClient: Send + Sync {
     }
 
     /// Typed backend-candidate plan for `requested_model` — the routing/failover
-    /// layer's candidate set (model + per-candidate context limit) for G4
-    /// native-vision gating (T2) and G3 pre-flight budgeting (T9). The `genuine`
-    /// signal is engine-side; this method returns only `candidates`.
+    /// layer's candidate set (model + per-candidate context limit) for G3
+    /// pre-flight budgeting (T9).
     ///
     /// Default impl: a single-provider passthrough sends the request model
     /// unchanged, so the only candidate is `requested_model` itself with no
@@ -489,8 +490,8 @@ pub trait UpstreamClient: Send + Sync {
     /// (D4). A NON-async, dyn-safe default (mirrors `supported_model_catalog`'s
     /// default so `Arc<dyn UpstreamClient>` stays object-safe): the bare leaf and
     /// any client that owns no provider metrics return an EMPTY vector; the
-    /// failover/routing clients override to report their providers' live status,
-    /// cumulative counters, cooldown deadline, and (routing) catalog metadata.
+    /// failover and profile-routing clients override to report their providers'
+    /// live status, cumulative counters, and cooldown deadline.
     /// Reads are lock-free over the per-provider `Arc<ProviderMetrics>` /
     /// `Arc<CatalogMeta>` plus a short cooldown-state `Mutex` hold; safe to call
     /// from a synchronous publication tick.
@@ -528,14 +529,6 @@ pub struct ReqwestUpstreamClient {
     /// to `disabled()` (every store op no-ops, zero overhead); the DI root threads
     /// the live store in via `with_flow_store` when the debug UI is on.
     flow_store: crate::dashboard_flow::DashboardFlowStore,
-    /// D2 bare-leaf marker: `true` ONLY when this leaf is the engine's upstream
-    /// DIRECTLY (lib.rs `Arc::new(primary_upstream)` — no routing/failover wrapper
-    /// owns the `provider` serving field). Then the leaf synthesizes
-    /// `provider = "primary"`. A leaf nested INSIDE a failover/routing client leaves
-    /// this `false` so it never clobbers the real provider name the wrapper records
-    /// on first-chunk success (the leaf runs BEFORE that success, so a
-    /// first-writer-wins tag here would otherwise win over the true provider).
-    tag_primary_provider: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -543,12 +536,11 @@ pub struct FailoverUpstreamProvider {
     name: String,
     client: ReqwestUpstreamClient,
     upstream_model: Option<String>,
-    exposed_model: Option<String>,
     upstream_chat_kwargs: JsonMap<String, Value>,
     /// D4 cumulative serving counters. Behind an `Arc` so this struct keeps its
     /// derived `Clone` (a bare atomic field would not be `Clone`) and so the
-    /// same counters survive the routing/failover REBUILD that clones the
-    /// provider (the rebuild clones the `Arc`, not the counters).
+    /// same counters survive the failover REBUILD that clones the provider (the
+    /// rebuild clones the `Arc`, not the counters).
     metrics: Arc<ProviderMetrics>,
 }
 
@@ -557,18 +549,30 @@ impl FailoverUpstreamProvider {
         name: impl Into<String>,
         client: ReqwestUpstreamClient,
         upstream_model: Option<String>,
-        exposed_model: Option<String>,
         upstream_chat_kwargs: JsonMap<String, Value>,
     ) -> Self {
         Self {
             name: name.into(),
             client,
             upstream_model,
-            exposed_model,
             upstream_chat_kwargs,
             metrics: ProviderMetrics::new(),
         }
     }
+}
+
+/// One step of a request's failover chain: the provider index to dispatch to
+/// plus the model id to POST there. The profile router builds a chain from a
+/// resolved route (primary = served model; each fallback = its entry model or
+/// the served model); the failover client builds one from bare provider indices
+/// via [`FailoverUpstreamClient::static_generation_chain`] /
+/// [`static_proxy_chain`](FailoverUpstreamClient::static_proxy_chain), carrying
+/// the per-provider static rewrite. On the raw-completions proxy path an EMPTY
+/// `model` means "leave the proxied body's own model untouched".
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    pub provider: usize,
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -576,232 +580,6 @@ pub struct FailoverUpstreamClient {
     providers: Vec<FailoverUpstreamProvider>,
     cooldown: Duration,
     states: Arc<Mutex<Vec<ProviderCooldownState>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RoutingUpstreamProvider {
-    name: String,
-    primary_client: ReqwestUpstreamClient,
-    primary_upstream_model: Option<String>,
-    fallback_exposed_models: Vec<RoutingFallbackExposedModel>,
-    client: FailoverUpstreamClient,
-}
-
-impl RoutingUpstreamProvider {
-    pub fn new(
-        name: impl Into<String>,
-        primary_client: ReqwestUpstreamClient,
-        primary_upstream_model: Option<String>,
-        primary_upstream_chat_kwargs: JsonMap<String, Value>,
-        fallback_providers: Vec<FailoverUpstreamProvider>,
-        cooldown: Duration,
-    ) -> Self {
-        let name = name.into();
-        let mut providers = vec![FailoverUpstreamProvider::new(
-            name.clone(),
-            primary_client.clone(),
-            primary_upstream_model.clone(),
-            None,
-            primary_upstream_chat_kwargs,
-        )];
-        let fallback_exposed_models = fallback_providers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, provider)| {
-                provider
-                    .exposed_model
-                    .clone()
-                    .map(|model_id| RoutingFallbackExposedModel {
-                        model_id,
-                        failover_provider_index: index + 1,
-                    })
-            })
-            .collect();
-        providers.extend(fallback_providers);
-        Self {
-            name,
-            primary_client,
-            primary_upstream_model,
-            fallback_exposed_models,
-            client: FailoverUpstreamClient::new(providers, cooldown),
-        }
-    }
-
-    /// The effective backend model of one of this routing provider's nested
-    /// failover providers (its `upstream_model` rewrite, if any). Used by G4
-    /// native-vision gating for an exposed-alias/fallback target that serves from
-    /// exactly one provider. `None` when the index is out of range or the
-    /// provider sends the request model through unchanged.
-    fn failover_provider_model(&self, failover_provider_index: usize) -> Option<String> {
-        self.client.provider_upstream_model(failover_provider_index)
-    }
-}
-
-/// A synthetic upstream backing one or more ad-hoc model routes (G7). Unlike a
-/// catalog provider, a route provider is matched by request-model *name* (in
-/// `ModelRouteSpec`), never enumerated into the `/v1/models` union, so routes
-/// stay invisible to the model listing exactly like claude-relay's
-/// `model_routes`.
-#[derive(Debug, Clone)]
-pub struct RouteUpstreamProvider {
-    name: String,
-    client: FailoverUpstreamClient,
-}
-
-impl RouteUpstreamProvider {
-    pub fn new(name: impl Into<String>, client: ReqwestUpstreamClient, cooldown: Duration) -> Self {
-        let name = name.into();
-        Self {
-            name: name.clone(),
-            client: FailoverUpstreamClient::new(
-                vec![FailoverUpstreamProvider::new(
-                    name,
-                    client,
-                    None,
-                    None,
-                    JsonMap::new(),
-                )],
-                cooldown,
-            ),
-        }
-    }
-}
-
-/// A compiled ad-hoc model route (G7): a request-model name/glob that maps to a
-/// `RouteUpstreamProvider` and an optional upstream-model rewrite.
-#[derive(Debug, Clone)]
-pub struct ModelRouteSpec {
-    /// Request-model name this route matches (literal or glob source).
-    name: String,
-    /// Compiled glob matcher (case-insensitive). `None` for a literal name,
-    /// which is compared with `eq_ignore_ascii_case`.
-    glob: Option<Regex>,
-    /// Index into `RoutingUpstreamClient::route_providers`.
-    route_provider_index: usize,
-    /// Upstream model to send. `None` passes the request model through.
-    upstream_model: Option<String>,
-}
-
-impl ModelRouteSpec {
-    /// Build a route spec. `glob` is the pre-compiled matcher (from
-    /// `config::ModelRoute`); `route_provider_index` indexes the matching
-    /// `RouteUpstreamProvider`.
-    pub fn new(
-        name: impl Into<String>,
-        glob: Option<Regex>,
-        route_provider_index: usize,
-        upstream_model: Option<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            glob,
-            route_provider_index,
-            upstream_model,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RoutingUpstreamClient {
-    providers: Vec<RoutingUpstreamProvider>,
-    /// Synthetic providers backing ad-hoc model routes (G7), indexed by
-    /// `ModelRouteSpec::route_provider_index`. Kept separate from catalog
-    /// `providers` so routes never enter the `/v1/models` union.
-    route_providers: Vec<RouteUpstreamProvider>,
-    routes: Vec<ModelRouteSpec>,
-    catalog: Arc<AsyncMutex<Option<CachedRoutingModelCatalog>>>,
-    /// D4 catalog metadata `(fetched_ms, size)` published for the topology map.
-    /// Swapped as a SINGLE immutable `Arc<CatalogMeta>` inside `refresh_catalog`
-    /// (under the `catalog` `AsyncMutex` hold) so a lock-free `provider_health()`
-    /// reader can never observe a torn `(fetched_ms, size)` pair — the two fields
-    /// always move together. Default `Arc<CatalogMeta>` (both `None`) until the
-    /// first refresh.
-    catalog_meta: Arc<Mutex<Arc<CatalogMeta>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedRoutingModelCatalog {
-    fetched_at: Instant,
-    catalog: RoutingModelCatalog,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RoutingModelCatalog {
-    provider_catalogs: Vec<RoutingProviderModelCatalog>,
-    union_entries: Vec<Value>,
-    union_ids: Vec<String>,
-    /// Context-window length keyed by union model id, parsed from the SAME
-    /// first-seen `/v1/models` entry that populated `union_entries`/`union_ids`.
-    /// `supported_model_catalog` reads it directly so the union catalog is parsed
-    /// once at refresh rather than reparsed from `union_entries` per call.
-    union_context_limit_by_id: HashMap<String, i64>,
-    ids_by_key: HashMap<String, Vec<RoutingModelCandidate>>,
-    /// Ad-hoc routes (G7), cloned from the client each refresh. Matched purely
-    /// by request-model name, independent of the live catalog, so routes still
-    /// resolve when an upstream `/v1/models` fetch is unavailable.
-    routes: Vec<ModelRouteSpec>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RoutingProviderModelCatalog {
-    candidates: Vec<RoutingModelCandidate>,
-    /// Per-model context-window length for this provider's catalog, keyed by
-    /// model id (parsed from the SAME `/v1/models` snapshot as `candidates`).
-    /// G3 pre-flight budgeting reads this via `backend_candidate_plan` so it
-    /// budgets against the REAL per-provider window (T9), not the pre-routing
-    /// union default.
-    context_limit_by_id: HashMap<String, i64>,
-}
-
-#[derive(Debug, Clone)]
-struct RoutingModelCandidate {
-    provider_index: usize,
-    model_id: String,
-    target: RoutingModelTarget,
-}
-
-/// Outcome of resolving a request model: either a catalog candidate (served by a
-/// `RoutingUpstreamProvider`) or an ad-hoc route candidate (served by a
-/// `RouteUpstreamProvider`). Routes slot strictly between an exact catalog id
-/// and the canonical-key/default fallbacks (G7), so an exact model id always
-/// beats a glob route.
-#[derive(Debug, Clone)]
-enum RoutingResolution {
-    Catalog(RoutingModelCandidate),
-    Route {
-        route_provider_index: usize,
-        model_id: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-enum RoutingModelTarget {
-    Primary,
-    Fallback { failover_provider_index: usize },
-}
-
-/// Which `RoutingModelCatalog::resolve` rule matched a request model. Carried
-/// out to the dispatch site purely for diagnostics: a `Default` match means the
-/// requested model was NOT served by any upstream and we fell back to the first
-/// catalog model — worth a WARN so an operator notices a model-name mismatch
-/// (e.g. the loaded vLLM model differs from what clients request). The rest are
-/// expected and log at INFO or below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchKind {
-    /// Rule 1: exact catalog model id.
-    ExactId,
-    /// Rules 2-3: ad-hoc route name or glob.
-    Route,
-    /// Rule 4: unique canonical-key catalog match (case/punctuation normalized).
-    CanonicalKey,
-    /// Rule 5: no match; fell back to the first catalog model.
-    Default,
-}
-
-#[derive(Debug, Clone)]
-struct RoutingFallbackExposedModel {
-    model_id: String,
-    failover_provider_index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -914,8 +692,8 @@ impl UpstreamRequestLogger {
     async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
         // G4 round-4 #3: the JSONL request log is written to DISK and would
         // otherwise serialize raw `data:` image bytes / signed `image_url`s for
-        // native-vision-passthrough / disabled-agent / missing-url /
-        // tool_choice:"none" image requests (any path that does NOT strip). The
+        // any image request that reaches an upstream without stripping (e.g. a
+        // native-vision passthrough profile). The
         // common no-image request serializes directly (format unchanged); only
         // when the serialized bytes contain an image-URI marker do we re-redact
         // via a CLONED JSON value through the shared redactor, so the on-disk log
@@ -986,9 +764,6 @@ impl ReqwestUpstreamClient {
             // Default to the no-op store (D2); the DI root threads the live one in
             // via `with_flow_store` only when the debug UI is enabled.
             flow_store: crate::dashboard_flow::DashboardFlowStore::disabled(),
-            // Default OFF: a leaf only tags `provider = "primary"` when the DI root
-            // marks it the bare/direct engine upstream via `into_bare_primary`.
-            tag_primary_provider: false,
         }
     }
 
@@ -1014,16 +789,6 @@ impl ReqwestUpstreamClient {
         flow_store: crate::dashboard_flow::DashboardFlowStore,
     ) -> Self {
         self.flow_store = flow_store;
-        self
-    }
-
-    /// Mark this leaf the BARE/direct engine upstream (D2): the DI root calls this
-    /// ONLY for the single-upstream `Arc::new(primary_upstream)` path, where no
-    /// routing/failover layer owns the `provider` serving field. Then the leaf
-    /// synthesizes `provider = "primary"`. Leaves nested inside a failover/routing
-    /// client never call this, so they don't clobber the real provider name.
-    pub(crate) fn into_bare_primary(mut self) -> Self {
-        self.tag_primary_provider = true;
         self
     }
 
@@ -1223,117 +988,10 @@ impl ReqwestUpstreamClient {
         serving.set_pending_response_body(captured);
     }
 
-    /// Gap 03 (bare-leaf path): wrap a successfully-dispatched upstream stream so the
-    /// flow records EXACTLY ONE served [`Attempt`](crate::dashboard_flow::Attempt). Round-1
-    /// review (F1): `first_upstream_byte_ms` is `header_byte_ms` — the wire instant the
-    /// upstream RESPONSE HEADERS arrived (captured by `dispatch_chat_stream` the moment
-    /// `send().await` returned), NOT the later instant the first parsed SSE chunk is
-    /// yielded. The attempt is still RECORDED at first-chunk yield (so a stream that yields
-    /// NO item becomes a FAILED attempt and exactly one attempt is recorded), but the
-    /// measured wire byte time is the header time. Because the dispatch succeeded, headers
-    /// arrived, so `header_byte_ms` is `Some` on this path; it is threaded as the byte time
-    /// for the served chunk AND the "stream produced nothing" `Stream`-class failure
-    /// (headers DID arrive — only the first chunk did not). Pure pass-through of every
-    /// chunk afterwards — it never buffers or duplicates tokens (AGENTS.md
-    /// failover-only-pre-first-chunk is untouched: this records, it does not retry). No-op
-    /// wrapper when no token is threaded.
-    fn record_served_attempt_on_first_byte(
-        serving: Option<Arc<ServingToken>>,
-        mut stream: UpstreamStream,
-        start_ms: u128,
-        model: String,
-        header_byte_ms: Option<u128>,
-    ) -> UpstreamStream {
-        let Some(serving) = serving else {
-            return stream;
-        };
-        Box::pin(async_stream::stream! {
-            let mut first_byte_recorded = false;
-            while let Some(item) = stream.next().await {
-                if !first_byte_recorded {
-                    first_byte_recorded = true;
-                    // The first item arrived. A transport/parse error in the FIRST item is
-                    // still "no usable first chunk" → a FAILED attempt; a chunk → a SERVED
-                    // attempt. Either way exactly one attempt is recorded, and its wire
-                    // first-byte is the HEADER time (F1), never the chunk-yield time.
-                    match &item {
-                        Ok(_) => serving.record_attempt(crate::dashboard_flow::Attempt {
-                            provider: Some("primary".to_string()),
-                            model: Some(model.clone()),
-                            start_ms,
-                            end_ms: now_epoch_ms_u128(),
-                            first_upstream_byte_ms: header_byte_ms,
-                            status: crate::dashboard_flow::AttemptStatus::Served,
-                            error_class: None,
-                            failover_reason: None,
-                        }),
-                        Err(err) => serving.record_attempt(Self::failed_bare_attempt(
-                            start_ms,
-                            model.clone(),
-                            header_byte_ms,
-                            err,
-                        )),
-                    }
-                }
-                yield item;
-            }
-            if !first_byte_recorded {
-                // The stream completed without yielding a single item: no first CHUNK
-                // arrived, but the response HEADERS did (the dispatch succeeded) — so the
-                // wire first-byte is the header time (F1), and this is a `Stream`-class
-                // FAILED attempt.
-                serving.record_attempt(crate::dashboard_flow::Attempt {
-                    provider: Some("primary".to_string()),
-                    model: Some(model.clone()),
-                    start_ms,
-                    end_ms: now_epoch_ms_u128(),
-                    first_upstream_byte_ms: header_byte_ms,
-                    status: crate::dashboard_flow::AttemptStatus::Failed,
-                    error_class: Some(crate::dashboard_flow::AttemptErrorClass::Stream),
-                    failover_reason: None,
-                });
-            }
-        })
-    }
-
-    /// Gap 03: build a FAILED bare-leaf [`Attempt`](crate::dashboard_flow::Attempt) (the
-    /// dispatch errored before producing a stream, OR the first stream item was an error).
-    /// Round-1 review (F1): `first_upstream_byte_ms` is `header_byte_ms` — `Some` (the wire
-    /// header time) for an HTTP-status failure whose response headers arrived, `None` for a
-    /// connect/timeout-before-response. The bounded taxonomic `error_class`/`failover_reason`
-    /// come from `err` — never raw upstream text.
-    fn failed_bare_attempt(
-        start_ms: u128,
-        model: String,
-        header_byte_ms: Option<u128>,
-        err: &AppError,
-    ) -> crate::dashboard_flow::Attempt {
-        use crate::dashboard_flow::AttemptFailoverReason;
-        use crate::dashboard_flow::AttemptStatus;
-        use crate::error::FailoverDisposition;
-        let failover_reason = match err.failover_disposition() {
-            FailoverDisposition::Terminal => AttemptFailoverReason::TerminalNoFailover,
-            FailoverDisposition::FailoverNoCooldown => AttemptFailoverReason::RequestRejected,
-            FailoverDisposition::Failover => AttemptFailoverReason::ProviderFailed,
-        };
-        crate::dashboard_flow::Attempt {
-            provider: Some("primary".to_string()),
-            model: Some(model),
-            start_ms,
-            end_ms: now_epoch_ms_u128(),
-            first_upstream_byte_ms: header_byte_ms,
-            status: AttemptStatus::Failed,
-            error_class: Some(classify_attempt_error(err)),
-            failover_reason: Some(failover_reason),
-        }
-    }
-
     /// The leaf's actual chat-completions dispatch: POST the finalized + sanitized
-    /// `request`, with the G1 context-overflow shrink-and-retry. Split out of
-    /// [`stream_chat_completion`](Self::stream_chat_completion) so the bare-leaf path can
-    /// wrap the result for gap-03 attempt recording WITHOUT duplicating the recording
-    /// across this method's several return sites. `response_id` keys the D2 on-wire body
-    /// capture (already performed by `logged_send_chat_request`).
+    /// `request`, with the G1 context-overflow shrink-and-retry. `response_id`
+    /// keys the D2 on-wire body capture (already performed by
+    /// `logged_send_chat_request`).
     async fn dispatch_chat_stream(
         &self,
         url: &Url,
@@ -1513,18 +1171,6 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // BEFORE `backend.request` is moved into `sanitize_chat_request` so the
         // first + retry send sites can both pass `response_id.as_deref()`.
         let response_id = backend.response_id.clone();
-        // D2 bare-leaf path: when this leaf is the engine's upstream DIRECTLY (no
-        // routing/failover wrapper — lib.rs `Arc::new(primary_upstream)`, marked via
-        // `into_bare_primary`), nothing upstream tags the serving provider. Synthesize
-        // `"primary"` so every flow carries a provider. A leaf nested inside a
-        // failover/routing client is NOT marked, so it never runs this — otherwise
-        // (first-writer-wins) it would clobber the real provider name the wrapper
-        // records on first-chunk success, since the leaf runs BEFORE that success.
-        if self.tag_primary_provider
-            && let Some(serving) = &backend.serving
-        {
-            serving.set_provider("primary");
-        }
         // D5 R4 (MEDIUM): the shared serving token, captured before `backend.request` is
         // moved into `sanitize`. The leaf finalizes the served model onto it below.
         let serving = backend.serving.clone();
@@ -1544,74 +1190,6 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // failover/routing the LAST leaf to run (the serving / last-tried provider) wins.
         if let Some(serving) = &serving {
             serving.set_model_served_final(request.model.clone());
-        }
-
-        // Gap 03: the bare-leaf path (this leaf IS the engine's upstream directly — no
-        // failover loop owns attempt recording) records EXACTLY ONE attempt for the flow.
-        // A leaf nested in a failover/routing client leaves `tag_primary_provider` false,
-        // so the failover loop is the sole attempt recorder there (this branch is skipped
-        // — no double-count). Round-1 review (F1): the served/failed attempt's
-        // `first_upstream_byte_ms` is the TRUE wire TTFB — the instant the upstream response
-        // HEADERS arrived (`dispatch_chat_stream` stamps the armed slot for both a 2xx and a
-        // non-2xx), NOT the later instant the first parsed SSE chunk is yielded. A dispatch
-        // that fails AFTER headers (a non-2xx) thus carries a measured byte time; a
-        // connect/timeout-before-response leaves it `None` (the slot was never stamped).
-        if self.tag_primary_provider {
-            let attempt_start_ms = now_epoch_ms_u128();
-            let attempt_model = request.model.clone();
-            if let Some(serving) = &serving {
-                serving.arm_attempt_header_byte();
-                // Gap 05 review round 2 (HIGH): per-attempt reset of the staged ERROR body
-                // on the bare-leaf (single-attempt, no-failover) path too, so the invariant
-                // "the final outcome decides the committed body" holds identically on every
-                // dispatch path. A fresh `ServingToken` starts empty, so this is normally a
-                // no-op here — but keeping the reset symmetric with the failover loop means
-                // the bare leaf can never commit a body from a stale staging, regardless of
-                // how the token was constructed. The non-2xx site in `dispatch_chat_stream`
-                // re-stages this attempt's own body; a body-less failure leaves it cleared.
-                serving.clear_pending_response_body();
-            }
-            return match self
-                .dispatch_chat_stream(
-                    &url,
-                    request,
-                    response_id.as_deref(),
-                    serving.as_ref(),
-                    capture.as_ref(),
-                )
-                .await
-            {
-                Ok(stream) => {
-                    // Headers arrived (the slot holds the wire byte time). The attempt is
-                    // still RECORDED at first-chunk yield so a stream that produces no chunk
-                    // is a FAILED attempt — but its `first_upstream_byte_ms` is the header
-                    // time captured here, not the chunk-yield time.
-                    let header_byte_ms = serving
-                        .as_ref()
-                        .and_then(|serving| serving.take_attempt_header_byte());
-                    Ok(Self::record_served_attempt_on_first_byte(
-                        serving,
-                        stream,
-                        attempt_start_ms,
-                        attempt_model,
-                        header_byte_ms,
-                    ))
-                }
-                Err(err) => {
-                    if let Some(serving) = &serving {
-                        // `take_attempt_header_byte` is `Some` for an HTTP-status failure
-                        // (headers arrived) and `None` for a connect/timeout-before-response.
-                        let header_byte_ms = serving.take_attempt_header_byte();
-                        serving.record_attempt(Self::failed_bare_attempt(
-                            attempt_start_ms,
-                            attempt_model,
-                            header_byte_ms,
-                            &err,
-                        ));
-                    }
-                    Err(err)
-                }
-            };
         }
 
         self.dispatch_chat_stream(
@@ -1719,13 +1297,38 @@ impl FailoverUpstreamClient {
         }
     }
 
-    /// The configured `upstream_model` rewrite of provider `index`, if any.
-    /// `None` when out of range or the provider sends the request model
-    /// unchanged. Used by G4 native-vision gating (round-2 #1).
-    fn provider_upstream_model(&self, index: usize) -> Option<String> {
-        self.providers
-            .get(index)
-            .and_then(|provider| provider.upstream_model.clone())
+    /// Chain steps for bare provider indices on the generation path, preserving
+    /// the per-provider static `upstream_model` rewrite (or the request model
+    /// when a provider sends it through unchanged). Lets these clients feed the
+    /// shared `*_with_provider_indices` dispatch, which carries the model per
+    /// step so the profile router can rewrite per fallback entry.
+    fn static_generation_chain(&self, indices: Vec<usize>, request_model: &str) -> Vec<ChainStep> {
+        indices
+            .into_iter()
+            .map(|provider| ChainStep {
+                model: self.providers[provider]
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| request_model.to_string()),
+                provider,
+            })
+            .collect()
+    }
+
+    /// Chain steps for the raw-completions proxy: the per-provider static
+    /// `upstream_model`, or an EMPTY model that leaves the proxied body's own
+    /// model untouched (passthrough), matching the prior per-provider rewrite.
+    fn static_proxy_chain(&self, indices: Vec<usize>) -> Vec<ChainStep> {
+        indices
+            .into_iter()
+            .map(|provider| ChainStep {
+                model: self.providers[provider]
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_default(),
+                provider,
+            })
+            .collect()
     }
 
     fn available_provider_indices(&self) -> Vec<usize> {
@@ -1857,14 +1460,18 @@ impl FailoverUpstreamClient {
         ))
     }
 
+    /// Rebuild the backend request for one chain step: POST `model` (the step's
+    /// resolved id) and gap-fill the provider's `upstream_chat_kwargs`. The model
+    /// rides on the step so the profile router can rewrite per fallback entry;
+    /// the failover client passes the provider-static rewrite through
+    /// [`static_generation_chain`](Self::static_generation_chain).
     fn request_for_provider(
         provider: &FailoverUpstreamProvider,
         backend: &BackendChatRequest,
+        model: &str,
     ) -> BackendChatRequest {
         let mut request = backend.request.clone();
-        if let Some(model) = &provider.upstream_model {
-            request.model = model.clone();
-        }
+        request.model = model.to_string();
         merge_chat_kwargs_gap_fill(&mut request, &provider.upstream_chat_kwargs);
         BackendChatRequest {
             request,
@@ -1878,6 +1485,21 @@ impl FailoverUpstreamClient {
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
         }
+    }
+
+    /// Provider-static rebuild for the in-crate unit tests that assert the
+    /// `upstream_model` rewrite directly: POST the provider's configured
+    /// `upstream_model`, or the request model when it sends through unchanged.
+    #[cfg(test)]
+    fn request_for_provider_static(
+        provider: &FailoverUpstreamProvider,
+        backend: &BackendChatRequest,
+    ) -> BackendChatRequest {
+        let model = provider
+            .upstream_model
+            .clone()
+            .unwrap_or_else(|| backend.request.model.clone());
+        Self::request_for_provider(provider, backend, &model)
     }
 
     async fn prefetch_first_chunk(
@@ -2015,38 +1637,17 @@ impl FailoverUpstreamClient {
         );
     }
 
-    async fn stream_chat_completion_with_timeout_from_provider(
-        &self,
-        provider_index: usize,
-        backend: &BackendChatRequest,
-        request_timeout: Duration,
-    ) -> AppResult<UpstreamStream> {
-        if provider_index >= self.providers.len() {
-            return Err(AppError::internal(
-                "resolved fallback provider index was out of range",
-            ));
-        }
-        if !self.provider_is_available(provider_index) {
-            return Err(self.cooldown_error());
-        }
-        self.stream_chat_completion_with_provider_indices(
-            vec![provider_index],
-            backend,
-            request_timeout,
-        )
-        .await
-    }
-
     async fn stream_chat_completion_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let mut last_error = None;
-        for provider_index in provider_indices {
+        for step in chain {
+            let provider_index = step.provider;
             let provider = &self.providers[provider_index];
-            let provider_request = Self::request_for_provider(provider, backend);
+            let provider_request = Self::request_for_provider(provider, backend, &step.model);
             // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
             // is issued; the provider's on-wire model is `provider_request.request.model`
             // (post `request_for_provider` remap). The attempt's outcome (served / failed)
@@ -2273,28 +1874,14 @@ impl FailoverUpstreamClient {
         });
     }
 
-    async fn count_tokens_from_provider(
-        &self,
-        provider_index: usize,
-        backend: &BackendChatRequest,
-    ) -> AppResult<Option<u64>> {
-        if provider_index >= self.providers.len() {
-            return Err(AppError::internal(
-                "resolved fallback provider index was out of range",
-            ));
-        }
-        self.count_tokens_with_provider_indices(vec![provider_index], backend)
-            .await
-    }
-
     async fn count_tokens_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         backend: &BackendChatRequest,
     ) -> AppResult<Option<u64>> {
-        for provider_index in provider_indices {
-            let provider = &self.providers[provider_index];
-            let provider_request = Self::request_for_provider(provider, backend);
+        for step in chain {
+            let provider = &self.providers[step.provider];
+            let provider_request = Self::request_for_provider(provider, backend, &step.model);
             match provider.client.count_tokens(&provider_request).await {
                 Ok(Some(count)) => return Ok(Some(count)),
                 Ok(None) => {}
@@ -2308,34 +1895,22 @@ impl FailoverUpstreamClient {
         Ok(None)
     }
 
-    async fn proxy_completions_from_provider(
-        &self,
-        provider_index: usize,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> AppResult<reqwest::Response> {
-        if provider_index >= self.providers.len() {
-            return Err(AppError::internal(
-                "resolved fallback provider index was out of range",
-            ));
-        }
-        if !self.provider_is_available(provider_index) {
-            return Err(self.cooldown_error());
-        }
-        self.proxy_completions_with_provider_indices(vec![provider_index], headers, body)
-            .await
-    }
-
     async fn proxy_completions_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         headers: HeaderMap,
         body: Bytes,
     ) -> AppResult<reqwest::Response> {
         let mut last_error = None;
-        for provider_index in provider_indices {
-            let provider = &self.providers[provider_index];
-            let provider_body = proxy_body_for_provider(provider, &body);
+        for step in chain {
+            let provider_index = step.provider;
+            // An empty step model leaves the proxied body's own model untouched
+            // (bare-provider passthrough); a non-empty one rewrites it.
+            let provider_body = if step.model.is_empty() {
+                body.clone()
+            } else {
+                proxy_body_with_model(body.clone(), &step.model)
+            };
             match self.providers[provider_index]
                 .client
                 .proxy_completions(headers.clone(), provider_body)
@@ -2366,412 +1941,6 @@ impl FailoverUpstreamClient {
     }
 }
 
-impl RoutingUpstreamClient {
-    pub fn new(providers: Vec<RoutingUpstreamProvider>) -> Self {
-        Self::with_routes(providers, Vec::new(), Vec::new())
-    }
-
-    /// Construct with ad-hoc model routes (G7). `route_providers` are the
-    /// synthetic upstreams; `routes` map request-model names/globs to them and
-    /// must reference valid `route_provider_index` values.
-    pub fn with_routes(
-        providers: Vec<RoutingUpstreamProvider>,
-        route_providers: Vec<RouteUpstreamProvider>,
-        routes: Vec<ModelRouteSpec>,
-    ) -> Self {
-        Self {
-            providers,
-            route_providers,
-            routes,
-            catalog: Arc::new(AsyncMutex::new(None)),
-            catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
-        }
-    }
-
-    /// Look up a synthetic route provider by index, mapping an out-of-range
-    /// index (a wiring bug) to an internal error rather than a panic.
-    fn route_provider(&self, index: usize) -> AppResult<&RouteUpstreamProvider> {
-        self.route_providers
-            .get(index)
-            .ok_or_else(|| AppError::internal("resolved route provider index was out of range"))
-    }
-
-    /// Clone the request and apply the resolved upstream-model rewrite, logging
-    /// once when the model actually changes. Shared by catalog and route
-    /// dispatch so both honor the same rewrite + log behavior. The wrapper's
-    /// `client_chat_template_kwargs` is preserved across the rewrite.
-    fn routed_request(
-        &self,
-        backend: &BackendChatRequest,
-        model_id: &str,
-        provider_name: &str,
-        kind: MatchKind,
-    ) -> BackendChatRequest {
-        let mut routed_request = backend.request.clone();
-        if routed_request.model != model_id {
-            log_model_resolution(&routed_request.model, model_id, provider_name, kind);
-            routed_request.model = model_id.to_string();
-        }
-        BackendChatRequest {
-            request: routed_request,
-            client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
-            thinking_override: backend.thinking_override,
-            // D2: carry the flow identity + shared serving token forward (clone the
-            // `Arc`, not the token).
-            response_id: backend.response_id.clone(),
-            serving: backend.serving.clone(),
-            // F1d: carry the turn-capture handle forward too (same reasoning as the
-            // failover rebuild above, `request_for_provider`).
-            capture: backend.capture.clone(),
-        }
-    }
-
-    async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
-        let mut cache = self.catalog.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
-        {
-            return Ok(cached.catalog.clone());
-        }
-        let catalog = self.refresh_catalog().await?;
-        *cache = Some(CachedRoutingModelCatalog {
-            fetched_at: Instant::now(),
-            catalog: catalog.clone(),
-        });
-        Ok(catalog)
-    }
-
-    async fn refresh_catalog(&self) -> AppResult<RoutingModelCatalog> {
-        let mut provider_catalogs = Vec::with_capacity(self.providers.len());
-        let mut union_entries = Vec::new();
-        let mut union_ids = Vec::new();
-        let mut union_context_limit_by_id: HashMap<String, i64> = HashMap::new();
-        let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
-        let mut seen_union_ids = HashSet::new();
-        let mut last_error = None;
-
-        for (provider_index, provider) in self.providers.iter().enumerate() {
-            let entries = match primary_provider_model_entries(provider).await {
-                Ok(entries) => entries,
-                Err(err) => {
-                    tracing::warn!(
-                        provider = %provider.name,
-                        error = %err,
-                        "failed to load upstream model catalog"
-                    );
-                    last_error = Some(err);
-                    Vec::new()
-                }
-            };
-
-            let mut provider_candidates = Vec::new();
-            let mut provider_context_limits: HashMap<String, i64> = HashMap::new();
-            for entry in entries {
-                let Some((model_id, entry)) = normalized_model_entry(entry) else {
-                    continue;
-                };
-                register_routing_model(
-                    provider_index,
-                    model_id,
-                    entry,
-                    RoutingModelTarget::Primary,
-                    &mut provider_candidates,
-                    &mut provider_context_limits,
-                    &mut union_entries,
-                    &mut union_ids,
-                    &mut union_context_limit_by_id,
-                    &mut ids_by_key,
-                    &mut seen_union_ids,
-                );
-            }
-            for model in &provider.fallback_exposed_models {
-                register_routing_model(
-                    provider_index,
-                    model.model_id.clone(),
-                    single_model_entry(&model.model_id),
-                    RoutingModelTarget::Fallback {
-                        failover_provider_index: model.failover_provider_index,
-                    },
-                    &mut provider_candidates,
-                    &mut provider_context_limits,
-                    &mut union_entries,
-                    &mut union_ids,
-                    &mut union_context_limit_by_id,
-                    &mut ids_by_key,
-                    &mut seen_union_ids,
-                );
-            }
-            provider_catalogs.push(RoutingProviderModelCatalog {
-                candidates: provider_candidates,
-                context_limit_by_id: provider_context_limits,
-            });
-        }
-
-        // With ad-hoc routes (G7), an empty union is still a usable catalog:
-        // routes resolve by name without a live model listing. Only error when
-        // there are neither catalog models nor routes to dispatch to.
-        if union_ids.is_empty() && self.routes.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                AppError::upstream("no models are currently available from configured upstreams")
-            }));
-        }
-
-        // D4: publish the catalog metadata as a SINGLE immutable `Arc<CatalogMeta>`
-        // swap. We still hold the `catalog` `AsyncMutex` (the caller `load_catalog`
-        // owns it for this whole refresh), so the swap is serialized with the
-        // catalog write — a lock-free `provider_health()` reader sees the
-        // `(fetched_ms, size)` pair move together, never torn. `fetched_ms` is the
-        // refresh wall-clock; `size` is the union model count.
-        let meta = Arc::new(CatalogMeta {
-            fetched_ms: Some(now_epoch_ms()),
-            size: Some(union_ids.len() as u64),
-        });
-        *self
-            .catalog_meta
-            .lock()
-            .expect("routing catalog meta lock poisoned") = meta;
-
-        Ok(RoutingModelCatalog {
-            provider_catalogs,
-            union_entries,
-            union_ids,
-            union_context_limit_by_id,
-            ids_by_key,
-            routes: self.routes.clone(),
-        })
-    }
-}
-
-impl RoutingModelCatalog {
-    /// Resolve a request model to a dispatch target. Precedence (G7):
-    /// 1. exact catalog model id (an exact id always wins),
-    /// 2. exact ad-hoc route name,
-    /// 3. glob ad-hoc route name (first match wins on overlap),
-    /// 4. unique canonical-key catalog match,
-    /// 5. default (first model of the first non-empty provider catalog).
-    ///
-    /// Routes therefore slot strictly between an exact id and the
-    /// canonical/default fallbacks; a glob never overrides an exact match.
-    fn resolve(&self, requested_model: &str) -> Option<(RoutingResolution, MatchKind)> {
-        let trimmed = requested_model.trim();
-        if !trimmed.is_empty() {
-            // 1. Exact catalog model id.
-            for (provider_index, provider) in self.provider_catalogs.iter().enumerate() {
-                if let Some(candidate) = provider
-                    .candidates
-                    .iter()
-                    .find(|candidate| candidate.model_id == trimmed)
-                {
-                    debug_assert_eq!(candidate.provider_index, provider_index);
-                    return Some((
-                        RoutingResolution::Catalog(candidate.clone()),
-                        MatchKind::ExactId,
-                    ));
-                }
-            }
-
-            // 2. Exact ad-hoc route name (case-insensitive), then 3. glob route.
-            if let Some(route) = self.match_route(trimmed) {
-                return Some((
-                    RoutingResolution::Route {
-                        route_provider_index: route.route_provider_index,
-                        model_id: route
-                            .upstream_model
-                            .clone()
-                            .unwrap_or_else(|| trimmed.to_string()),
-                    },
-                    MatchKind::Route,
-                ));
-            }
-
-            // 4. Unique canonical-key catalog match.
-            let key = canonical_model_key(trimmed);
-            if let Some(candidates) = self.ids_by_key.get(&key)
-                && let Some(model_id) = unique_candidate_model_id(candidates)
-            {
-                return candidates
-                    .iter()
-                    .find(|candidate| candidate.model_id == model_id)
-                    .cloned()
-                    .map(|candidate| {
-                        (
-                            RoutingResolution::Catalog(candidate),
-                            MatchKind::CanonicalKey,
-                        )
-                    });
-            }
-        }
-
-        // 5. Default catalog candidate.
-        self.default_candidate()
-            .map(|candidate| (RoutingResolution::Catalog(candidate), MatchKind::Default))
-    }
-
-    /// Match a request model against ad-hoc routes: an exact name (case
-    /// insensitive) beats any glob; among globs the first declared wins.
-    fn match_route(&self, requested_model: &str) -> Option<&ModelRouteSpec> {
-        if let Some(route) = self
-            .routes
-            .iter()
-            .find(|route| route.glob.is_none() && route.name.eq_ignore_ascii_case(requested_model))
-        {
-            return Some(route);
-        }
-        self.routes.iter().find(|route| {
-            route
-                .glob
-                .as_ref()
-                .is_some_and(|glob| glob.is_match(requested_model))
-        })
-    }
-
-    fn default_candidate(&self) -> Option<RoutingModelCandidate> {
-        self.provider_catalogs
-            .iter()
-            .enumerate()
-            .find_map(|(provider_index, provider)| {
-                provider.candidates.first().map(|candidate| {
-                    debug_assert_eq!(candidate.provider_index, provider_index);
-                    candidate.clone()
-                })
-            })
-    }
-
-    fn union_body(&self) -> Value {
-        serde_json::json!({
-            "object": "list",
-            "data": self.union_entries,
-        })
-    }
-}
-
-/// Log a request-model rewrite at a level reflecting WHY it happened. A
-/// `Default` match means the requested model was not served by any upstream —
-/// the operator likely loaded a different model than clients ask for, so it goes
-/// to WARN. Expected normalizations (canonical-key) and ad-hoc routes stay at
-/// INFO. Callers invoke this only when the model actually changed.
-fn log_model_resolution(requested: &str, resolved: &str, provider: &str, kind: MatchKind) {
-    if requested == resolved {
-        return;
-    }
-    if kind == MatchKind::Default {
-        tracing::warn!(
-            requested_model = %requested,
-            routed_model = %resolved,
-            provider = %provider,
-            "requested model is not served by any configured upstream; falling back to the default catalog model"
-        );
-    } else {
-        tracing::info!(
-            requested_model = %requested,
-            routed_model = %resolved,
-            provider = %provider,
-            "routed request model to upstream catalog model"
-        );
-    }
-}
-
-fn unique_candidate_model_id(candidates: &[RoutingModelCandidate]) -> Option<String> {
-    let mut unique = candidates
-        .iter()
-        .map(|candidate| candidate.model_id.as_str())
-        .collect::<HashSet<_>>();
-    if unique.len() == 1 {
-        unique.drain().next().map(ToString::to_string)
-    } else {
-        None
-    }
-}
-
-async fn primary_provider_model_entries(
-    provider: &RoutingUpstreamProvider,
-) -> AppResult<Vec<Value>> {
-    let Some(model) = provider.primary_upstream_model.as_deref() else {
-        let response = provider.primary_client.list_models().await?;
-        let (_, body, _) = collect_models_response(response).await?;
-        return Ok(model_entries_from_body(&body));
-    };
-
-    match provider.primary_client.list_models().await {
-        Ok(response) => {
-            let (_, body, _) = collect_models_response(response).await?;
-            Ok(filter_model_entries(&model_entries_from_body(&body), model))
-        }
-        Err(err) => {
-            tracing::warn!(
-                provider = %provider.name,
-                model,
-                error = %err,
-                "failed to load model metadata for configured upstream model; using synthetic entry"
-            );
-            Ok(vec![single_model_entry(model)])
-        }
-    }
-}
-
-fn normalized_model_entry(entry: Value) -> Option<(String, Value)> {
-    match entry {
-        Value::String(id) => Some((id.clone(), single_model_entry(&id))),
-        Value::Object(map) => {
-            let id = map.get("id").and_then(Value::as_str)?.to_string();
-            Some((id, Value::Object(map)))
-        }
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn register_routing_model(
-    provider_index: usize,
-    model_id: String,
-    entry: Value,
-    target: RoutingModelTarget,
-    provider_candidates: &mut Vec<RoutingModelCandidate>,
-    context_limit_by_id: &mut HashMap<String, i64>,
-    union_entries: &mut Vec<Value>,
-    union_ids: &mut Vec<String>,
-    union_context_limit_by_id: &mut HashMap<String, i64>,
-    ids_by_key: &mut HashMap<String, Vec<RoutingModelCandidate>>,
-    seen_union_ids: &mut HashSet<String>,
-) {
-    let key = canonical_model_key(&model_id);
-    if key.is_empty() {
-        return;
-    }
-    let candidate = RoutingModelCandidate {
-        provider_index,
-        model_id: model_id.clone(),
-        target,
-    };
-    if !provider_candidates
-        .iter()
-        .any(|candidate| candidate.model_id == model_id)
-    {
-        provider_candidates.push(candidate.clone());
-    }
-    // Preserve the per-provider context limit for G3 budgeting (T9). Synthetic
-    // bare-string entries (no object body) carry no limit ⇒ None.
-    if let Value::Object(map) = &entry
-        && let Some(limit) = entry_context_limit(map)
-    {
-        context_limit_by_id.insert(model_id.clone(), limit);
-    }
-    ids_by_key.entry(key).or_default().push(candidate);
-    if seen_union_ids.insert(model_id.clone()) {
-        // Capture the first-seen entry's context limit alongside the union id,
-        // so the union catalog is parsed once here instead of being reparsed
-        // from `union_entries` in `supported_model_catalog`. Reads the SAME
-        // `entry_context_limit` over the SAME first-seen entry.
-        if let Value::Object(map) = &entry
-            && let Some(limit) = entry_context_limit(map)
-        {
-            union_context_limit_by_id.insert(model_id.clone(), limit);
-        }
-        union_ids.push(model_id);
-        union_entries.push(entry);
-    }
-}
-
 #[async_trait]
 impl UpstreamClient for FailoverUpstreamClient {
     async fn stream_chat_completion(
@@ -2792,7 +1961,7 @@ impl UpstreamClient for FailoverUpstreamClient {
             return Err(self.cooldown_error());
         }
         self.stream_chat_completion_with_provider_indices(
-            provider_indices,
+            self.static_generation_chain(provider_indices, &backend.request.model),
             backend,
             request_timeout,
         )
@@ -2804,8 +1973,11 @@ impl UpstreamClient for FailoverUpstreamClient {
         if provider_indices.is_empty() {
             return Ok(None);
         }
-        self.count_tokens_with_provider_indices(provider_indices, backend)
-            .await
+        self.count_tokens_with_provider_indices(
+            self.static_generation_chain(provider_indices, &backend.request.model),
+            backend,
+        )
+        .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -2839,19 +2011,22 @@ impl UpstreamClient for FailoverUpstreamClient {
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(provider_indices, headers, body)
-            .await
+        self.proxy_completions_with_provider_indices(
+            self.static_proxy_chain(provider_indices),
+            headers,
+            body,
+        )
+        .await
     }
 
     /// Typed plan: a failover chain's candidate set is each provider's
     /// effective model — its `upstream_model` rewrite (matching
     /// `request_for_provider`) or the request model when it sends through
-    /// unchanged (G4 round-2 #1). We enumerate ALL providers (not just
-    /// currently-available ones): cooldown is transient, so a fallback that is
-    /// non-native must still force strip+offload. Context limits are `None`
-    /// (a failover chain does not load per-provider `/v1/models` catalogs, so
-    /// G3 budgeting no-ops — matching pre-T9 behavior). `candidate_backend_models`
-    /// (trait default) projects from this.
+    /// unchanged. We enumerate ALL providers (not just currently-available
+    /// ones) because cooldown is transient, so any of them may serve
+    /// pre-first-chunk. Context limits are `None` (a failover chain does not
+    /// load per-provider `/v1/models` catalogs, so G3 budgeting no-ops -
+    /// matching pre-T9 behavior).
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let candidates = self
             .providers
@@ -2875,8 +2050,175 @@ impl UpstreamClient for FailoverUpstreamClient {
     }
 }
 
+/// Trimmed, ASCII-case-insensitive upstream name, matching `Config::upstream_by_name`
+/// so a profile's upstream reference resolves to a provider regardless of case.
+fn normalize_upstream_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// Profile-driven routing client. Resolves each request model to a model profile
+/// (`Config::resolve_route`) and dispatches over that profile's failover chain -
+/// the primary named upstream plus its declared fallbacks. Every profile shares
+/// ONE `FailoverUpstreamProvider` per named upstream, so cooldown is keyed by
+/// upstream name and observed across all profiles that route to it.
+pub struct ProfileRoutingClient {
+    config: Arc<crate::config::Config>,
+    /// One provider per `config.upstreams` entry (index = position), wrapped in a
+    /// single failover client. Reusing the failover client keeps the shared
+    /// per-upstream cooldown state and the `*_with_provider_indices` dispatch
+    /// unchanged; the profile chain rides on the per-step model.
+    failover: FailoverUpstreamClient,
+    /// Normalized upstream name -> provider index, resolving a profile's
+    /// primary/fallback upstream references to a chain step.
+    by_name: HashMap<String, usize>,
+    /// Cached per-provider `/v1/models` snapshot: per-provider context limits for
+    /// pre-flight budgeting plus the union catalog for metadata consumers.
+    /// TTL-refreshed like the routing client's catalog.
+    catalog: Arc<AsyncMutex<Option<CachedProfileModelCatalog>>>,
+}
+
+#[derive(Clone)]
+struct ProfileModelCatalog {
+    /// Per provider index: model id -> reported context-window length.
+    provider_context_limits: Vec<HashMap<String, i64>>,
+    /// Union of every provider's catalog entries (first-seen id wins), for the
+    /// metadata `supported_model_catalog` consumers.
+    union: Vec<UpstreamModelEntry>,
+}
+
+struct CachedProfileModelCatalog {
+    fetched_at: Instant,
+    catalog: ProfileModelCatalog,
+}
+
+impl ProfileRoutingClient {
+    pub fn new(
+        config: Arc<crate::config::Config>,
+        providers: Vec<FailoverUpstreamProvider>,
+    ) -> Self {
+        let by_name = providers
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (normalize_upstream_name(&provider.name), index))
+            .collect();
+        let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
+        Self {
+            config,
+            failover: FailoverUpstreamClient::new(providers, cooldown),
+            by_name,
+            catalog: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    /// Resolve `request_model` to its profile's failover chain: the primary step
+    /// (served model) followed by one step per declared fallback (the entry's
+    /// model override, else the served model). `AppError::not_found` when no
+    /// profile matches, so an unserved model surfaces a clean 404.
+    fn chain_for(&self, request_model: &str) -> AppResult<Vec<ChainStep>> {
+        let route = self.config.resolve_route(request_model).ok_or_else(|| {
+            AppError::not_found(format!(
+                "model {request_model:?} is not served by any configured model profile"
+            ))
+        })?;
+        let mut chain = Vec::with_capacity(1 + route.profile.fallbacks.len());
+        chain.push(ChainStep {
+            provider: self.provider_index(&route.profile.upstream)?,
+            model: route.served_model.clone(),
+        });
+        for fallback in &route.profile.fallbacks {
+            chain.push(ChainStep {
+                provider: self.provider_index(&fallback.upstream)?,
+                model: fallback
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| route.served_model.clone()),
+            });
+        }
+        Ok(chain)
+    }
+
+    fn provider_index(&self, upstream_name: &str) -> AppResult<usize> {
+        self.by_name
+            .get(&normalize_upstream_name(upstream_name))
+            .copied()
+            .ok_or_else(|| {
+                AppError::internal(format!(
+                    "model profile references unknown upstream {upstream_name:?}"
+                ))
+            })
+    }
+
+    /// Drop chain steps whose provider is currently cooling, so a shared upstream
+    /// already in cooldown (from another profile's failure) is skipped rather than
+    /// re-contacted.
+    fn available_chain(&self, chain: Vec<ChainStep>) -> Vec<ChainStep> {
+        chain
+            .into_iter()
+            .filter(|step| self.failover.provider_is_available(step.provider))
+            .collect()
+    }
+
+    async fn load_catalog(&self) -> AppResult<ProfileModelCatalog> {
+        let mut cache = self.catalog.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+        {
+            return Ok(cached.catalog.clone());
+        }
+        let catalog = self.refresh_catalog().await?;
+        *cache = Some(CachedProfileModelCatalog {
+            fetched_at: Instant::now(),
+            catalog: catalog.clone(),
+        });
+        Ok(catalog)
+    }
+
+    async fn refresh_catalog(&self) -> AppResult<ProfileModelCatalog> {
+        let mut provider_context_limits = Vec::with_capacity(self.failover.providers.len());
+        let mut union: Vec<UpstreamModelEntry> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut last_error = None;
+        for provider in &self.failover.providers {
+            let entries = match provider.client.supported_model_catalog().await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        error = %err,
+                        "failed to load upstream model catalog"
+                    );
+                    last_error = Some(err);
+                    Vec::new()
+                }
+            };
+            let mut limits = HashMap::new();
+            for entry in entries {
+                if let Some(limit) = entry.context_limit {
+                    limits.insert(entry.id.clone(), limit);
+                }
+                if seen.insert(entry.id.clone()) {
+                    union.push(entry);
+                }
+            }
+            provider_context_limits.push(limits);
+        }
+        // Best-effort union: some providers may have failed. Only propagate an
+        // error when nothing at all loaded, so a single unreachable upstream does
+        // not blank the catalog.
+        if union.is_empty()
+            && let Some(err) = last_error
+        {
+            return Err(err);
+        }
+        Ok(ProfileModelCatalog {
+            provider_context_limits,
+            union,
+        })
+    }
+}
+
 #[async_trait]
-impl UpstreamClient for RoutingUpstreamClient {
+impl UpstreamClient for ProfileRoutingClient {
     async fn stream_chat_completion(
         &self,
         backend: &BackendChatRequest,
@@ -2885,253 +2227,41 @@ impl UpstreamClient for RoutingUpstreamClient {
             .await
     }
 
-    /// Typed backend-candidate plan using the SAME route/catalog resolution as
-    /// `stream_chat_completion` (G4 review #2 + round-2 #1). Each candidate
-    /// carries its per-provider context limit for G3 budgeting (T9); the
-    /// `genuine` signal is engine-side (see `BackendCandidatePlan`).
-    ///
-    /// A route resolves to one backend model (route providers are synthetic
-    /// single-model upstreams with no `/v1/models` context window ⇒ `None`).
-    /// A catalog match dispatches to a routing provider: the PRIMARY target may
-    /// fail over across that provider's whole nested failover chain (so all of
-    /// its candidate models count), while a fallback/exposed-alias target serves
-    /// only that single provider's model. Per-provider context limits come from
-    /// the routing catalog's `context_limit_by_id` (populated from the SAME
-    /// `/v1/models` snapshot as the candidate ids); nested-failover models not
-    /// in this provider's catalog carry `None` (G3 no-ops for them, same as
-    /// pre-T9). A catalog-load failure or empty catalog yields an empty candidate
-    /// set, which the safe invariant treats as "unknown → strip+offload" and
-    /// budgeting treats as no-op.
-    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
-        let Ok(catalog) = self.load_catalog().await else {
-            return BackendCandidatePlan {
-                candidates: Vec::new(),
-            };
-        };
-        let Some((resolution, _kind)) = catalog.resolve(requested_model) else {
-            return BackendCandidatePlan {
-                candidates: Vec::new(),
-            };
-        };
-        let candidates = match resolution {
-            RoutingResolution::Route { model_id, .. } => vec![BackendCandidate {
-                model: model_id,
-                context_limit: None,
-            }],
-            RoutingResolution::Catalog(candidate) => {
-                let Some(provider) = self.providers.get(candidate.provider_index) else {
-                    return BackendCandidatePlan {
-                        candidates: Vec::new(),
-                    };
-                };
-                // Per-provider context limits come from the SELECTED routing
-                // provider's primary `/v1/models` snapshot. They are keyed by
-                // the primary's OWN model ids, so the limit is authoritative
-                // ONLY for the primary's own model (`candidate.model_id`).
-                // Nested-failover / exposed-fallback models are served by OTHER
-                // upstreams whose `/v1/models` is not loaded here; looking them
-                // up in the primary's map could borrow the WRONG window when an
-                // id coincidentally matches, so they carry `None` (G3 no-ops for
-                // them — T9 R2 HIGH fix).
-                let primary_limits =
-                    &catalog.provider_catalogs[candidate.provider_index].context_limit_by_id;
-                let primary_limit = primary_limits.get(&candidate.model_id).copied();
-                match candidate.target {
-                    // Primary: the whole nested failover chain may serve. Only
-                    // Primary: the whole nested failover chain may serve. Only
-                    // the chain's FIRST candidate (index 0 — the selected
-                    // provider's own model, whose `/v1/models` snapshot populates
-                    // `primary_limits`) carries `primary_limit`. All later chain
-                    // candidates are nested-failover models served by OTHER
-                    // upstreams whose `/v1/models` is not loaded here ⇒ `None`
-                    // (G3 no-ops for them — never borrow the primary's window for
-                    // a different provider, even if the model id matches). This
-                    // is provider-identity scoping, not model-string scoping
-                    // (T9 R3 HIGH fix).
-                    RoutingModelTarget::Primary => provider
-                        .client
-                        .candidate_backend_models(&candidate.model_id)
-                        .await
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, model)| BackendCandidate {
-                            context_limit: (index == 0).then_some(primary_limit).flatten(),
-                            model,
-                        })
-                        .collect(),
-                    // Fallback/exposed-alias: served by a nested failover
-                    // provider whose own `/v1/models` is not loaded here ⇒ None
-                    // (G3 no-ops; the failover provider's window is unknown at
-                    // this layer, so no false cap / no wrong-window borrow).
-                    RoutingModelTarget::Fallback {
-                        failover_provider_index,
-                    } => {
-                        let model = provider
-                            .failover_provider_model(failover_provider_index)
-                            .unwrap_or_else(|| candidate.model_id.clone());
-                        vec![BackendCandidate {
-                            context_limit: None,
-                            model,
-                        }]
-                    }
-                }
-            }
-        };
-        BackendCandidatePlan { candidates }
-    }
-
-    /// D4: aggregate per-provider health across every routing provider's nested
-    /// failover chain (stamping `route = Some(provider_name)` + the published
-    /// catalog metadata) AND every synthetic route provider's chain. A catalog
-    /// provider's entries carry the routing `(fetched_ms, size)` meta (the union
-    /// snapshot that backs catalog resolution); the ad-hoc route providers carry
-    /// no catalog meta (they resolve by name, loading no `/v1/models`). Reads are
-    /// lock-free over the per-provider metrics + the `Arc<CatalogMeta>` swap, with
-    /// only short per-chain cooldown-state lock holds.
-    fn provider_health(&self) -> Vec<ProviderHealth> {
-        let catalog_meta = **self
-            .catalog_meta
-            .lock()
-            .expect("routing catalog meta lock poisoned");
-        let mut health = Vec::new();
-        for provider in &self.providers {
-            health.extend(
-                provider
-                    .client
-                    .provider_health_with_route(Some(&provider.name), catalog_meta),
-            );
-        }
-        for route_provider in &self.route_providers {
-            health.extend(
-                route_provider
-                    .client
-                    .provider_health_with_route(Some(&route_provider.name), CatalogMeta::default()),
-            );
-        }
-        health
-    }
-
     async fn stream_chat_completion_with_timeout(
         &self,
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let catalog = self.load_catalog().await.map_err(|err| {
-            tracing::warn!(
-                requested_model = %backend.request.model,
-                error = %err,
-                "failed to load upstream model catalog (is the backend reachable?)"
-            );
-            err
-        })?;
-        let (resolution, match_kind) = catalog.resolve(&backend.request.model).ok_or_else(|| {
-            tracing::warn!(
-                requested_model = %backend.request.model,
-                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
-            );
-            AppError::upstream("no models are currently available from configured upstreams")
-        })?;
-        if let RoutingResolution::Route {
-            route_provider_index,
-            model_id,
-        } = &resolution
-        {
-            let provider = self.route_provider(*route_provider_index)?;
-            let routed_request = self.routed_request(backend, model_id, &provider.name, match_kind);
-            // D2: this routing layer owns the `route` serving field — tag it with the
-            // selected route provider's name (the failover layer below owns `provider`).
-            if let Some(serving) = &routed_request.serving {
-                serving.set_route(provider.name.clone());
-            }
-            return provider
-                .client
-                .stream_chat_completion_with_timeout(&routed_request, request_timeout)
-                .await;
+        let chain = self.available_chain(self.chain_for(&backend.request.model)?);
+        if chain.is_empty() {
+            return Err(self.failover.cooldown_error());
         }
-        let RoutingResolution::Catalog(resolution) = resolution else {
-            unreachable!("route resolution handled above");
-        };
-        let provider = self
-            .providers
-            .get(resolution.provider_index)
-            .ok_or_else(|| {
-                AppError::internal("resolved upstream provider index was out of range")
-            })?;
-        let routed_request =
-            self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
-        // D2: tag the `route` serving field with the selected routing provider's
-        // name (first-writer-wins; the nested failover layer owns `provider`).
-        if let Some(serving) = &routed_request.serving {
-            serving.set_route(provider.name.clone());
-        }
-        match resolution.target {
-            RoutingModelTarget::Primary => {
-                provider
-                    .client
-                    .stream_chat_completion_with_timeout(&routed_request, request_timeout)
-                    .await
-            }
-            RoutingModelTarget::Fallback {
-                failover_provider_index,
-            } => {
-                provider
-                    .client
-                    .stream_chat_completion_with_timeout_from_provider(
-                        failover_provider_index,
-                        &routed_request,
-                        request_timeout,
-                    )
-                    .await
-            }
-        }
+        self.failover
+            .stream_chat_completion_with_provider_indices(chain, backend, request_timeout)
+            .await
     }
 
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
-        let catalog = match self.load_catalog().await {
-            Ok(catalog) => catalog,
-            Err(err) => {
-                tracing::debug!(error = %err, "cannot route token-count request without model catalog");
-                return Ok(None);
-            }
-        };
-        let Some((resolution, match_kind)) = catalog.resolve(&backend.request.model) else {
+        let Ok(chain) = self.chain_for(&backend.request.model) else {
             return Ok(None);
         };
-        if let RoutingResolution::Route {
-            route_provider_index,
-            model_id,
-        } = &resolution
-        {
-            let provider = self.route_provider(*route_provider_index)?;
-            let routed = self.routed_request(backend, model_id, &provider.name, match_kind);
-            return provider.client.count_tokens(&routed).await;
+        let chain = self.available_chain(chain);
+        if chain.is_empty() {
+            return Ok(None);
         }
-        let RoutingResolution::Catalog(resolution) = resolution else {
-            unreachable!("route resolution handled above");
-        };
-        let provider = self
-            .providers
-            .get(resolution.provider_index)
-            .ok_or_else(|| {
-                AppError::internal("resolved upstream provider index was out of range")
-            })?;
-        let routed = self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
-        match resolution.target {
-            RoutingModelTarget::Primary => provider.client.count_tokens(&routed).await,
-            RoutingModelTarget::Fallback {
-                failover_provider_index,
-            } => {
-                provider
-                    .client
-                    .count_tokens_from_provider(failover_provider_index, &routed)
-                    .await
-            }
-        }
+        self.failover
+            .count_tokens_with_provider_indices(chain, backend)
+            .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
-        let catalog = self.load_catalog().await?;
-        json_response(catalog.union_body())
+        // No caller: `/v1/models` is synthesized from the configured profiles
+        // and `supported_model_catalog` covers per-model context limits, so
+        // there is no single upstream response this method could honestly
+        // return. Kept only because the trait requires an implementation.
+        Err(AppError::internal(
+            "list_models is not supported on the profile routing client; use supported_model_catalog",
+        ))
     }
 
     async fn proxy_completions(
@@ -3139,69 +2269,64 @@ impl UpstreamClient for RoutingUpstreamClient {
         headers: HeaderMap,
         body: Bytes,
     ) -> AppResult<reqwest::Response> {
-        let catalog = self.load_catalog().await?;
         let requested_model = proxy_body_model(&body).unwrap_or_default();
-        let (resolution, match_kind) = catalog.resolve(&requested_model).ok_or_else(|| {
-            tracing::warn!(
-                requested_model = %requested_model,
-                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
-            );
-            AppError::upstream("no models are currently available from configured upstreams")
-        })?;
-        if let RoutingResolution::Route {
-            route_provider_index,
-            model_id,
-        } = &resolution
-        {
-            let provider = self.route_provider(*route_provider_index)?;
-            log_model_resolution(&requested_model, model_id, &provider.name, match_kind);
-            let body = proxy_body_with_model(body, model_id);
-            return provider.client.proxy_completions(headers, body).await;
+        let chain = self.available_chain(self.chain_for(&requested_model)?);
+        if chain.is_empty() {
+            return Err(self.failover.cooldown_error());
         }
-        let RoutingResolution::Catalog(resolution) = resolution else {
-            unreachable!("route resolution handled above");
-        };
-        let provider = self
-            .providers
-            .get(resolution.provider_index)
-            .ok_or_else(|| {
-                AppError::internal("resolved upstream provider index was out of range")
-            })?;
-        log_model_resolution(
-            &requested_model,
-            &resolution.model_id,
-            &provider.name,
-            match_kind,
-        );
-        let body = proxy_body_with_model(body, &resolution.model_id);
-        match resolution.target {
-            RoutingModelTarget::Primary => provider.client.proxy_completions(headers, body).await,
-            RoutingModelTarget::Fallback {
-                failover_provider_index,
-            } => {
-                provider
-                    .client
-                    .proxy_completions_from_provider(failover_provider_index, headers, body)
-                    .await
-            }
-        }
+        self.failover
+            .proxy_completions_with_provider_indices(chain, headers, body)
+            .await
     }
 
     async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
-        // Build from the cached union catalog directly (single snapshot) rather
-        // than re-serializing `union_body()` through the default `list_models()`
-        // path: the union ids are authoritative, and any context length is read
-        // from `union_context_limit_by_id`, parsed once at catalog refresh from
-        // the same first-seen entries.
-        let catalog = self.load_catalog().await?;
-        Ok(catalog
-            .union_ids
+        Ok(self.load_catalog().await?.union)
+    }
+
+    /// The resolved chain's steps, each with its step model plus that provider's
+    /// catalog context limit (provider-identity scoped, so a coincidental id
+    /// match across upstreams never borrows the wrong window). Preserves the
+    /// conservative-min budgeting the engine applies over the candidate set. An
+    /// unserved model yields an empty set (budgeting no-ops); a catalog-load
+    /// failure keeps the chain's models with unknown limits.
+    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
+        let Ok(chain) = self.chain_for(requested_model) else {
+            return BackendCandidatePlan {
+                candidates: Vec::new(),
+            };
+        };
+        let catalog = self.load_catalog().await.ok();
+        let candidates = chain
             .into_iter()
-            .map(|id| {
-                let context_limit = catalog.union_context_limit_by_id.get(&id).copied();
-                UpstreamModelEntry { id, context_limit }
+            .map(|step| BackendCandidate {
+                context_limit: catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.provider_context_limits.get(step.provider))
+                    .and_then(|limits| limits.get(&step.model).copied()),
+                model: step.model,
             })
-            .collect())
+            .collect();
+        BackendCandidatePlan { candidates }
+    }
+
+    /// Each named upstream reported as its own provider (no routing wrapper, so
+    /// no `route` stamp). Catalog metadata comes from whatever the shared
+    /// TTL cache last loaded (via `/v1/models` or a routed request) - a
+    /// `try_lock` so this stays synchronous and lock-free like the rest of
+    /// `provider_health`; the rare contended case just reports unfetched.
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        let catalog_meta = self
+            .catalog
+            .try_lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|cached| CatalogMeta {
+                    fetched_ms: Some(past_instant_to_epoch_ms(cached.fetched_at)),
+                    size: Some(cached.catalog.union.len() as u64),
+                })
+            })
+            .unwrap_or_default();
+        self.failover.provider_health_with_route(None, catalog_meta)
     }
 }
 
@@ -3264,17 +2389,64 @@ fn status_is_request_intrinsic_4xx(status: StatusCode) -> bool {
 /// engine no longer threads `template_family` / `upstream_chat_kwargs` down the
 /// wire DTO, and `ChatCompletionRequest` carries no `#[serde(skip)]` side-channel
 /// fields. The leaf is the single point that knows the FINAL `request.model`.
+/// A per-model leaf policy table: EXACT entries keyed by the effective backend
+/// model an exact profile serves, plus an ordered list of GLOB entries from
+/// glob-keyed profiles. Lookup mirrors `Config::resolve_route`'s precedence -
+/// an exact match wins, then the first matching glob in declaration order - so
+/// the leaf resolves the FINAL provider model the same way routing does.
+#[derive(Clone, Debug)]
+pub struct LeafPolicyMap<V> {
+    /// Keyed by effective backend model (`upstream_model` or the exact key).
+    pub exact: std::collections::BTreeMap<String, V>,
+    /// Compiled glob matcher + policy, in declaration order.
+    pub globs: Vec<(Regex, V)>,
+}
+
+impl<V> Default for LeafPolicyMap<V> {
+    fn default() -> Self {
+        Self {
+            exact: std::collections::BTreeMap::new(),
+            globs: Vec::new(),
+        }
+    }
+}
+
+impl<V> LeafPolicyMap<V> {
+    /// Resolve the policy for the FINAL provider `model`: an exact id (then a
+    /// canonical-key match - case/punctuation-insensitive - only when exactly
+    /// one exact entry shares that key, so an ambiguous pick is deterministic),
+    /// else the first glob whose pattern matches. `None` when nothing applies.
+    fn get(&self, model: &str) -> Option<&V> {
+        if let Some(policy) = self.exact.get(model) {
+            return Some(policy);
+        }
+        let key = canonical_model_key(model);
+        let mut matches = self
+            .exact
+            .iter()
+            .filter(|(name, _)| canonical_model_key(name) == key)
+            .map(|(_, policy)| policy);
+        if let (Some(policy), None) = (matches.next(), matches.next()) {
+            return Some(policy);
+        }
+        self.globs
+            .iter()
+            .find(|(glob, _)| glob.is_match(model))
+            .map(|(_, policy)| policy)
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct BackendFinalizationPolicies {
     /// Per-model reasoning-effort policy (`reasoning_effort_map` + default).
-    pub effort: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+    pub effort: Arc<LeafPolicyMap<crate::config::ReasoningEffortPolicy>>,
     /// Per-model `template_family` override (normalized `kimi`/`deepseek`).
-    pub template_family: Arc<std::collections::BTreeMap<String, String>>,
+    pub template_family: Arc<LeafPolicyMap<String>>,
     /// GLOBAL `template_family` fallback (normalized), applied when no per-model
     /// policy matches the FINAL model.
     pub global_template_family: Option<String>,
     /// Per-model extends-merged `upstream_chat_kwargs`.
-    pub upstream_chat_kwargs: Arc<std::collections::BTreeMap<String, JsonMap<String, Value>>>,
+    pub upstream_chat_kwargs: Arc<LeafPolicyMap<JsonMap<String, Value>>>,
     /// GLOBAL `upstream_chat_kwargs` (base layer), merged under the per-model
     /// policy at the leaf.
     pub global_upstream_chat_kwargs: Arc<JsonMap<String, Value>>,
@@ -3288,57 +2460,42 @@ impl BackendFinalizationPolicies {
     /// production leaf receives (T1).
     pub fn from_config(config: &crate::config::Config) -> Self {
         Self {
-            effort: Arc::new(config.reasoning_effort_policies()),
-            template_family: Arc::new(config.template_family_policies()),
+            effort: Arc::new(LeafPolicyMap {
+                exact: config.reasoning_effort_policies(),
+                globs: config.reasoning_effort_policy_globs(),
+            }),
+            template_family: Arc::new(LeafPolicyMap {
+                exact: config.template_family_policies(),
+                globs: config.template_family_policy_globs(),
+            }),
             global_template_family: config.global_template_family(),
-            upstream_chat_kwargs: Arc::new(config.upstream_chat_kwargs_policies()),
+            upstream_chat_kwargs: Arc::new(LeafPolicyMap {
+                exact: config.upstream_chat_kwargs_policies(),
+                globs: config.upstream_chat_kwargs_policy_globs(),
+            }),
             global_upstream_chat_kwargs: Arc::new(config.global_upstream_chat_kwargs().clone()),
         }
     }
 
     /// Resolve the `template_family` override for the FINAL provider `model`:
-    /// the per-model policy wins (exact then canonical-key match, mirroring
-    /// `Config::model_profile` / `reasoning_effort_fragment`), else the global
+    /// the per-model policy wins (exact/canonical then glob), else the global
     /// fallback. `None` means sniff the model id instead.
     fn resolve_family_override(&self, model: &str) -> Option<String> {
-        policy_for_model(&self.template_family, model)
+        self.template_family
+            .get(model)
             .cloned()
             .or_else(|| self.global_template_family.clone())
     }
 
     /// The extends-merged `upstream_chat_kwargs` for the FINAL provider `model`:
-    /// the per-model policy (exact then canonical-key match) layered over the
-    /// global base (per-model wins on conflict). Empty when neither applies.
+    /// the per-model policy (exact/canonical then glob) layered over the global
+    /// base (per-model wins on conflict). Empty when neither applies.
     fn resolve_chat_kwargs(&self, model: &str) -> JsonMap<String, Value> {
         let mut merged = (*self.global_upstream_chat_kwargs).clone();
-        if let Some(per_model) = policy_for_model(&self.upstream_chat_kwargs, model) {
+        if let Some(per_model) = self.upstream_chat_kwargs.get(model) {
             merge_json_maps(&mut merged, per_model);
         }
         merged
-    }
-}
-/// Look up a per-model policy in `map` for the FINAL provider `model` with the
-/// SAME semantics as `Config::model_profile` and `RoutingModelCatalog` model
-/// matching: exact (case-sensitive) id first, then a canonical-key match
-/// (case/punctuation-insensitive) ONLY when unambiguous (exactly one profile
-/// shares that canonical key — two would make the pick order-dependent). `None`
-/// when no policy applies. Keeps the leaf's per-model policy lookup consistent
-/// with how profiles are matched everywhere else (T1).
-fn policy_for_model<'a, V>(
-    map: &'a std::collections::BTreeMap<String, V>,
-    model: &str,
-) -> Option<&'a V> {
-    if let Some(policy) = map.get(model) {
-        return Some(policy);
-    }
-    let key = canonical_model_key(model);
-    let mut matches = map
-        .iter()
-        .filter(|(name, _)| canonical_model_key(name) == key)
-        .map(|(_, policy)| policy);
-    match (matches.next(), matches.next()) {
-        (Some(policy), None) => Some(policy),
-        _ => map.get("*"),
     }
 }
 
@@ -3721,12 +2878,12 @@ impl BackendChatRequest {
 /// inject the right knobs (G2). Mirrors claude-relay `backend.py`.
 ///
 /// Detection + injection live HERE, in the upstream client, rather than in the
-/// engine: routing/failover/exposed-alias paths rewrite the actual provider
-/// model AFTER the engine resolves its model (`request_for_provider` /
-/// `RoutingUpstreamClient::stream_chat_completion`). Sniffing the family from
-/// the engine's model would send e.g. Kimi kwargs to a DeepSeek fallback (or
-/// none to a Kimi fallback). The leaf is the single point that always sees the
-/// FINAL `request.model` with provider `upstream_chat_kwargs` already merged.
+/// engine: profile routing/failover paths rewrite the actual provider model
+/// AFTER the engine resolves its model (`request_for_provider`). Sniffing the
+/// family from the engine's model would send e.g. Kimi kwargs to a DeepSeek
+/// fallback (or none to a Kimi fallback). The leaf is the single point that
+/// always sees the FINAL `request.model` with provider `upstream_chat_kwargs`
+/// already merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelFamily {
     Kimi,
@@ -3797,7 +2954,7 @@ pub fn finalize_request_for_backend(
     //    its OWN kwargs, not the alias's.
     merge_chat_kwargs_gap_fill(request, &policies.resolve_chat_kwargs(&request.model));
     // 2. Reasoning effort: map (→ fragment, top-level cleared) or clamp.
-    let effort_policy = policy_for_model(&policies.effort, &request.model);
+    let effort_policy = policies.effort.get(&request.model);
     let fragment = reasoning_effort_fragment(
         &policies.effort,
         &request.model,
@@ -3859,7 +3016,9 @@ fn apply_profile_thinking_kwarg(
     let Some(enabled) = backend.thinking_override else {
         return;
     };
-    let reasoning_config = policy_for_model(&policies.effort, &backend.request.model)
+    let reasoning_config = policies
+        .effort
+        .get(&backend.request.model)
         .and_then(|policy| policy.upstream_reasoning.as_ref());
     let family_override = policies.resolve_family_override(&backend.request.model);
     let family = detect_model_family(&backend.request.model, family_override.as_deref());
@@ -3953,11 +3112,11 @@ fn clamp_reasoning_effort(effort: Option<&str>) -> Option<String> {
 /// (after defaulting) is not mapped. Lookup is exact, then canonical-key
 /// (case/punctuation-insensitive), mirroring catalog/profile model matching.
 fn reasoning_effort_fragment(
-    policies: &std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>,
+    policies: &LeafPolicyMap<crate::config::ReasoningEffortPolicy>,
     model: &str,
     raw_effort: Option<&str>,
 ) -> Option<Value> {
-    let policy = policy_for_model(policies, model)?;
+    let policy = policies.get(model)?;
     let level = raw_effort
         .map(str::trim)
         .filter(|level| !level.is_empty())
@@ -4179,13 +3338,6 @@ fn merge_json_value_preserve_destination(destination: &mut Value, source: &Value
                 }
             }
         }
-    }
-}
-
-fn proxy_body_for_provider(provider: &FailoverUpstreamProvider, body: &Bytes) -> Bytes {
-    match provider.upstream_model.as_deref() {
-        Some(model) => proxy_body_with_model(body.clone(), model),
-        None => body.clone(),
     }
 }
 
@@ -4739,17 +3891,6 @@ async fn filter_models_response(
     Ok(reqwest::Response::from(response))
 }
 
-fn json_response(body: Value) -> AppResult<reqwest::Response> {
-    let body = serde_json::to_string(&body)
-        .map_err(|err| AppError::internal(format!("failed to serialize JSON response: {err}")))?;
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|err| AppError::internal(format!("failed to build JSON response: {err}")))?;
-    Ok(reqwest::Response::from(response))
-}
-
 fn filter_models_body(body: Value, model: &str) -> Value {
     match body {
         Value::Object(mut map) => {
@@ -4938,8 +4079,8 @@ fn truncate_for_error(s: &str, max: usize) -> String {
 
 /// Redact image `data:`/signed URLs from an upstream RESPONSE error body, then
 /// truncate it for an `AppError`/log message (G4 round-9 #2). A provider that
-/// echoes a native-vision-passthrough / disabled-agent image request can mirror
-/// the submitted `data:` bytes or a signed image URL back in its 4xx/5xx body;
+/// echoes a native-vision passthrough image request can mirror the submitted
+/// `data:` bytes or a signed image URL back in its 4xx/5xx body;
 /// without this they would leak through `response.failed` and failover logs
 /// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
 /// URI cannot survive at the truncation boundary.
@@ -5093,29 +4234,31 @@ mod tests {
             .expect("chat_template_kwargs object")
     }
 
-    fn glm_effort_policies()
-    -> std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy> {
-        std::collections::BTreeMap::from([(
-            "GLM-5.2-NVFP4-MTP".to_string(),
-            crate::config::ReasoningEffortPolicy {
-                default: Some("max".to_string()),
-                upstream_reasoning: None,
-                map: std::collections::BTreeMap::from([
-                    (
-                        "high".to_string(),
-                        json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
-                    ),
-                    (
-                        "max".to_string(),
-                        json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
-                    ),
-                    (
-                        "none".to_string(),
-                        json!({"chat_template_kwargs": {"enable_thinking": false}}),
-                    ),
-                ]),
-            },
-        )])
+    fn glm_effort_policies() -> super::LeafPolicyMap<crate::config::ReasoningEffortPolicy> {
+        super::LeafPolicyMap {
+            exact: std::collections::BTreeMap::from([(
+                "GLM-5.2-NVFP4-MTP".to_string(),
+                crate::config::ReasoningEffortPolicy {
+                    default: Some("max".to_string()),
+                    upstream_reasoning: None,
+                    map: std::collections::BTreeMap::from([
+                        (
+                            "high".to_string(),
+                            json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                        ),
+                        (
+                            "max".to_string(),
+                            json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
+                        ),
+                        (
+                            "none".to_string(),
+                            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                        ),
+                    ]),
+                },
+            )]),
+            globs: Vec::new(),
+        }
     }
 
     /// Wrap a family-request with optional client kwargs into the leaf wrapper.
@@ -5146,12 +4289,13 @@ mod tests {
     /// Finalization policies carrying a per-model `template_family` override.
     fn family_policies(per_model: &[(&str, &str)]) -> BackendFinalizationPolicies {
         BackendFinalizationPolicies {
-            template_family: Arc::new(
-                per_model
+            template_family: Arc::new(super::LeafPolicyMap {
+                exact: per_model
                     .iter()
                     .map(|(m, f)| (m.to_string(), f.to_string()))
                     .collect(),
-            ),
+                globs: Vec::new(),
+            }),
             ..Default::default()
         }
     }
@@ -5198,8 +4342,8 @@ mod tests {
         // Ambiguous canonical match (two profiles, same canonical key, neither an
         // exact id match) -> no policy, deterministically.
         let mut ambiguous = glm_effort_policies();
-        let dup = ambiguous["GLM-5.2-NVFP4-MTP"].clone();
-        ambiguous.insert("glm5.2nvfp4mtp".to_string(), dup);
+        let dup = ambiguous.exact["GLM-5.2-NVFP4-MTP"].clone();
+        ambiguous.exact.insert("glm5.2nvfp4mtp".to_string(), dup);
         assert!(reasoning_effort_fragment(&ambiguous, "GLM!5.2!NVFP4!MTP", Some("high")).is_none());
     }
 
@@ -5441,12 +4585,12 @@ mod tests {
                 4096,
             ),
             Some("kimi-k2-instruct".to_string()),
-            None,
             provider_kwargs,
         );
         // Engine-level request still names a non-Kimi model; the provider remaps.
         let base = family_backend("glm-5.1", None);
-        let mut provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let mut provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
         assert_eq!(provider_request.request.model, "kimi-k2-instruct");
         // Leaf injects family from the FINAL (remapped) model.
         apply_family_chat_template_kwargs(&mut provider_request, &empty_policies());
@@ -5474,13 +4618,13 @@ mod tests {
                 4096,
             ),
             None,
-            None,
             provider_kwargs,
         );
         let mut base = family_backend("m", None);
         base.request.stop = Some(vec!["CLIENT".to_string()]);
 
-        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
 
         assert_eq!(
             provider_request.request.stop,
@@ -5511,7 +4655,6 @@ mod tests {
                 4096,
             ),
             None,
-            None,
             provider_kwargs,
         );
         let mut base = family_backend("m", None);
@@ -5519,7 +4662,8 @@ mod tests {
             .extra_body
             .insert("max_completion_tokens".to_string(), json!(256));
 
-        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
 
         assert!(
             !provider_request
@@ -6352,10 +5496,9 @@ mod tests {
             "p0",
             d2_leaf_client(),
             Some("upstream-model".to_string()),
-            None,
             JsonMap::new(),
         );
-        let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+        let rebuilt = FailoverUpstreamClient::request_for_provider_static(&provider, &backend);
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
@@ -6367,29 +5510,6 @@ mod tests {
         // original (same underlying token).
         reb.set_provider("p0");
         assert_eq!(orig.snapshot().1.as_deref(), Some("p0"));
-    }
-
-    #[test]
-    fn routing_rebuild_preserves_response_id_and_shares_serving_arc() {
-        // `routed_request` is the routing production rebuild. Same contract.
-        let routing = super::RoutingUpstreamClient::new(Vec::new());
-        let backend = d2_backend_with_identity("requested", "resp_routing");
-        let rebuilt = routing.routed_request(
-            &backend,
-            "served-model",
-            "prov-a",
-            super::MatchKind::ExactId,
-        );
-        assert_eq!(rebuilt.response_id.as_deref(), Some("resp_routing"));
-        assert_eq!(rebuilt.request.model, "served-model");
-        let orig = backend.serving.as_ref().expect("original token");
-        let reb = rebuilt.serving.as_ref().expect("rebuilt token");
-        assert!(
-            Arc::ptr_eq(orig, reb),
-            "routing rebuild must share the serving Arc"
-        );
-        reb.set_route("prov-a");
-        assert_eq!(orig.snapshot().0.as_deref(), Some("prov-a"));
     }
 
     #[test]
@@ -6415,9 +5535,9 @@ mod tests {
         // flows, each with its OWN token threaded through a failover rebuild — assert
         // no cross-flow bleed.
         let provider_a =
-            FailoverUpstreamProvider::new("vllm-a", d2_leaf_client(), None, None, JsonMap::new());
+            FailoverUpstreamProvider::new("vllm-a", d2_leaf_client(), None, JsonMap::new());
         let provider_b =
-            FailoverUpstreamProvider::new("sglang-b", d2_leaf_client(), None, None, JsonMap::new());
+            FailoverUpstreamProvider::new("sglang-b", d2_leaf_client(), None, JsonMap::new());
         let backend_a = d2_backend_with_identity("m", "resp_a");
         let backend_b = d2_backend_with_identity("m", "resp_b");
         let token_a = Arc::clone(backend_a.serving.as_ref().unwrap());
@@ -6435,7 +5555,8 @@ mod tests {
             std::thread::spawn(move || {
                 // The routing layer tags route on the rebuilt request's token; the
                 // failover layer tags provider on first-chunk success.
-                let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+                let rebuilt =
+                    FailoverUpstreamClient::request_for_provider_static(&provider, &backend);
                 rebuilt.serving.as_ref().unwrap().set_route(route);
                 rebuilt
                     .serving
@@ -7052,14 +6173,12 @@ mod tests {
                     "primary",
                     d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
                     Some("model-a".to_string()),
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
                     Some("model-b".to_string()),
-                    None,
                     JsonMap::new(),
                 ),
             ],
@@ -7085,9 +6204,8 @@ mod tests {
         );
     }
 
-    /// A leaf pointed at `server` that returns the SSE 200 success body; `bare`
-    /// marks it the direct engine upstream (D2 `into_bare_primary`).
-    async fn d2_ok_leaf(server: &MockServer, bare: bool) -> ReqwestUpstreamClient {
+    /// A leaf pointed at `server` that returns the SSE 200 success body.
+    async fn d2_ok_leaf(server: &MockServer) -> ReqwestUpstreamClient {
         Mock::given(wm_method("POST"))
             .and(wm_path("/v1/chat/completions"))
             .respond_with(
@@ -7097,7 +6215,7 @@ mod tests {
             )
             .mount(server)
             .await;
-        let leaf = ReqwestUpstreamClient::with_options(
+        ReqwestUpstreamClient::with_options(
             reqwest::Client::new(),
             format!("{}/v1/", server.uri()).parse().expect("url"),
             None,
@@ -7105,45 +6223,20 @@ mod tests {
             true,
             4096,
             1024 * 1024,
-        );
-        if bare { leaf.into_bare_primary() } else { leaf }
-    }
-
-    #[tokio::test]
-    async fn bare_leaf_tags_provider_primary() {
-        // When the leaf is the engine's upstream DIRECTLY (marked `into_bare_primary`),
-        // it synthesizes `provider = "primary"` so every flow carries a provider.
-        let server = MockServer::start().await;
-        let client = d2_ok_leaf(&server, true).await;
-        let token = Arc::new(super::ServingToken::default());
-        let backend =
-            BackendChatRequest::new(family_request("m"), None, None, Some(Arc::clone(&token)));
-        let mut stream = client
-            .stream_chat_completion(&backend)
-            .await
-            .expect("stream opens");
-        while stream.next().await.is_some() {}
-
-        assert_eq!(
-            token.snapshot().1.as_deref(),
-            Some("primary"),
-            "bare leaf path tags a synthetic `primary` provider"
-        );
+        )
     }
 
     #[tokio::test]
     async fn nested_failover_leaf_does_not_clobber_real_provider() {
-        // A leaf NESTED in a failover client must NOT tag `"primary"` — otherwise
-        // (first-writer-wins, and the leaf runs before the failover's first-chunk
-        // success) it would win over the REAL provider name. Drive the failover
+        // The failover layer owns the `provider` serving field; it is tagged with
+        // the real provider name on first-chunk success. Drive the failover
         // client end-to-end and assert the token carries the provider's name.
         let server = MockServer::start().await;
-        let leaf = d2_ok_leaf(&server, false).await; // NOT bare — it is wrapped
+        let leaf = d2_ok_leaf(&server).await;
         let failover = FailoverUpstreamClient::new(
             vec![FailoverUpstreamProvider::new(
                 "real-vllm",
                 leaf,
-                None,
                 None,
                 JsonMap::new(),
             )],
@@ -7211,7 +6304,6 @@ mod tests {
                 "real-vllm",
                 leaf,
                 Some("served-model".to_string()),
-                None,
                 JsonMap::new(),
             )],
             std::time::Duration::from_secs(0),
@@ -7515,113 +6607,6 @@ mod tests {
         );
     }
 
-    /// A real bare-leaf single success records EXACTLY ONE served attempt with a measured
-    /// wire `first_upstream_byte_ms` (the bare-leaf analogue of the prefetch point).
-    #[tokio::test]
-    async fn bare_leaf_single_success_records_one_served_attempt_with_first_byte() {
-        use crate::dashboard_flow::AttemptStatus;
-        let server = MockServer::start().await;
-        Mock::given(wm_method("POST"))
-            .and(wm_path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
-            .mount(&server)
-            .await;
-
-        let leaf = ReqwestUpstreamClient::with_options(
-            reqwest::Client::new(),
-            format!("{}/v1/", server.uri()).parse().expect("url"),
-            None,
-            None,
-            true,
-            4096,
-            1024 * 1024,
-        )
-        .into_bare_primary();
-
-        let token = Arc::new(super::ServingToken::default());
-        let backend = BackendChatRequest::new(
-            family_request("m"),
-            None,
-            Some("resp_bare".to_string()),
-            Some(Arc::clone(&token)),
-        );
-        let mut stream = leaf
-            .stream_chat_completion(&backend)
-            .await
-            .expect("stream opens");
-        // The served attempt's first byte is recorded WHEN the first chunk is consumed.
-        while stream.next().await.is_some() {}
-
-        let (attempts, first_byte) = token.attempts_snapshot();
-        assert_eq!(attempts.len(), 1, "bare leaf records exactly one attempt");
-        assert_eq!(attempts[0].status, AttemptStatus::Served);
-        assert_eq!(attempts[0].provider.as_deref(), Some("primary"));
-        assert!(
-            attempts[0].first_upstream_byte_ms.is_some(),
-            "served attempt measured a wire first-byte"
-        );
-        assert!(
-            attempts[0].error_class.is_none(),
-            "served attempt has no error_class"
-        );
-        assert_eq!(
-            first_byte, attempts[0].first_upstream_byte_ms,
-            "flow-level first byte is the served attempt's wire first-byte"
-        );
-    }
-
-    /// F1 (round-1 review): a bare-leaf HTTP-status FAILURE (non-2xx) records ONE failed
-    /// attempt that DOES carry a measured wire first-byte — the response HEADERS arrived
-    /// (that is what makes it an HTTP-status failure rather than a connect failure), so the
-    /// wire TTFB is real even though the request ultimately failed. The flow-level first
-    /// byte stays `None` (no attempt SERVED). Contrast `bare_leaf_connect_failure_*` below,
-    /// where headers never arrive and the byte time is `None`.
-    #[tokio::test]
-    async fn bare_leaf_http_status_failure_records_failed_attempt_with_measured_first_byte() {
-        use crate::dashboard_flow::AttemptErrorClass;
-        use crate::dashboard_flow::AttemptStatus;
-        let server = MockServer::start().await;
-        Mock::given(wm_method("POST"))
-            .and(wm_path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
-            .mount(&server)
-            .await;
-
-        let leaf = ReqwestUpstreamClient::with_options(
-            reqwest::Client::new(),
-            format!("{}/v1/", server.uri()).parse().expect("url"),
-            None,
-            None,
-            true,
-            4096,
-            1024 * 1024,
-        )
-        .into_bare_primary();
-
-        let token = Arc::new(super::ServingToken::default());
-        let backend = BackendChatRequest::new(
-            family_request("m"),
-            None,
-            Some("resp_bare_fail".to_string()),
-            Some(Arc::clone(&token)),
-        );
-        let result = leaf.stream_chat_completion(&backend).await;
-        assert!(result.is_err(), "503 dispatch fails");
-
-        let (attempts, first_byte) = token.attempts_snapshot();
-        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
-        assert_eq!(attempts[0].status, AttemptStatus::Failed);
-        assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::HttpStatus));
-        assert!(
-            attempts[0].first_upstream_byte_ms.is_some(),
-            "F1: an HTTP-status failure received response headers → measured wire first-byte"
-        );
-        assert!(
-            first_byte.is_none(),
-            "no served attempt → no flow-level first byte"
-        );
-    }
-
     /// Gap 05: with the upstream-response capture gate ARMED, a failing turn's upstream
     /// ERROR body is STAGED on the shared `ServingToken` (copied through the capped/redacting
     /// serializer) and lands on the live FlowStore record when the L1 guard commits it at
@@ -7652,7 +6637,6 @@ mod tests {
             4096,
             1024 * 1024,
         )
-        .into_bare_primary()
         .with_flow_store(store.clone());
 
         let token = Arc::new(super::ServingToken::default());
@@ -7710,7 +6694,6 @@ mod tests {
             4096,
             1024 * 1024,
         )
-        .into_bare_primary()
         .with_flow_store(store.clone());
 
         let token = Arc::new(super::ServingToken::default());
@@ -7766,21 +6749,18 @@ mod tests {
         let (api_call_id, response_id) = d2_open_linked_flow(&store);
 
         // Cooldown 0 so the failover loop tries provider A then B in one dispatch. The
-        // nested leaves are NOT `into_bare_primary` — the failover loop owns provider tagging
-        // (and the gap-05 serve-success clear).
+        // failover loop owns provider tagging (and the gap-05 serve-success clear).
         let failover = FailoverUpstreamClient::new(
             vec![
                 FailoverUpstreamProvider::new(
                     "primary",
                     d2_capturing_client(&down.uri(), store.clone()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&up.uri(), store.clone()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -7849,13 +6829,11 @@ mod tests {
                     "primary",
                     d2_capturing_client(&down_a.uri(), store.clone()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&down_b.uri(), store.clone()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -7926,13 +6904,11 @@ mod tests {
                     "primary",
                     d2_capturing_client(&down_a.uri(), store.clone()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client("http://127.0.0.1:1", store.clone()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -8008,13 +6984,11 @@ mod tests {
                     "primary",
                     d2_capturing_client(&down_a.uri(), store.clone()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&empty_b.uri(), store.clone()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -8043,55 +7017,6 @@ mod tests {
             record.upstream_response.is_none(),
             "round 2: a 200-but-no-first-chunk FINAL failure commits None, not the earlier \
              provider's stale 500 body"
-        );
-    }
-
-    /// F1 (round-1 review): a bare-leaf CONNECT failure (no upstream is listening, so
-    /// `send().await` errors BEFORE any response headers) records ONE failed attempt whose
-    /// wire first-byte is `None` — the slot is never stamped because the leaf never received
-    /// headers. This is the ONLY case F1 leaves `None` (don't-lie-with-zeros).
-    #[tokio::test]
-    async fn bare_leaf_connect_failure_records_failed_attempt_with_no_first_byte() {
-        use crate::dashboard_flow::AttemptErrorClass;
-        use crate::dashboard_flow::AttemptStatus;
-        // A reserved-but-closed port: the TCP connect is refused, so `send().await` fails
-        // before any HTTP response — a transport/connect error, not an HTTP status.
-        let leaf = ReqwestUpstreamClient::with_options(
-            reqwest::Client::new(),
-            "http://127.0.0.1:1/v1/".parse().expect("url"),
-            None,
-            None,
-            true,
-            4096,
-            1024 * 1024,
-        )
-        .into_bare_primary();
-
-        let token = Arc::new(super::ServingToken::default());
-        let backend = BackendChatRequest::new(
-            family_request("m"),
-            None,
-            Some("resp_bare_connect_fail".to_string()),
-            Some(Arc::clone(&token)),
-        );
-        let result = leaf.stream_chat_completion(&backend).await;
-        assert!(result.is_err(), "connect-refused dispatch fails");
-
-        let (attempts, first_byte) = token.attempts_snapshot();
-        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
-        assert_eq!(attempts[0].status, AttemptStatus::Failed);
-        assert_eq!(
-            attempts[0].error_class,
-            Some(AttemptErrorClass::Connect),
-            "a transport failure before any response is classified Connect"
-        );
-        assert!(
-            attempts[0].first_upstream_byte_ms.is_none(),
-            "F1: connect-before-response never received headers → no wire first-byte (None)"
-        );
-        assert!(
-            first_byte.is_none(),
-            "no served attempt → no flow-level first byte"
         );
     }
 
@@ -8125,13 +7050,11 @@ mod tests {
                     "primary",
                     d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -8213,13 +7136,11 @@ mod tests {
                     "primary",
                     d2_capturing_client("http://127.0.0.1:1", DashboardFlowStore::disabled()),
                     None,
-                    None,
                     JsonMap::new(),
                 ),
                 FailoverUpstreamProvider::new(
                     "backup",
                     d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
-                    None,
                     None,
                     JsonMap::new(),
                 ),
@@ -8305,7 +7226,6 @@ mod tests {
             vec![FailoverUpstreamProvider::new(
                 "primary",
                 d2_capturing_client(&server.uri(), DashboardFlowStore::disabled()),
-                None,
                 None,
                 JsonMap::new(),
             )],
@@ -8419,13 +7339,11 @@ mod tests {
                         "primary",
                         d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
                         None,
-                        None,
                         JsonMap::new(),
                     ),
                     FailoverUpstreamProvider::new(
                         "backup",
                         d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
-                        None,
                         None,
                         JsonMap::new(),
                     ),
@@ -8528,87 +7446,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod resolve_match_kind_tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// Single-provider catalog serving exactly `model`, with the canonical-key
-    /// index populated so rule-4 normalization is exercised too.
-    fn catalog_serving(model: &str) -> RoutingModelCatalog {
-        let candidate = RoutingModelCandidate {
-            provider_index: 0,
-            model_id: model.to_string(),
-            target: RoutingModelTarget::Primary,
-        };
-        let mut ids_by_key = HashMap::new();
-        ids_by_key.insert(canonical_model_key(model), vec![candidate.clone()]);
-        RoutingModelCatalog {
-            provider_catalogs: vec![RoutingProviderModelCatalog {
-                candidates: vec![candidate],
-                context_limit_by_id: HashMap::new(),
-            }],
-            union_entries: Vec::new(),
-            union_ids: vec![model.to_string()],
-            union_context_limit_by_id: HashMap::new(),
-            ids_by_key,
-            routes: Vec::new(),
-        }
-    }
-
-    fn resolved_id(resolution: &RoutingResolution) -> &str {
-        match resolution {
-            RoutingResolution::Catalog(candidate) => &candidate.model_id,
-            RoutingResolution::Route { model_id, .. } => model_id,
-        }
-    }
-
-    #[test]
-    fn exact_id_reports_exact_match() {
-        let (resolution, kind) = catalog_serving("served-model")
-            .resolve("served-model")
-            .expect("resolves");
-        assert_eq!(kind, MatchKind::ExactId);
-        assert_eq!(resolved_id(&resolution), "served-model");
-    }
-
-    #[test]
-    fn case_or_punctuation_variant_reports_canonical_key() {
-        // Not an exact id (case differs), so it must normalize via the canonical
-        // key rather than silently dropping to the default fallback.
-        let (resolution, kind) = catalog_serving("served-model")
-            .resolve("SERVED_MODEL")
-            .expect("resolves");
-        assert_eq!(kind, MatchKind::CanonicalKey);
-        assert_eq!(resolved_id(&resolution), "served-model");
-    }
-
-    #[test]
-    fn unknown_model_reports_default_fallback() {
-        // The claude-relay parity case: an incoming `claude-opus-*` name that the
-        // backend does not serve falls back to the first catalog model, tagged
-        // Default so the dispatch site logs a WARN.
-        let (resolution, kind) = catalog_serving("served-model")
-            .resolve("claude-opus-4")
-            .expect("falls back to default");
-        assert_eq!(kind, MatchKind::Default);
-        assert_eq!(resolved_id(&resolution), "served-model");
-    }
-
-    #[test]
-    fn empty_catalog_resolves_to_none() {
-        let empty = RoutingModelCatalog {
-            provider_catalogs: Vec::new(),
-            union_entries: Vec::new(),
-            union_ids: Vec::new(),
-            union_context_limit_by_id: HashMap::new(),
-            ids_by_key: HashMap::new(),
-            routes: Vec::new(),
-        };
-        assert!(empty.resolve("anything").is_none());
-    }
-}
-
-#[cfg(test)]
 mod d4_provider_health_tests {
     use super::*;
     use serde_json::json;
@@ -8628,7 +7465,7 @@ mod d4_provider_health_tests {
     }
 
     fn provider(name: &str, base: &str) -> FailoverUpstreamProvider {
-        FailoverUpstreamProvider::new(name, leaf(base), None, None, JsonMap::new())
+        FailoverUpstreamProvider::new(name, leaf(base), None, JsonMap::new())
     }
 
     /// FROZEN DTO contract (D9/D10/D12 validate this exact shape): every field
@@ -8796,47 +7633,6 @@ mod d4_provider_health_tests {
             "without a cooldown window, the threshold alone never forces Down"
         );
         assert_eq!(health[0].cooling_until_ms, None);
-    }
-
-    /// A routing client stamps `route = Some(provider_name)` on each entry and
-    /// reports the synthetic route providers too. (No catalog is loaded here, so
-    /// catalog meta stays `None` — exercised separately.)
-    #[test]
-    fn routing_provider_health_stamps_route() {
-        let routing_provider = RoutingUpstreamProvider::new(
-            "vllm-a",
-            leaf("https://a.invalid/v1"),
-            None,
-            JsonMap::new(),
-            Vec::new(),
-            Duration::from_secs(30),
-        );
-        let route_provider = RouteUpstreamProvider::new(
-            "route-claude",
-            leaf("https://r.invalid/v1"),
-            Duration::from_secs(30),
-        );
-        let client = RoutingUpstreamClient::with_routes(
-            vec![routing_provider],
-            vec![route_provider],
-            Vec::new(),
-        );
-        let health = client.provider_health();
-        // One catalog provider entry + one route provider entry.
-        assert_eq!(health.len(), 2);
-        let catalog_entry = health
-            .iter()
-            .find(|h| h.id == "vllm-a")
-            .expect("catalog provider");
-        assert_eq!(catalog_entry.route.as_deref(), Some("vllm-a"));
-        assert_eq!(catalog_entry.base_url, "https://a.invalid/v1");
-        assert_eq!(catalog_entry.catalog_fetched_ms, None);
-        assert_eq!(catalog_entry.catalog_size, None);
-        let route_entry = health
-            .iter()
-            .find(|h| h.id == "route-claude")
-            .expect("route provider");
-        assert_eq!(route_entry.route.as_deref(), Some("route-claude"));
     }
 
     /// No-torn-pair: concurrent `(fetched_ms, size)` swaps (each a SINGLE

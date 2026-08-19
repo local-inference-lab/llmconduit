@@ -1250,7 +1250,7 @@ fn finalize_is_noop_after_failure_event() {
 }
 
 // -- C1 conformance proof: a REAL converter run, checked against the harness
-// from Task 0B1 (`super::conformance`), not a hand-built event vector. --
+// (`super::conformance`), not a hand-built event vector. --
 
 #[test]
 fn real_converter_reasoning_text_stream_satisfies_ordering_invariants() {

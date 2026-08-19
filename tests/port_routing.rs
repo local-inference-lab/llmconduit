@@ -41,9 +41,24 @@ use futures::StreamExt;
 use llmconduit::adapters::chat_completions;
 use llmconduit::adapters::chat_completions::ChatCompletionStreamConverter;
 use llmconduit::adapters::chat_completions::ChatSseEvent;
+use llmconduit::config::CompiledProfile;
+use llmconduit::config::Config;
+use llmconduit::config::ModelProfile;
+use llmconduit::config::ProfileFallback;
 use llmconduit::models::chat::ChatCompletionRequest;
 use llmconduit::models::responses::ResponseItem;
+use llmconduit::upstream::BackendChatRequest;
+use llmconduit::upstream::FailoverUpstreamProvider;
+use llmconduit::upstream::ProfileRoutingClient;
+use llmconduit::upstream::ReqwestUpstreamClient;
+use llmconduit::upstream::UpstreamClient;
 use serde_json::json;
+use std::sync::Arc;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 /// Build a config whose configured upstream default sets temperature = 0.1.
 fn config_with_default_temperature() -> llmconduit::config::Config {
@@ -188,41 +203,6 @@ async fn template_family_override_forces_family_regardless_of_name() {
     assert_eq!(
         body["chat_template_kwargs"]["preserve_thinking"],
         json!(true)
-    );
-}
-
-/// The resolved model beats a stale configured `upstream_model`: a `kimi`
-/// `upstream_model` that the backend does NOT serve normalizes to the served
-/// DeepSeek model, and the DeepSeek contract (not Kimi) is injected — the
-/// concretely resolved model is authoritative (claude-relay lesson).
-#[tokio::test]
-async fn resolved_model_wins_over_stale_configured_upstream_model() {
-    let upstream = MockUpstream::default();
-    // Backend serves only deepseek-v3; a stale kimi-k2 upstream_model in config
-    // does not match, so normalization falls back to the served model.
-    upstream.set_supported_models(["deepseek-v3"]).await;
-    upstream
-        .push_response(vec![
-            Ok(content_chunk("chat-1", "hi")),
-            Ok(usage_chunk("chat-1", 5, 1, 6)),
-        ])
-        .await;
-    let mut config = test_config();
-    config.upstream_model = Some("kimi-k2".to_string());
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let request = base_request(vec![user_message("hello")]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let body = serde_json::to_value(&upstream.requests().await[0]).expect("serialize");
-    assert_eq!(
-        body["model"],
-        json!("deepseek-v3"),
-        "resolved to served model"
-    );
-    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
-    assert!(
-        body["chat_template_kwargs"].get("thinking").is_none(),
-        "DeepSeek contract must not carry the Kimi `thinking` key"
     );
 }
 
@@ -442,5 +422,305 @@ async fn chat_non_family_reasoning_surfaces_when_client_requested() {
         reasoning,
         vec!["secret thinking"],
         "client-requested reasoning must surface from a non-family backend"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Profile-driven routing (`ProfileRoutingClient`): each request model resolves
+// to a model profile whose failover chain is the primary named upstream plus
+// its declared fallbacks. Every profile shares one provider per named upstream,
+// so cooldown is keyed by upstream name and observed across profiles. These
+// tests build the client directly against wiremock upstreams (lib.rs wiring is a
+// later task) and inspect the POSTed body + per-upstream request counts.
+// ---------------------------------------------------------------------------
+
+/// A leaf client pointing at a wiremock upstream's `/v1/` root.
+fn profile_leaf(base_uri: &str) -> ReqwestUpstreamClient {
+    ReqwestUpstreamClient::new(
+        reqwest::Client::new(),
+        format!("{base_uri}/v1/").parse().expect("url"),
+        None,
+        None,
+        true,
+        4096,
+    )
+}
+
+/// A named-upstream provider (pure endpoint: no per-provider model rewrite; the
+/// profile chain supplies the model per step).
+fn named_provider(name: &str, base_uri: &str) -> FailoverUpstreamProvider {
+    FailoverUpstreamProvider::new(name, profile_leaf(base_uri), None, serde_json::Map::new())
+}
+
+/// An exact-key model profile routing to `upstream` with the given fallbacks.
+fn exact_profile(key: &str, upstream: &str, fallbacks: Vec<ProfileFallback>) -> CompiledProfile {
+    CompiledProfile {
+        key: key.to_string(),
+        glob: None,
+        profile: ModelProfile {
+            upstream: upstream.to_string(),
+            fallbacks,
+            ..Default::default()
+        },
+    }
+}
+
+/// A config whose only routing state is `profiles`, with a non-zero cooldown so a
+/// failed upstream stays cooling across the next profile's dispatch.
+fn profile_config(profiles: Vec<CompiledProfile>) -> Config {
+    let mut config = test_config();
+    config.model_profiles = profiles;
+    config.upstream_failure_cooldown_secs = 30;
+    config
+}
+
+fn backend_for(model: &str) -> BackendChatRequest {
+    BackendChatRequest::new(chat_request(model, None), None, None, None)
+}
+
+/// Mount a minimal successful chat-completions SSE stream (one content chunk).
+async fn mount_chat_ok(server: &MockServer) {
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(body, "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mount a failover-eligible 503 (fails pre-first-chunk, cools the provider).
+async fn mount_chat_503(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+        .mount(server)
+        .await;
+}
+
+/// Drain an upstream stream, asserting every chunk parses; returns the count.
+async fn drain_ok(stream: llmconduit::upstream::UpstreamStream) -> usize {
+    let mut stream = std::pin::pin!(stream);
+    let mut count = 0;
+    while let Some(item) = stream.next().await {
+        item.expect("upstream chunk parses");
+        count += 1;
+    }
+    count
+}
+
+async fn posted_model(server: &MockServer) -> String {
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1, "exactly one upstream request");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+    body["model"].as_str().expect("model field").to_string()
+}
+
+async fn request_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .len()
+}
+
+/// A profile routes its request model to the profile's primary upstream, posting
+/// the resolved served model.
+#[tokio::test]
+async fn profile_routes_request_to_its_upstream() {
+    let server = MockServer::start().await;
+    mount_chat_ok(&server).await;
+
+    let client = ProfileRoutingClient::new(
+        Arc::new(profile_config(vec![exact_profile(
+            "profile-a",
+            "primary",
+            vec![],
+        )])),
+        vec![named_provider("primary", &server.uri())],
+    );
+
+    let stream = client
+        .stream_chat_completion(&backend_for("profile-a"))
+        .await
+        .expect("primary upstream serves");
+    assert!(
+        drain_ok(stream).await >= 1,
+        "primary served at least one chunk"
+    );
+    assert_eq!(
+        posted_model(&server).await,
+        "profile-a",
+        "served model posted"
+    );
+}
+
+/// A pre-first-chunk primary failure fails over to the profile's fallback, and
+/// the fallback ENTRY's model rewrite is visible in the POSTed body.
+#[tokio::test]
+async fn fallback_fires_pre_first_chunk_with_entry_model_rewrite() {
+    let primary = MockServer::start().await;
+    mount_chat_503(&primary).await;
+    let fallback = MockServer::start().await;
+    mount_chat_ok(&fallback).await;
+
+    let client = ProfileRoutingClient::new(
+        Arc::new(profile_config(vec![exact_profile(
+            "profile-p",
+            "primary",
+            vec![ProfileFallback {
+                upstream: "fallback".to_string(),
+                model: Some("fallback-model".to_string()),
+            }],
+        )])),
+        vec![
+            named_provider("primary", &primary.uri()),
+            named_provider("fallback", &fallback.uri()),
+        ],
+    );
+
+    let stream = client
+        .stream_chat_completion(&backend_for("profile-p"))
+        .await
+        .expect("fallback upstream serves after the primary 503");
+    assert!(drain_ok(stream).await >= 1);
+
+    assert_eq!(request_count(&primary).await, 1, "primary tried once");
+    assert_eq!(
+        posted_model(&fallback).await,
+        "fallback-model",
+        "the fallback entry's model rewrite rides on the POSTed body"
+    );
+}
+
+/// Two profiles route to the SAME primary upstream. Failing the first profile's
+/// primary cools that shared upstream; the second profile then SKIPS it (serving
+/// from its own fallback) rather than re-contacting the cooling upstream.
+#[tokio::test]
+async fn profiles_on_same_upstream_share_cooldown() {
+    let shared = MockServer::start().await;
+    mount_chat_503(&shared).await;
+    let backup = MockServer::start().await;
+    mount_chat_ok(&backup).await;
+
+    let client = ProfileRoutingClient::new(
+        Arc::new(profile_config(vec![
+            exact_profile("profile-a", "shared", vec![]),
+            exact_profile(
+                "profile-b",
+                "shared",
+                vec![ProfileFallback {
+                    upstream: "backup".to_string(),
+                    model: None,
+                }],
+            ),
+        ])),
+        vec![
+            named_provider("shared", &shared.uri()),
+            named_provider("backup", &backup.uri()),
+        ],
+    );
+
+    // Profile A has no fallback, so the shared 503 fails its whole chain and
+    // drives the shared upstream into cooldown.
+    let a = client
+        .stream_chat_completion(&backend_for("profile-a"))
+        .await;
+    assert!(a.is_err(), "profile A's only upstream 503s");
+
+    // Profile B shares that upstream; it must skip the cooling one and serve from
+    // its backup fallback.
+    let stream = client
+        .stream_chat_completion(&backend_for("profile-b"))
+        .await
+        .expect("profile B serves via its backup while shared is cooling");
+    assert!(drain_ok(stream).await >= 1);
+
+    assert_eq!(
+        request_count(&shared).await,
+        1,
+        "profile B skipped the cooling shared upstream (contacted only by A)"
+    );
+    assert_eq!(request_count(&backup).await, 1, "backup served profile B");
+}
+
+/// An unknown request model (no matching profile) surfaces a 404 `AppError` and
+/// contacts no upstream.
+#[tokio::test]
+async fn unknown_model_surfaces_not_found() {
+    let server = MockServer::start().await;
+    mount_chat_ok(&server).await;
+
+    let client = ProfileRoutingClient::new(
+        Arc::new(profile_config(vec![exact_profile(
+            "known",
+            "primary",
+            vec![],
+        )])),
+        vec![named_provider("primary", &server.uri())],
+    );
+
+    let err = match client
+        .stream_chat_completion(&backend_for("unserved-model"))
+        .await
+    {
+        Ok(_) => panic!("an unserved model must not open a stream"),
+        Err(err) => err,
+    };
+    assert_eq!(err.status.as_u16(), 404, "unserved model is a 404");
+    assert_eq!(
+        request_count(&server).await,
+        0,
+        "no upstream is contacted for an unserved model"
+    );
+}
+
+/// The failover chain is EXACTLY the primary plus the profile's fallbacks: a
+/// third configured upstream that the profile does not reference is never
+/// contacted.
+#[tokio::test]
+async fn chain_is_exactly_primary_plus_profile_fallbacks() {
+    let primary = MockServer::start().await;
+    mount_chat_503(&primary).await;
+    let fallback = MockServer::start().await;
+    mount_chat_ok(&fallback).await;
+    let unused = MockServer::start().await;
+    mount_chat_ok(&unused).await;
+
+    let client = ProfileRoutingClient::new(
+        Arc::new(profile_config(vec![exact_profile(
+            "profile-p",
+            "primary",
+            vec![ProfileFallback {
+                upstream: "fallback".to_string(),
+                model: None,
+            }],
+        )])),
+        vec![
+            named_provider("primary", &primary.uri()),
+            named_provider("fallback", &fallback.uri()),
+            named_provider("unused", &unused.uri()),
+        ],
+    );
+
+    let stream = client
+        .stream_chat_completion(&backend_for("profile-p"))
+        .await
+        .expect("serves via the declared fallback");
+    assert!(drain_ok(stream).await >= 1);
+
+    assert_eq!(request_count(&primary).await, 1);
+    assert_eq!(request_count(&fallback).await, 1);
+    assert_eq!(
+        request_count(&unused).await,
+        0,
+        "a configured upstream not in the profile chain is never contacted"
     );
 }
