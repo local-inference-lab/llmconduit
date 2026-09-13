@@ -88,6 +88,54 @@ pub struct ResponsesRequest {
     pub extra_body: BTreeMap<String, Value>,
 }
 
+impl ResponsesRequest {
+    /// Iterate over every tool available for this turn. Responses Lite carries
+    /// prompt-scoped tool definitions in `input` as `additional_tools`, while
+    /// the standard Responses API carries them in the top-level `tools` field.
+    /// Both encodings have the same execution contract after canonical ingress.
+    pub fn tool_specs(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.tools.iter().chain(self.additional_tool_specs())
+    }
+
+    /// Iterate over prompt-scoped tool definitions carried by Responses Lite.
+    /// Callers that remove a replayed input prefix can use this iterator to
+    /// preserve the active tool set independently of the remaining messages.
+    pub fn additional_tool_specs(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.input.iter().flat_map(|item| {
+            let ResponseItem::AdditionalTools { tools, .. } = item else {
+                return &[][..];
+            };
+            tools.as_slice()
+        })
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.tool_specs().count()
+    }
+
+    pub fn tools_are_empty(&self) -> bool {
+        self.tool_specs().next().is_none()
+    }
+
+    pub fn retain_tools(&mut self, mut keep: impl FnMut(&ToolSpec) -> bool) {
+        self.tools.retain(&mut keep);
+        for item in &mut self.input {
+            if let ResponseItem::AdditionalTools { tools, .. } = item {
+                tools.retain(&mut keep);
+            }
+        }
+    }
+
+    pub(crate) fn for_each_tool_group_mut(&mut self, mut apply: impl FnMut(&mut Vec<ToolSpec>)) {
+        apply(&mut self.tools);
+        for item in &mut self.input {
+            if let ResponseItem::AdditionalTools { tools, .. } = item {
+                apply(tools);
+            }
+        }
+    }
+}
+
 fn default_tool_choice() -> Value {
     Value::String("auto".to_string())
 }
@@ -149,6 +197,11 @@ pub enum NamespaceToolSpec {
         #[serde(default)]
         strict: bool,
         parameters: Value,
+    },
+    Custom {
+        name: String,
+        description: String,
+        format: CustomToolFormat,
     },
 }
 
@@ -346,6 +399,12 @@ pub enum ReasoningContentItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
+    AdditionalTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        role: String,
+        tools: Vec<ToolSpec>,
+    },
     Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -868,6 +927,101 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
         assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn response_item_additional_tools_round_trips_namespace_tools() {
+        let value = serde_json::json!({
+            "type": "additional_tools",
+            "id": "at_tools",
+            "role": "developer",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "description": "Runtime tools.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Execute source.",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": "start: SOURCE"
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "wait",
+                        "description": "Wait for completion.",
+                        "strict": false,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cell_id": {"type": "string"}},
+                            "required": ["cell_id"],
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let item: ResponseItem =
+            serde_json::from_value(value.clone()).expect("deserialize additional_tools");
+        let ResponseItem::AdditionalTools { id, role, tools } = &item else {
+            panic!("expected additional_tools, got {item:?}");
+        };
+        assert_eq!(id.as_deref(), Some("at_tools"));
+        assert_eq!(role, "developer");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            serde_json::to_value(item).expect("serialize additional_tools"),
+            value
+        );
+    }
+
+    #[test]
+    fn responses_request_counts_top_level_and_additional_tools() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "local-model",
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "Runtime tools.",
+                    "tools": [{
+                        "type": "function",
+                        "name": "wait",
+                        "description": "Wait for completion.",
+                        "parameters": {"type": "object"}
+                    }]
+                }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "top_level",
+                "description": "Top-level tool.",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("deserialize Responses Lite request");
+
+        assert_eq!(request.tool_count(), 2);
+        assert!(!request.tools_are_empty());
+        assert_eq!(
+            request
+                .tool_specs()
+                .map(|tool| match tool {
+                    ToolSpec::Function { name, .. } | ToolSpec::Namespace { name, .. } => {
+                        name.as_str()
+                    }
+                    _ => "unexpected",
+                })
+                .collect::<Vec<_>>(),
+            vec!["top_level", "functions"]
+        );
     }
 
     #[test]

@@ -136,7 +136,7 @@ impl ImageCache {
                 }
             }
         }
-        inject_analyze_image_tool(&mut request.tools);
+        inject_analyze_image_tool(request);
         prepend_image_agent_system_prompt(request);
     }
 }
@@ -155,7 +155,12 @@ impl ImageCache {
 /// case-insensitively). A
 /// namespace left empty after removal is dropped entirely. Finally append
 /// exactly one canonical spec.
-fn inject_analyze_image_tool(tools: &mut Vec<ToolSpec>) {
+fn inject_analyze_image_tool(request: &mut ResponsesRequest) {
+    request.for_each_tool_group_mut(remove_analyze_image_tools);
+    request.tools.push(analyze_image_tool_spec());
+}
+
+fn remove_analyze_image_tools(tools: &mut Vec<ToolSpec>) {
     tools.retain_mut(|spec| match spec {
         // Top-level analyzeImage (Function/Custom): remove.
         spec if tool_is_analyze_image(spec) => false,
@@ -166,13 +171,13 @@ fn inject_analyze_image_tool(tools: &mut Vec<ToolSpec>) {
         }
         _ => true,
     });
-    tools.push(analyze_image_tool_spec());
 }
 
 /// Whether a namespace child tool is `analyzeImage` (case-insensitive).
 fn namespace_tool_is_analyze_image(tool: &crate::models::responses::NamespaceToolSpec) -> bool {
     match tool {
-        crate::models::responses::NamespaceToolSpec::Function { name, .. } => {
+        crate::models::responses::NamespaceToolSpec::Function { name, .. }
+        | crate::models::responses::NamespaceToolSpec::Custom { name, .. } => {
             name.eq_ignore_ascii_case(ANALYZE_IMAGE_TOOL_NAME)
         }
     }
