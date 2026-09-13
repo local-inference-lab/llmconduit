@@ -1351,22 +1351,35 @@ impl Gateway {
             .await
             .map_err(&finalize_pre_spawn_err)?;
         let mut tail_request = request.clone();
-        tail_request.input = request.input[prefix_len..].to_vec();
+        // Responses Lite places prompt-scoped definitions in an
+        // `additional_tools` input item. That item can belong to a replayed
+        // prefix even though its tools remain active for the new tail. Hoist
+        // every embedded definition into the tail request's standard tool
+        // field, then omit the metadata-only items from message lowering.
+        tail_request
+            .tools
+            .extend(request.additional_tool_specs().cloned());
+        tail_request.input = request.input[prefix_len..]
+            .iter()
+            .filter(|item| !matches!(item, ResponseItem::AdditionalTools { .. }))
+            .cloned()
+            .collect();
         if self.config.brave_api_key.is_none() {
-            let original_tool_count = tail_request.tools.len();
-            tail_request
-                .tools
-                .retain(|t| !matches!(t, crate::models::responses::ToolSpec::WebSearch { .. }));
-            if tail_request.tools.len() != original_tool_count {
+            let original_tool_count = tail_request.tool_count();
+            tail_request.retain_tools(|tool| {
+                !matches!(tool, crate::models::responses::ToolSpec::WebSearch { .. })
+            });
+            if tail_request.tool_count() != original_tool_count {
+                let no_tools_remain = tail_request.tools_are_empty();
                 relax_tool_choice_after_stripping_tool(
                     &mut tail_request.tool_choice,
                     "web_search",
-                    tail_request.tools.is_empty(),
+                    no_tools_remain,
                 );
                 relax_tool_choice_after_stripping_tool(
                     &mut request.tool_choice,
                     "web_search",
-                    tail_request.tools.is_empty(),
+                    no_tools_remain,
                 );
             }
         }
@@ -1881,7 +1894,7 @@ impl Gateway {
             MonitorEventKind::RequestStarted {
                 model: request.model.clone(),
                 input_items: request.input.len(),
-                tool_count: request.tools.len(),
+                tool_count: request.tool_count(),
                 turn_count: request
                     .input
                     .iter()
@@ -1984,6 +1997,17 @@ impl Gateway {
                     .input
                     .iter()
                     .map(|item| match item {
+                        ResponseItem::AdditionalTools { role, tools, .. } => {
+                            role.chars().count()
+                                + tools
+                                    .iter()
+                                    .map(|tool| {
+                                        serde_json::to_string(tool)
+                                            .map(|value| value.chars().count())
+                                            .unwrap_or(0)
+                                    })
+                                    .sum::<usize>()
+                        }
                         ResponseItem::Message { content, .. } => content
                             .iter()
                             .map(|content| match content {
@@ -4039,6 +4063,9 @@ fn json_path_child(parent: &str, key: &str) -> String {
 
 fn summarize_response_item(item: &ResponseItem) -> String {
     match item {
+        ResponseItem::AdditionalTools { tools, .. } => {
+            format!("additional_tools {} tools", tools.len())
+        }
         ResponseItem::Message { role, content, .. } => {
             format!("{role}: {}", summarize_content(content))
         }
@@ -4812,6 +4839,7 @@ impl ResponseEventState {
 
 fn response_item_event_id(item: &ResponseItem) -> Option<String> {
     match item {
+        ResponseItem::AdditionalTools { id, .. } => id.clone(),
         ResponseItem::Message { id, .. } => id.clone(),
         ResponseItem::Reasoning { id, .. } => Some(id.clone()),
         ResponseItem::FunctionCall { id, call_id, .. } => {

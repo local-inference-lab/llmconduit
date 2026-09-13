@@ -155,11 +155,12 @@ pub fn lower_request_with_image_agent_and_roles(
             tool_calls: None,
         });
     }
-    let tools = lower_tools(&request.tools)?;
-    let registry = build_tool_registry(&request.tools, image_agent_active)?;
+    let tools = lower_tools(request.tool_specs())?;
+    let registry = build_tool_registry(request.tool_specs(), image_agent_active)?;
     let mut pending_reasoning: Option<PendingReasoning> = None;
     for item in &request.input {
         match item {
+            ResponseItem::AdditionalTools { .. } => {}
             ResponseItem::Message { role, content, .. } => {
                 let text = message_content_to_chat_value(content)?;
                 let normalized_role = if roles.is_some() {
@@ -657,7 +658,7 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
         Value::String(s) => match s.as_str() {
             "auto" | "none" => {}
             "required" => {
-                if request.tools.is_empty() {
+                if request.tools_are_empty() {
                     return Err(AppError::bad_request(
                         "tool_choice is \"required\" but no tools are provided",
                     ));
@@ -683,7 +684,7 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
                     "invalid tool_choice object: expected {\"type\":\"function\",\"function\":{\"name\":\"<non-empty>\"}}",
                 ));
             }
-            if request.tools.is_empty() {
+            if request.tools_are_empty() {
                 return Err(AppError::bad_request(
                     "tool_choice specifies a function but no tools are provided",
                 ));
@@ -698,7 +699,7 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
     Ok(())
 }
 
-fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
+fn lower_tools<'a>(specs: impl IntoIterator<Item = &'a ToolSpec>) -> AppResult<Vec<ChatTool>> {
     let mut tools = Vec::new();
     for spec in specs {
         let lowered_tools = match spec {
@@ -734,6 +735,28 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                             description: description.clone(),
                             parameters: Some(parameters.clone()),
                             strict: *strict,
+                        },
+                    },
+                    NamespaceToolSpec::Custom {
+                        name,
+                        description,
+                        format,
+                    } => ChatTool {
+                        kind: "function".to_string(),
+                        function: ChatToolDefinition {
+                            name: name.clone(),
+                            description: format!(
+                                "{description}\n\nReturn the raw tool input as a string matching the {} {} format.",
+                                format.kind, format.syntax
+                            ),
+                            parameters: Some(json!({
+                                "type": "object",
+                                "properties": {
+                                    "input": { "type": "string" }
+                                },
+                                "required": ["input"]
+                            })),
+                            strict: false,
                         },
                     },
                 })
@@ -824,7 +847,10 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
     Ok(tools)
 }
 
-fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResult<ToolRegistry> {
+fn build_tool_registry<'a>(
+    specs: impl IntoIterator<Item = &'a ToolSpec>,
+    image_agent_active: bool,
+) -> AppResult<ToolRegistry> {
     let mut by_name = HashMap::new();
     for spec in specs {
         let lowered_kinds: Vec<(String, ToolKind)> = match spec {
@@ -857,6 +883,12 @@ fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResul
                         ToolKind::Function {
                             public_name: name.clone(),
                             namespace: Some(namespace.clone()),
+                        },
+                    ),
+                    NamespaceToolSpec::Custom { name, .. } => (
+                        name.clone(),
+                        ToolKind::Custom {
+                            public_name: name.clone(),
                         },
                     ),
                 })
@@ -1503,6 +1535,112 @@ mod tests {
         assert_eq!(
             shaped.role, "system",
             "no roles config ⇒ legacy passthrough"
+        );
+    }
+
+    #[test]
+    fn additional_tools_lower_to_active_namespaced_chat_tools() {
+        let mut req = base_test_request();
+        req.tool_choice = Value::String("required".to_string());
+        req.input = vec![
+            ResponseItem::AdditionalTools {
+                id: Some("at_tools".to_string()),
+                role: "developer".to_string(),
+                tools: vec![ToolSpec::Namespace {
+                    name: "functions".to_string(),
+                    description: "Runtime tools.".to_string(),
+                    tools: vec![
+                        NamespaceToolSpec::Custom {
+                            name: "exec".to_string(),
+                            description: "Execute source.".to_string(),
+                            format: CustomToolFormat {
+                                kind: "grammar".to_string(),
+                                syntax: "lark".to_string(),
+                                definition: "start: SOURCE".to_string(),
+                            },
+                        },
+                        NamespaceToolSpec::Function {
+                            name: "wait".to_string(),
+                            description: "Wait for completion.".to_string(),
+                            strict: false,
+                            parameters: json!({
+                                "type": "object",
+                                "properties": {"cell_id": {"type": "string"}},
+                                "required": ["cell_id"]
+                            }),
+                        },
+                    ],
+                }],
+            },
+            user_msg("Use a tool."),
+        ];
+
+        let lowered = lower_request(&req, vec![]).expect("lower additional tools");
+        assert_eq!(lowered.messages.len(), 1);
+        assert_eq!(lowered.messages[0].role, "user");
+        assert_eq!(
+            lowered
+                .tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec", "wait"]
+        );
+        let exec = lowered
+            .tools
+            .iter()
+            .find(|tool| tool.function.name == "exec")
+            .expect("exec chat tool");
+        assert_eq!(
+            exec.function.parameters,
+            Some(json!({
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"]
+            }))
+        );
+        assert!(matches!(
+            lowered.tool_registry.get("exec"),
+            Some(ToolKind::Custom { public_name }) if public_name == "exec"
+        ));
+        assert!(matches!(
+            lowered.tool_registry.get("wait"),
+            Some(ToolKind::Function {
+                public_name,
+                namespace: Some(namespace),
+            }) if public_name == "wait" && namespace == "functions"
+        ));
+    }
+
+    #[test]
+    fn duplicate_name_across_standard_and_additional_tools_is_rejected() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::Function {
+            name: "wait".to_string(),
+            description: "Top-level tool.".to_string(),
+            strict: false,
+            parameters: json!({}),
+        }];
+        req.input = vec![ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: vec![ToolSpec::Namespace {
+                name: "functions".to_string(),
+                description: "Runtime tools.".to_string(),
+                tools: vec![NamespaceToolSpec::Function {
+                    name: "WAIT".to_string(),
+                    description: "Namespaced tool.".to_string(),
+                    strict: false,
+                    parameters: json!({}),
+                }],
+            }],
+        }];
+
+        let err = lower_request(&req, vec![]).expect_err("duplicate name must be rejected");
+        assert!(
+            err.to_string()
+                .contains("duplicate tool name is not supported: wait"),
+            "unexpected error: {err}"
         );
     }
 
