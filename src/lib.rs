@@ -9,6 +9,7 @@ pub mod dashboard_ws;
 pub mod debug_ui;
 pub mod engine;
 pub mod error;
+pub mod first_message_cache;
 pub mod http;
 pub mod log_rotation;
 pub mod metrics;
@@ -21,6 +22,7 @@ pub mod replay;
 pub mod request_log;
 pub mod search;
 pub(crate) mod sse_guard;
+pub mod system_message_cache;
 /// Crate-internal, test-only peak-allocation probe (the crate's single
 /// `#[global_allocator]`), shared by the `sse_guard` reject-path and
 /// `dashboard_flow::capture_body` heap-bound tests.

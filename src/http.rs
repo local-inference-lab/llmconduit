@@ -1620,7 +1620,11 @@ async fn handle_count_tokens(
     }
 
     let original_model = request.model.clone();
-    let responses_request = anthropic_to_responses::convert_request(request)?;
+    let responses_request = anthropic_to_responses::convert_request_with_caches(
+        request,
+        Some(&gateway.system_message_cache()),
+        Some(&gateway.first_message_cache()),
+    )?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
@@ -1731,7 +1735,11 @@ async fn handle_post_messages(
         request.thinking.as_ref(),
         Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. })
     );
-    let responses_request = anthropic_to_responses::convert_request(request)?;
+    let responses_request = anthropic_to_responses::convert_request_with_caches(
+        request,
+        Some(&gateway.system_message_cache()),
+        Some(&gateway.first_message_cache()),
+    )?;
     let stream = gateway
         .stream_responses_with_api_call_id(responses_request, api_call_id)
         .await?;
