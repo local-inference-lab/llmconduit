@@ -81,6 +81,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
+use utoipa::ToSchema;
 
 /// The explicit WS close code the dashboard SPA recognizes as a SESSION EXPIRY /
 /// auth failure (`dashboard-frontend/src/api/ws.ts` `WS_AUTH_CLOSE`): on `4401` the
@@ -116,6 +117,7 @@ pub enum Domain {
     Metrics,
     Topology,
     Monitor,
+    Sessions,
 }
 
 /// The batched WS envelope: ONE frame per source update (e.g. one `DebugUpdate`),
@@ -134,28 +136,43 @@ pub struct DashboardFrame {
 /// `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
 /// baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
 /// snake_case to the frozen `SeqCursors` contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SeqCursors {
+    /// FlowStore domain cursor.
     pub flow_seq: u64,
+    /// Metrics domain cursor.
     pub metrics_seq: u64,
+    /// Topology domain cursor.
     pub topology_seq: u64,
+    /// Monitor (debug transcript) domain cursor.
     pub monitor_seq: u64,
 }
 
 /// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
 /// windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
 /// [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MetricsSnapshot {
+    /// Metrics domain cursor.
     pub metrics_seq: u64,
+    /// Headline (`m1`) requests per second (terminal flows ÷ window seconds).
     pub reqs_per_sec: f64,
+    /// Count of currently open flows (on `/snapshot`: open flows in the frozen cut).
     pub active_streams: u64,
+    /// Headline (`m1`) percentage of terminal flows in the error status class.
     pub error_pct: f64,
+    /// Headline (`m1`) p50 latency in ms.
     pub p50: f64,
+    /// Headline (`m1`) p95 latency in ms.
     pub p95: f64,
+    /// Headline (`m1`) p99 latency in ms.
     pub p99: f64,
+    /// Headline (`m1`) reported tokens per second.
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
+    /// Headline (`m1`) priced USD per minute.
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
     /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
@@ -163,6 +180,10 @@ pub struct MetricsSnapshot {
     /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
     /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
     pub usage_samples: u64,
+    /// Headline flows with both prompt usage and a measured prefill duration.
+    pub prefill_samples: u64,
+    /// Headline flows with both completion usage and a measured decode duration.
+    pub decode_samples: u64,
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
@@ -170,6 +191,7 @@ pub struct MetricsSnapshot {
     /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
     /// when any priced bucket bills cached at the default `0.0`.
     pub cost_confidence: crate::dashboard_api::CostConfidence,
+    /// The `m1`/`m5`/`h1` window tiles.
     pub windows: MetricWindows,
 }
 
@@ -177,11 +199,15 @@ pub struct MetricsSnapshot {
 /// PLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The
 /// price table is empty until D13 wires the price config; an empty map satisfies
 /// the frontend `isPriceTable` guard (vacuously every value is a finite price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologySnapshot {
+    /// Topology domain cursor (the provider-health snapshot version).
     pub topology_seq: u64,
+    /// One node per published provider.
     pub nodes: Vec<TopologyNode>,
+    /// One `gateway` → provider edge per provider.
     pub edges: Vec<TopologyEdge>,
+    /// Configured per-model prices keyed by served model id (empty when none configured).
     pub price_table: std::collections::BTreeMap<String, ModelPrice>,
 }
 
@@ -229,6 +255,9 @@ pub enum SnapshotTag {
 /// The `usage`/`flow_status` arms are keyed by `api_call_id` (authoritative) with
 /// an optional secondary `response_id`.
 #[derive(Debug, Clone, Serialize)]
+// The flow_status variant carries the per-flow spine (phases, attempts, session
+// facts); boxing it would only move the allocation to every frame.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardPayload {
     /// One per `DebugWsMessage` in the originating `DebugUpdate` batch; the real
@@ -290,6 +319,8 @@ pub enum DashboardPayload {
         usage: Option<FlowUsage>,
         started_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
+        finished_ms: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u128>,
         /// Gap 10b — the gap-02 per-phase timestamps reached so far, flattened as sibling
         /// scalar fields (`ingress_ms`/`first_content_delta_ms`/…). `skip_serializing_if`
@@ -305,6 +336,9 @@ pub enum DashboardPayload {
         /// chunk), once measured. `None` ⇒ absent ⇒ renders `—`, never `0`.
         #[serde(skip_serializing_if = "Option::is_none")]
         first_upstream_byte_ms: Option<u128>,
+        /// Harness/session facts, flattened; each absent when unknown.
+        #[serde(flatten)]
+        session: crate::dashboard_flow::FlowSessionFacts,
     },
     /// The provider topology cut (topology domain): nodes (D4 `ProviderHealth`,
     /// `catalog_size` flattened to a non-null count) + gateway→provider edges.
@@ -312,6 +346,12 @@ pub enum DashboardPayload {
         nodes: Vec<TopologyNode>,
         edges: Vec<TopologyEdge>,
     },
+    /// Sessions-domain tick: the ids of sessions whose row or request ring
+    /// changed. Carries NO body — the SPA treats it as a push notification to
+    /// refetch `/dashboard/api/sessions/active` (mirroring how a metrics frame
+    /// invalidates the topology query), so the authoritative cut stays a single
+    /// REST read and the frame stays tiny.
+    SessionUpdate { touched: Vec<String> },
 }
 
 /// The flat metric-tile shape carried by a `metric_tick` payload — mirrors the
@@ -327,6 +367,8 @@ pub struct MetricTick {
     pub p95: f64,
     pub p99: f64,
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
     /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
@@ -334,6 +376,8 @@ pub struct MetricTick {
     /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
     /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
     pub usage_samples: u64,
+    pub prefill_samples: u64,
+    pub decode_samples: u64,
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
@@ -345,10 +389,13 @@ pub struct MetricTick {
 }
 
 /// The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MetricWindows {
+    /// Last 60 seconds.
     pub m1: MetricWindow,
+    /// Last 5 minutes.
     pub m5: MetricWindow,
+    /// Last hour.
     pub h1: MetricWindow,
 }
 
@@ -361,15 +408,25 @@ pub struct MetricWindows {
 /// so the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)
 /// and `active_streams` (live open-flow count) stay numeric. The field is a finite
 /// `u64`, so it never violates the frozen finite-number wire contract.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct MetricWindow {
+    /// Requests per second (terminal flows in the window ÷ window seconds).
     pub reqs_per_sec: f64,
+    /// Count of currently open flows (identical across the three windows).
     pub active_streams: u64,
+    /// Percentage of terminal flows in the window in the error status class.
     pub error_pct: f64,
+    /// p50 latency in ms.
     pub p50: f64,
+    /// p95 latency in ms.
     pub p95: f64,
+    /// p99 latency in ms.
     pub p99: f64,
+    /// Reported tokens per second over the window.
     pub tokens_per_sec: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
+    /// Priced USD per minute over the window.
     pub cost_per_min: f64,
     /// Terminal-flow sample count in this window (the measured/unavailable signal for
     /// latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
@@ -381,6 +438,8 @@ pub struct MetricWindow {
     /// yet `usage_samples == 0` (every finalized flow omitted usage), in which case
     /// `tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.
     pub usage_samples: u64,
+    pub prefill_samples: u64,
+    pub decode_samples: u64,
     /// Count of usage-bearing terminal flows whose served model has a configured price
     /// (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no
     /// PRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an
@@ -403,18 +462,29 @@ pub struct MetricWindow {
 /// (NOT nullable), unlike the other `Option` fields which serde emits as `null`.
 /// Every other field mirrors `ProviderHealth` exactly (keys always present, the
 /// nullable ones as JSON `null`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologyNode {
+    /// Stable provider identifier (the configured provider/route name).
     pub id: String,
+    /// Human-readable provider name (currently identical to `id`).
     pub name: String,
+    /// The routing-provider name that owns this entry; `null` for a bare/failover provider.
     pub route: Option<String>,
+    /// The upstream base URL this provider POSTs to.
     pub base_url: String,
+    /// Serving status.
     pub status: crate::upstream::ProviderStatus,
+    /// Epoch-ms the failure cooldown ends; `null` when not cooling.
     pub cooling_until_ms: Option<u64>,
+    /// The most recent failure message recorded for this provider; `null` when none.
     pub last_error: Option<String>,
+    /// Cumulative count of flows this provider served.
     pub served_count: u64,
+    /// Cumulative count of times this provider was failed over FROM.
     pub failover_count: u64,
+    /// Consecutive failures since the last success.
     pub consecutive_failures: u32,
+    /// Epoch-ms this provider's `/v1/models` catalog was last fetched; `null` until the first refresh.
     pub catalog_fetched_ms: Option<u64>,
     /// Flattened from `ProviderHealth::catalog_size: Option<u64>` to a required
     /// non-null count (`None → 0`) per the frozen contract.
@@ -482,12 +552,17 @@ impl TopologyNode {
 /// they serialize as `0.0` (the contract requires the keys present + finite, not
 /// a specific value), so the byte-shape is exact while the rich values land in
 /// D13.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TopologyEdge {
+    /// Always `gateway`.
     pub from: String,
+    /// The provider id this edge feeds.
     pub to: String,
+    /// Requests per second to this provider over the `m1` window.
     pub throughput: f64,
+    /// Reported tokens per second to this provider over the `m1` window.
     pub tokens_per_sec: f64,
+    /// Priced USD per second to this provider over the `m1` window.
     pub cost_per_sec: f64,
 }
 
@@ -575,12 +650,16 @@ pub fn frames_for_update(
             }
             DebugWsMessage::RequestStatus {
                 response_id,
+                status,
                 completed_at_ms,
                 ..
             } => {
                 let intent = intent_for(&mut intents, &mut intent_index, response_id);
                 // Latest status fallback timestamp wins for a repeated response_id.
-                intent.status_completed_at_ms = Some(*completed_at_ms);
+                intent.status = Some(MonitorTerminal {
+                    status: *status,
+                    completed_at_ms: *completed_at_ms,
+                });
             }
             _ => {}
         }
@@ -617,8 +696,8 @@ pub fn frames_for_update(
                 reasoning,
             });
         }
-        if let Some(completed_at_ms) = merged.status_completed_at_ms {
-            flow_batch.push(flow_status_payload(&merged.record, completed_at_ms));
+        if let Some(terminal) = merged.status {
+            flow_batch.push(flow_status_payload(&merged.record, terminal));
         }
     }
 
@@ -657,6 +736,12 @@ struct UsageTokens {
     total: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MonitorTerminal {
+    status: crate::monitor::DebugRequestStatus,
+    completed_at_ms: Option<u128>,
+}
+
 /// A pending flow-domain enrichment for ONE `response_id`, accumulated across the
 /// messages of a single `DebugUpdate` BEFORE the record is resolved. Both arms
 /// COALESCE onto the same intent so repeated messages for one `response_id` fold
@@ -666,9 +751,8 @@ struct FlowEnrichIntent {
     response_id: String,
     /// The latest monitor `Usage` token counts seen for this response_id (if any).
     usage: Option<UsageTokens>,
-    /// The latest monitor `RequestStatus` completion stamp (if a status was seen);
-    /// the inner `Option` is the message's own `completed_at_ms` (may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
+    /// The latest monitor terminal status seen for this response_id (if any).
+    status: Option<MonitorTerminal>,
 }
 
 /// Get the mutable [`FlowEnrichIntent`] for `response_id`, creating it (preserving
@@ -683,7 +767,7 @@ fn intent_for<'a>(
         intents.push(FlowEnrichIntent {
             response_id: response_id.to_string(),
             usage: None,
-            status_completed_at_ms: None,
+            status: None,
         });
         intents.len() - 1
     });
@@ -705,9 +789,8 @@ struct MergedRecordIntent {
     response_id: String,
     /// Latest monitor `Usage` token counts across all aliasing `response_id`s.
     usage: Option<UsageTokens>,
-    /// Latest monitor `RequestStatus` completion stamp across all aliases (the inner
-    /// `Option` is the message's own `completed_at_ms`, which may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
+    /// Latest monitor terminal status across all aliases.
+    status: Option<MonitorTerminal>,
 }
 
 /// Resolve each per-`response_id` [`FlowEnrichIntent`] to its FlowStore record and MERGE
@@ -734,7 +817,7 @@ fn merge_intents_by_record(
                 record: Arc::clone(&record),
                 response_id: intent.response_id.clone(),
                 usage: None,
-                status_completed_at_ms: None,
+                status: None,
             });
             merged.len() - 1
         });
@@ -743,8 +826,8 @@ fn merge_intents_by_record(
         if intent.usage.is_some() {
             entry.usage = intent.usage;
         }
-        if intent.status_completed_at_ms.is_some() {
-            entry.status_completed_at_ms = intent.status_completed_at_ms;
+        if intent.status.is_some() {
+            entry.status = intent.status;
         }
     }
     merged
@@ -761,21 +844,36 @@ fn merge_intents_by_record(
 /// `cancelled`, not be flattened to `failed`. The monitor `completed_at_ms` is used
 /// ONLY as a fallback to derive `elapsed_ms` when the record has not finalized its
 /// own measured elapsed yet.
-fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> DashboardPayload {
+fn flow_status_payload(record: &FlowRecord, terminal: MonitorTerminal) -> DashboardPayload {
+    let completed_at_ms = terminal.completed_at_ms;
+    let status = if record.status == FlowStatus::Open {
+        match terminal.status {
+            // Treat a terminal monitor event as authoritative even if an older/open record
+            // snapshot is observed (for example from buffered or legacy event ordering).
+            // Once the record is terminal, its richer status (especially Cancelled) wins.
+            crate::monitor::DebugRequestStatus::Completed => FlowStatus::Completed,
+            crate::monitor::DebugRequestStatus::Failed => FlowStatus::Failed,
+            crate::monitor::DebugRequestStatus::Running => FlowStatus::Open,
+        }
+    } else {
+        record.status
+    };
     // Prefer the record's measured elapsed; fall back to a wall-clock delta from
     // the monitor's completion stamp (when the record has not finalized yet).
     let elapsed_ms = record
         .elapsed_ms
         .or_else(|| completed_at_ms.map(|done| done.saturating_sub(record.started_ms)));
+    let finished_ms = record.finished_ms.or(completed_at_ms);
     DashboardPayload::FlowStatus {
         api_call_id: record.api_call_id.clone(),
         response_id: record.response_id.clone(),
-        status: record.status,
+        status,
         model_requested: record.model_requested.clone(),
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
         usage: record.usage,
         started_ms: record.started_ms,
+        finished_ms,
         elapsed_ms,
         // Gap 10b: project the gap-02 phases + gap-03 attempts/wire-TTFB reached so far
         // from the SAME record snapshot the rest of this payload is built from (no second
@@ -785,6 +883,7 @@ fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> Da
         phases: record.phases,
         attempts: record.attempts.clone(),
         first_upstream_byte_ms: record.first_upstream_byte_ms,
+        session: record.session.clone(),
     }
 }
 
@@ -830,9 +929,13 @@ pub fn metric_tick_frame(
             p95: body.p95,
             p99: body.p99,
             tokens_per_sec: body.tokens_per_sec,
+            prefill_tokens_per_sec: body.prefill_tokens_per_sec,
+            decode_tokens_per_sec: body.decode_tokens_per_sec,
             cost_per_min: body.cost_per_min,
             samples: body.samples,
             usage_samples: body.usage_samples,
+            prefill_samples: body.prefill_samples,
+            decode_samples: body.decode_samples,
             priced_samples: body.priced_samples,
             cost_confidence: body.cost_confidence,
             windows: body.windows,
@@ -923,6 +1026,24 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
 /// finding 1) — live flow frames are stamped with the monitor `update.sequence`, so the
 /// flow + monitor domains dedup against the SAME monotonic clock (the flow `flows` body
 /// still comes from the FlowStore).
+/// Price body-free snapshot rows from a model→price lookup (the FlowStore owns no
+/// price table). Every row ends up with BOTH a `cost` and the `cost_confidence`
+/// tag that explains it — the SPA's `isFlowSummary` REQUIRES the tag, and one
+/// untagged row makes it drop the entire snapshot, leaving the dashboard stuck on
+/// "connecting" with every live frame buffered behind it.
+fn price_snapshot_summaries(
+    summaries: &mut [crate::dashboard_flow::SnapshotFlowSummary],
+    price_for: impl Fn(&str) -> Option<crate::config::ModelPrice>,
+) {
+    for summary in summaries {
+        let price = summary.model_served.as_deref().and_then(&price_for);
+        let (cost, confidence) =
+            crate::dashboard_api::priced_cost_and_confidence(price, summary.usage);
+        summary.cost = cost;
+        summary.cost_confidence = confidence;
+    }
+}
+
 fn snapshot_message(
     flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
     flow_seq: u64,
@@ -956,6 +1077,18 @@ fn snapshot_message(
 /// that fails cookie+Origin is rejected `401 no-store` BEFORE the upgrade. The
 /// bearer fallback is intentionally NOT honored for WS (browsers can't set
 /// `Authorization` on a `WebSocket`).
+#[utoipa::path(
+    get,
+    path = "/dashboard/ws",
+    tag = "ui",
+    operation_id = "dashboard_ws",
+    responses(
+        (status = 101, description = "WebSocket upgrade accepted; JSON text frames, server → client only (inbound text/binary is ignored; a peer Close/EOF tears the socket down). The FIRST message is always the snapshot `{\"type\":\"snapshot\", cursors: {flow_seq, metrics_seq, topology_seq, monitor_seq}, flows: [SnapshotFlowSummary…], metrics: MetricsSnapshot|null, topology: TopologySnapshot|null}` (the SPA buffers everything until it lands). Every later message is a batched `DashboardFrame` `{domain, seq, batch: [payload…]}` with `domain` ∈ `flow` | `metrics` | `topology` | `monitor` | `sessions` and a per-domain monotonic `seq` (the client drops a whole frame when `seq <= last_seq[domain]`). Each payload is `type`-tagged: `monitor` {message: DebugWsMessage} (one per retained/live monitor message; the transcript is replayed first), `usage` {api_call_id, response_id?, prompt, completion, total, cached?, reasoning?}, `flow_status` {api_call_id, response_id?, status, model_requested?, model_served?, upstream_target?, usage, started_ms, elapsed_ms?, phase timestamps, attempts?, first_upstream_byte_ms?, session facts}, `metric_tick` (the `/dashboard/api/metrics` tile, emitted periodically when it changes), `topology_update` {nodes, edges} (polled every 2 s, emitted when the version advances), `session_update` {touched: [session ids]} (the live-session hub's push tick; the SPA refetches `/dashboard/api/sessions/active`). At the session cookie's `exp` the server sends Close code 4401 `session expired`; a dev-open listener never expires."),
+        (status = 400, description = "Not a WebSocket upgrade: the `WebSocketUpgrade` extractor rejects a plain GET (missing `Connection: upgrade` / `Upgrade: websocket` / `Sec-WebSocket-Key`, or `Sec-WebSocket-Version` not `13`) BEFORE the handler runs, so this precedes the auth check. Plain text reason from axum.", content_type = "text/plain", body = String),
+        (status = 401, description = "The upgrade request failed the WS auth: no valid signed `llmconduit_session` cookie, or an `Origin` header not on the allow-list (the configured public origin, else same-origin as `Host` on loopback/insecure dev-open listeners). The bearer-token fallback is NOT honored here. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 426, description = "The connection cannot be upgraded (e.g. HTTP/1.0); axum's `WebSocketUpgrade` rejection.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_ws(
     State(gateway): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -971,7 +1104,24 @@ pub async fn dashboard_ws(
             );
         }
     };
-    let Some(exp) = auth.authenticate_ws(&headers) else {
+    let exp = if let Some(exp) = auth.authenticate_ws(&headers) {
+        Some(exp)
+    } else if auth.origin_allowed(&headers) {
+        if let Some((session_id, exp)) = auth.delegated_session(&headers) {
+            gateway
+                .authz()
+                .authenticate_delegated_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|_| exp)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(exp) = exp else {
         return crate::dashboard_auth::no_store(
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         );
@@ -990,7 +1140,11 @@ pub async fn dashboard_ws(
 async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let flow_store = gateway.flow_store().clone();
     let mut monitor_rx = gateway.subscribe_monitor();
+    // Sessions-domain push: the hub broadcast (a disabled hub's channel never
+    // sends, so the select arm is inert in production).
+    let mut sessions_rx = gateway.session_hub().subscribe();
     let snapshot = gateway.debug_snapshot();
+    let snapshot_sequence = snapshot.last_sequence;
 
     // Split the socket so the loop can READ inbound alongside writing (D7b R2 finding
     // 4): without an inbound read, a browser-side close / peer disconnect is invisible
@@ -1055,11 +1209,12 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // live tick use — real `active_streams` (live open-flow count) + priced
     // `cost_per_min`/`tokens_per_sec`/true rates — so the strip is honest from the
     // first frame, not a raw-count/`0.0` placeholder.
+    let prices = gateway.price_table();
     let metrics = Some(metrics_snapshot(
         &metrics_view,
         metrics_seq,
         snapshot_active,
-        gateway.price_table(),
+        &prices,
     ));
     let topo = gateway.provider_health_publisher().latest();
     let mut last_topology_version = topo.version;
@@ -1067,11 +1222,13 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // Body-free flow summaries from the FlowStore; the FlowStore `seq` is discarded — the
     // flow-domain WS dedup cursor is the monitor's `last_sequence` (finding 1), captured
     // atomically with the transcript below.
-    let (flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    let (mut flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    // Tag every row with its cost + confidence before the snapshot goes out.
+    price_snapshot_summaries(&mut flow_summaries, |model| gateway.price_for(model));
     let initial = snapshot_message(
         flow_summaries,
         // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
-        snapshot.last_sequence,
+        snapshot_sequence,
         metrics,
         topology,
         // monitor baseline 0 — the transcript rides the replay frame below.
@@ -1083,10 +1240,13 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // client dedups them (the snapshot already carries those flows) — only the
     // monitor-domain transcript frame advances the (snapshot-0) monitor cursor.
     let snapshot_update = DebugUpdate {
-        sequence: snapshot.last_sequence,
-        messages: snapshot.messages.clone(),
+        sequence: snapshot_sequence,
+        messages: snapshot.messages,
     };
     let snapshot_frames = frames_for_update(&snapshot_update, &flow_store);
+    // The live connection needs only the replay watermark; retaining transcript
+    // copies here multiplies the history budget for every open dashboard tab.
+    drop(snapshot_update);
     // Send the snapshot FIRST, then the replay frames, racing expiry throughout
     // (finding 1: snapshot strictly precedes every frame).
     match send_initial(&initial, &snapshot_frames, expiry.as_mut(), &mut sink).await {
@@ -1097,6 +1257,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         }
         SendOutcome::Failed => return,
     }
+    drop(snapshot_frames);
+    drop(initial);
 
     let mut metric_ticker = tokio::time::interval(METRIC_TICK_INTERVAL);
     metric_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1134,7 +1296,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     // Dedup at the source against the replayed snapshot: an update
                     // already covered by the snapshot's last_sequence is skipped
                     // (the client would whole-frame-dedup it anyway).
-                    Ok(update) if update.sequence <= snapshot.last_sequence => {}
+                    Ok(update) if update.sequence <= snapshot_sequence => {}
                     Ok(update) => {
                         let frames = frames_for_update(&update, &flow_store);
                         match send_frames(&frames, expiry.as_mut(), &mut sink).await {
@@ -1150,17 +1312,54 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
+            received = sessions_rx.recv() => {
+                match received {
+                    Ok(update) => {
+                        // One tiny sessions-domain frame per hub event, stamped
+                        // with the hub's own per-domain seq (client-side dedup
+                        // is per-domain, so this needs no coordination with the
+                        // other domains).
+                        let frame = DashboardFrame {
+                            domain: Domain::Sessions,
+                            seq: update.seq,
+                            batch: vec![DashboardPayload::SessionUpdate {
+                                touched: update.touched,
+                            }],
+                        };
+                        match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
+                            SendOutcome::Completed => {}
+                            SendOutcome::Expired => {
+                                send_auth_close(&mut sink).await;
+                                return;
+                            }
+                            SendOutcome::Failed => return,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The hub broadcasts at request pace; a lagged receiver
+                        // simply misses ticks. The next accepted frame carries a
+                        // higher seq and the REST refetch heals the cut, so
+                        // resume rather than tearing down the socket.
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
             _ = metric_ticker.tick() => {
                 // Atomic view + seq (D7b R2 finding 2): pair the tile body with its own
                 // ring cursor. `active_streams` is sampled AT tick time from the live
                 // FlowStore — the honest in-flight count for THIS frame.
-                let (view, seq) = gateway.metrics().view_with_seq();
                 let active = crate::dashboard_api::active_stream_count(&gateway);
                 // Gap 01 finding 1: emit when EITHER the aggregated view changed
                 // (`seq` advanced at a terminal finalize) OR the live open-flow count
                 // changed (a request started/ended mid-flight, which does NOT bump the
                 // ring seq). Without the active-count clause, an in-flight count change
-                // never reaches the strip until the next finalize.
+                // never reaches the strip until the next finalize. Peek the cheap seq
+                // first so an idle second skips aggregating the 1 h ring entirely; a
+                // send still re-reads view + seq atomically below.
+                if gateway.metrics().metrics_seq() == last_metrics_seq && active == last_active {
+                    continue;
+                }
+                let (view, seq) = gateway.metrics().view_with_seq();
                 if seq != last_metrics_seq || active != last_active {
                     last_metrics_seq = seq;
                     last_active = active;
@@ -1173,7 +1372,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     // Gap 01: the live tick carries the live open-flow count + price table
                     // so `active_streams`/`cost_per_min`/`tokens_per_sec`/true rates are
                     // real (not the old hard-coded `0.0`).
-                    let frame = metric_tick_frame(&view, emit_seq, active, gateway.price_table());
+                    let prices = gateway.price_table();
+                    let frame = metric_tick_frame(&view, emit_seq, active, &prices);
                     match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
@@ -1389,6 +1589,30 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// The sessions-domain `session_update` payload serializes as
+    /// `{type:"session_update", touched:[...]}` under `domain:"sessions"` —
+    /// the shape the SPA's `isDashboardPayload`/`DOMAIN_PAYLOADS` guard must
+    /// accept (adding the domain without the frontend guard would have every
+    /// frame rejected).
+    #[test]
+    fn session_update_frame_serializes_sessions_domain() {
+        let frame = DashboardFrame {
+            domain: Domain::Sessions,
+            seq: 3,
+            batch: vec![DashboardPayload::SessionUpdate {
+                touched: vec!["sess-1".to_string(), "sess-2".to_string()],
+            }],
+        };
+        let value = serde_json::to_value(&frame).expect("serialize");
+        assert_eq!(value["domain"], "sessions");
+        assert_eq!(value["seq"], 3);
+        assert_eq!(value["batch"][0]["type"], "session_update");
+        assert_eq!(
+            value["batch"][0]["touched"],
+            serde_json::json!(["sess-1", "sess-2"])
+        );
+    }
+
     // -- the batched-envelope no-drop invariant (the key fix) --------------
 
     /// A `DebugUpdate` carrying MULTIPLE sibling `DebugWsMessage`s → exactly ONE
@@ -1588,11 +1812,20 @@ mod tests {
             DashboardPayload::FlowStatus {
                 api_call_id,
                 status,
+                finished_ms,
                 ..
             } => {
                 assert_eq!(api_call_id, "api_001");
-                // Record status (Open), NOT the monitor message's Completed (finding 4).
-                assert_eq!(*status, FlowStatus::Open);
+                assert_eq!(
+                    *status,
+                    FlowStatus::Completed,
+                    "a monitor terminal event closes an otherwise-still-open record snapshot"
+                );
+                assert_eq!(
+                    *finished_ms,
+                    Some(1718900000003),
+                    "monitor completion time is carried as the live terminal timestamp fallback"
+                );
             }
             other => panic!("expected flow_status payload, got {other:?}"),
         }
@@ -2222,6 +2455,7 @@ mod tests {
             domain: Domain::Flow,
             seq: 5,
             batch: vec![DashboardPayload::FlowStatus {
+                session: Default::default(),
                 api_call_id: "api_001".to_string(),
                 response_id: Some("resp_001".to_string()),
                 status: FlowStatus::Completed,
@@ -2236,6 +2470,7 @@ mod tests {
                     reasoning: Some(0),
                 }),
                 started_ms: 1718900000000,
+                finished_ms: Some(1718900003100),
                 elapsed_ms: Some(3100),
                 // Gap 10b: the spine fields are absent on this golden fixture (an all-`None`
                 // `PhaseTimings` + an empty attempts vec + `None` TTFB), so they `skip` and
@@ -2260,6 +2495,7 @@ mod tests {
                     "upstream_target": "vllm-a",
                     "usage": { "prompt": 812, "completion": 512, "total": 1324, "cached": 128, "reasoning": 0 },
                     "started_ms": 1718900000000u64,
+                    "finished_ms": 1718900003100u64,
                     "elapsed_ms": 3100
                 }
             ]
@@ -2301,6 +2537,7 @@ mod tests {
 
         // PRESENT: a live flow that has reached first content + recorded its serving attempt.
         let present = DashboardPayload::FlowStatus {
+            session: Default::default(),
             api_call_id: "api_001".to_string(),
             response_id: Some("resp_001".to_string()),
             status: FlowStatus::Open,
@@ -2309,6 +2546,7 @@ mod tests {
             upstream_target: Some("vllm-a".to_string()),
             usage: None,
             started_ms: 1_000,
+            finished_ms: None,
             elapsed_ms: Some(500),
             phases,
             attempts: vec![attempt.clone()],
@@ -2339,6 +2577,7 @@ mod tests {
 
         // ABSENT: a freshly-opened flow with no spine measured yet omits every spine key.
         let absent = DashboardPayload::FlowStatus {
+            session: Default::default(),
             api_call_id: "api_002".to_string(),
             response_id: None,
             status: FlowStatus::Open,
@@ -2347,6 +2586,7 @@ mod tests {
             upstream_target: None,
             usage: None,
             started_ms: 1_000,
+            finished_ms: None,
             elapsed_ms: None,
             phases: PhaseTimings::default(),
             attempts: Vec::new(),
@@ -2388,9 +2628,13 @@ mod tests {
                 p95: 920.0,
                 p99: 1840.0,
                 tokens_per_sec: 142.0,
+                prefill_tokens_per_sec: 10_430.25,
+                decode_tokens_per_sec: 78.34,
                 cost_per_min: 0.21,
                 samples: 252,
                 usage_samples: 250,
+                prefill_samples: 248,
+                decode_samples: 246,
                 priced_samples: 240,
                 cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                 windows: MetricWindows {
@@ -2402,9 +2646,13 @@ mod tests {
                         p95: 920.0,
                         p99: 1840.0,
                         tokens_per_sec: 142.0,
+                        prefill_tokens_per_sec: 10_430.25,
+                        decode_tokens_per_sec: 78.34,
                         cost_per_min: 0.21,
                         samples: 252,
                         usage_samples: 250,
+                        prefill_samples: 248,
+                        decode_samples: 246,
                         priced_samples: 240,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2416,9 +2664,13 @@ mod tests {
                         p95: 900.0,
                         p99: 1800.0,
                         tokens_per_sec: 128.0,
+                        prefill_tokens_per_sec: 9_840.5,
+                        decode_tokens_per_sec: 74.2,
                         cost_per_min: 0.19,
                         samples: 1140,
                         usage_samples: 1130,
+                        prefill_samples: 1120,
+                        decode_samples: 1118,
                         priced_samples: 1100,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2430,9 +2682,13 @@ mod tests {
                         p95: 850.0,
                         p99: 1700.0,
                         tokens_per_sec: 100.0,
+                        prefill_tokens_per_sec: 9_120.0,
+                        decode_tokens_per_sec: 69.8,
                         cost_per_min: 0.15,
                         samples: 10440,
                         usage_samples: 10400,
+                        prefill_samples: 10350,
+                        decode_samples: 10320,
                         priced_samples: 10000,
                         cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
@@ -2440,23 +2696,25 @@ mod tests {
             })],
         };
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
-        let want: serde_json::Value = serde_json::json!({
+        // Parse the golden as JSON text instead of expanding a very wide `json!` tree; the
+        // expanded metric contract otherwise exceeds rustc's default macro recursion limit.
+        let want: serde_json::Value = serde_json::from_str(r#"{
             "domain": "metrics",
             "seq": 2,
             "batch": [
                 {
                     "type": "metric_tick",
                     "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
-                    "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
-                    "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated",
+                    "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "prefill_tokens_per_sec": 10430.25, "decode_tokens_per_sec": 78.34, "cost_per_min": 0.21,
+                    "samples": 252, "usage_samples": 250, "prefill_samples": 248, "decode_samples": 246, "priced_samples": 240, "cost_confidence": "estimated",
                     "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated" },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100, "cost_confidence": "estimated" },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000, "cost_confidence": "estimated" }
+                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "prefill_tokens_per_sec": 10430.25, "decode_tokens_per_sec": 78.34, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "prefill_samples": 248, "decode_samples": 246, "priced_samples": 240, "cost_confidence": "estimated" },
+                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "prefill_tokens_per_sec": 9840.5, "decode_tokens_per_sec": 74.2, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "prefill_samples": 1120, "decode_samples": 1118, "priced_samples": 1100, "cost_confidence": "estimated" },
+                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "prefill_tokens_per_sec": 9120.0, "decode_tokens_per_sec": 69.8, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "prefill_samples": 10350, "decode_samples": 10320, "priced_samples": 10000, "cost_confidence": "estimated" }
                     }
                 }
             ]
-        });
+        }"#).expect("parse golden metric tick");
         assert_eq!(got, want);
     }
 
@@ -2651,6 +2909,23 @@ mod tests {
             flows[0].get("inbound_body").is_none(),
             "summaries are body-free"
         );
+        // Every field the SPA's `isFlowSummary` REQUIRES must be present: one row
+        // missing any of them fails `isSnapshotFrame`, the SPA drops the WHOLE
+        // snapshot, `connection` never leaves `'connecting'` and every live frame
+        // piles up in the shadow buffer (the dashboard looks frozen).
+        for field in ["api_call_id", "method", "uri", "status", "started_ms"] {
+            assert!(
+                flows[0].get(field).is_some_and(|value| !value.is_null()),
+                "flow summary must carry a non-null `{field}`"
+            );
+        }
+        // Gap 07: the cost tag is REQUIRED on every row — `Unavailable` when the
+        // served model has no configured price, never absent.
+        assert!(
+            flows[0]["cost_confidence"].is_string(),
+            "flow summary must carry `cost_confidence` (got {:?})",
+            flows[0].get("cost_confidence")
+        );
         // metrics: the flat tile + metrics_seq + windows{m1,m5,h1}.
         let m = &value["metrics"];
         assert_eq!(m["metrics_seq"], serde_json::json!(7));
@@ -2668,6 +2943,71 @@ mod tests {
         );
         // catalog_size on a snapshot node follows the same non-null-uint rule.
         assert_eq!(t["nodes"][0]["catalog_size"], serde_json::json!(0));
+    }
+
+    /// The snapshot rows are priced from the gateway's table at the socket layer
+    /// (the FlowStore stays pricing-free): a served model WITH a price gets a cost
+    /// and a confident/estimated tag, an unpriced one keeps `Unavailable` and a
+    /// `null` cost — never a fabricated `0`.
+    #[test]
+    fn snapshot_summaries_are_priced_from_the_price_table() {
+        use crate::config::ModelPrice;
+        let priced = ModelPrice {
+            input_per_1k: 1.0,
+            output_per_1k: 2.0,
+            cached_per_1k: 0.5,
+            cached_price_configured: true,
+        };
+        // 1000 prompt + 1000 completion tokens at 1.0/2.0 per 1k, nothing cached.
+        let usage = crate::dashboard_flow::FlowUsage {
+            prompt: 1_000,
+            completion: 1_000,
+            total: 2_000,
+            cached: Some(0),
+            reasoning: None,
+        };
+        let mut summaries = vec![
+            summary_for_pricing("api_priced", Some("GLM-5.2"), Some(usage)),
+            summary_for_pricing("api_unpriced", Some("no-price"), Some(usage)),
+            summary_for_pricing("api_no_model", None, Some(usage)),
+        ];
+        price_snapshot_summaries(&mut summaries, |model| {
+            (model == "GLM-5.2").then_some(priced)
+        });
+        assert_eq!(summaries[0].cost, Some(3.0));
+        assert_eq!(
+            summaries[0].cost_confidence,
+            crate::dashboard_api::CostConfidence::Confident
+        );
+        for unpriced in &summaries[1..] {
+            assert_eq!(unpriced.cost, None);
+            assert_eq!(
+                unpriced.cost_confidence,
+                crate::dashboard_api::CostConfidence::Unavailable,
+                "an unpriced row is UNAVAILABLE, never a fake 0"
+            );
+        }
+    }
+
+    fn summary_for_pricing(
+        id: &str,
+        model_served: Option<&str>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    ) -> crate::dashboard_flow::SnapshotFlowSummary {
+        let store = DashboardFlowStore::new();
+        store.open(
+            id.to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
+        );
+        store.finalize(id, FlowStatus::Completed, None, None);
+        let mut summary = store.snapshot_summaries().remove(0);
+        summary.model_served = model_served.map(str::to_string);
+        summary.usage = usage;
+        summary
     }
 
     /// When metrics/topology are absent (disabled / no providers), the snapshot

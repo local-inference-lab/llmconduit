@@ -82,6 +82,20 @@ impl AppError {
         }
     }
 
+    /// An authenticated request is not permitted to use the selected resource.
+    /// Authorization failures are terminal request outcomes: routing/failover
+    /// must not retry another candidate or cool a healthy provider.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::FORBIDDEN,
+            client_message: msg.clone(),
+            message: msg,
+            code: Some("authorization_denied".to_string()),
+            failover: FailoverDisposition::Terminal,
+        }
+    }
+
     pub fn upstream(message: impl Into<String>) -> Self {
         let msg = message.into();
         Self {

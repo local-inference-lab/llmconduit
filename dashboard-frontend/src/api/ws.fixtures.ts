@@ -100,16 +100,18 @@ export const GOLDEN_METRIC_TICK_FRAME_JSON = JSON.stringify({
     {
       type: 'metric_tick',
       reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+      prefill_tokens_per_sec: 10_430.25, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
       // The three per-metric measurability denominators (gap 01): `samples` (latency/error),
       // `usage_samples` (tok/s), `priced_samples` ($/min). The headline mirrors the m1 window.
       // Matches the Rust golden-shape test byte-for-byte.
       // Gap 07: the aggregate cost-confidence tag (mirrors the Rust golden-shape test).
-      samples: 252, usage_samples: 250, priced_samples: 240, cost_confidence: 'estimated',
+      samples: 252, usage_samples: 250, prefill_samples: 248, decode_samples: 246,
+      priced_samples: 240, cost_confidence: 'estimated',
       windows: {
-        m1: { reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1, p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21, samples: 252, usage_samples: 250, priced_samples: 240, cost_confidence: 'estimated' },
-        m5: { reqs_per_sec: 3.8, active_streams: 3, error_pct: 1.0, p50: 175, p95: 900, p99: 1800, tokens_per_sec: 128, cost_per_min: 0.19, samples: 1140, usage_samples: 1130, priced_samples: 1100, cost_confidence: 'estimated' },
-        h1: { reqs_per_sec: 2.9, active_streams: 2, error_pct: 0.8, p50: 160, p95: 850, p99: 1700, tokens_per_sec: 100, cost_per_min: 0.15, samples: 10440, usage_samples: 10400, priced_samples: 10000, cost_confidence: 'estimated' },
+        m1: { reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1, p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, prefill_tokens_per_sec: 10_430.25, decode_tokens_per_sec: 78.34, cost_per_min: 0.21, samples: 252, usage_samples: 250, prefill_samples: 248, decode_samples: 246, priced_samples: 240, cost_confidence: 'estimated' },
+        m5: { reqs_per_sec: 3.8, active_streams: 3, error_pct: 1.0, p50: 175, p95: 900, p99: 1800, tokens_per_sec: 128, prefill_tokens_per_sec: 9_840.5, decode_tokens_per_sec: 74.2, cost_per_min: 0.19, samples: 1140, usage_samples: 1130, prefill_samples: 1120, decode_samples: 1118, priced_samples: 1100, cost_confidence: 'estimated' },
+        h1: { reqs_per_sec: 2.9, active_streams: 2, error_pct: 0.8, p50: 160, p95: 850, p99: 1700, tokens_per_sec: 100, prefill_tokens_per_sec: 9_120, decode_tokens_per_sec: 69.8, cost_per_min: 0.15, samples: 10440, usage_samples: 10400, prefill_samples: 10350, decode_samples: 10320, priced_samples: 10000, cost_confidence: 'estimated' },
       },
     },
   ],

@@ -36,13 +36,16 @@ use axum::Extension;
 use axum::Json;
 use axum::extract::FromRequestParts;
 use axum::extract::OptionalFromRequestParts;
+use axum::extract::Query;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::http::request::Parts;
 use axum::middleware::Next;
+use axum::response::Html;
 use axum::response::IntoResponse;
+use axum::response::Redirect;
 use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -51,6 +54,7 @@ use hmac::Mac;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -72,6 +76,8 @@ pub const SESSION_COOKIE: &str = "llmconduit_session";
 pub const CSRF_COOKIE: &str = "llmconduit_csrf";
 /// Header carrying the double-submit CSRF token on a mutation request.
 pub const CSRF_HEADER: &str = "x-csrf-token";
+const GITHUB_OAUTH_COOKIE: &str = "llmconduit_github_oauth";
+const GITHUB_OAUTH_TTL_SECS: u64 = 600;
 
 /// Minimum decoded length (bytes) for `LLMCONDUIT_DASHBOARD_SESSION_KEY`.
 const MIN_SESSION_KEY_BYTES: usize = 32;
@@ -85,6 +91,11 @@ const ENV_SESSION_KEY: &str = "LLMCONDUIT_DASHBOARD_SESSION_KEY";
 const ENV_PUBLIC_ORIGIN: &str = "LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN";
 const ENV_ALLOW_INSECURE: &str = "LLMCONDUIT_ALLOW_INSECURE_DASHBOARD";
 const ENV_ALLOW_MUTATIONS: &str = "LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS";
+const ENV_GITHUB_CLIENT_ID: &str = "LLMCONDUIT_GITHUB_CLIENT_ID";
+const ENV_GITHUB_CLIENT_SECRET: &str = "LLMCONDUIT_GITHUB_CLIENT_SECRET";
+const ENV_GITHUB_CALLBACK_URL: &str = "LLMCONDUIT_GITHUB_CALLBACK_URL";
+const ENV_GITHUB_ALLOWED_USERS: &str = "LLMCONDUIT_GITHUB_ALLOWED_USERS";
+const ENV_GITHUB_ADMIN_USERS: &str = "LLMCONDUIT_GITHUB_ADMIN_USERS";
 
 // ---------------------------------------------------------------------------
 // Environment snapshot (so loading + the startup decision are unit-testable
@@ -94,13 +105,35 @@ const ENV_ALLOW_MUTATIONS: &str = "LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS";
 /// A read-only snapshot of the dashboard-relevant environment. Taking the env
 /// as data (rather than reading `std::env` inline) lets every loading/startup
 /// decision be exercised deterministically in tests.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct DashboardEnv {
     pub token: Option<String>,
     pub session_key_b64: Option<String>,
     pub public_origin: Option<String>,
     pub allow_insecure: bool,
     pub allow_mutations: bool,
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
+    pub github_callback_url: Option<String>,
+    pub github_allowed_users: Option<String>,
+    pub github_admin_users: Option<String>,
+}
+
+impl std::fmt::Debug for DashboardEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DashboardEnv")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field(
+                "session_key_b64",
+                &self.session_key_b64.as_ref().map(|_| "[redacted]"),
+            )
+            .field("public_origin", &self.public_origin)
+            .field("allow_insecure", &self.allow_insecure)
+            .field("allow_mutations", &self.allow_mutations)
+            .field("github_sso_configured", &self.github_sso_configured())
+            .finish()
+    }
 }
 
 impl DashboardEnv {
@@ -118,7 +151,39 @@ impl DashboardEnv {
             public_origin: read(ENV_PUBLIC_ORIGIN),
             allow_insecure: env_flag(ENV_ALLOW_INSECURE),
             allow_mutations: env_flag(ENV_ALLOW_MUTATIONS),
+            github_client_id: read(ENV_GITHUB_CLIENT_ID),
+            github_client_secret: read(ENV_GITHUB_CLIENT_SECRET),
+            github_callback_url: read(ENV_GITHUB_CALLBACK_URL),
+            github_allowed_users: read(ENV_GITHUB_ALLOWED_USERS),
+            github_admin_users: read(ENV_GITHUB_ADMIN_USERS),
         }
+    }
+
+    pub fn github_sso_configured(&self) -> bool {
+        self.github_client_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .github_client_secret
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .github_allowed_users
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn github_sso_partially_configured(&self) -> bool {
+        [
+            self.github_client_id.as_deref(),
+            self.github_client_secret.as_deref(),
+            self.github_callback_url.as_deref(),
+            self.github_allowed_users.as_deref(),
+            self.github_admin_users.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty())
     }
 }
 
@@ -240,6 +305,8 @@ pub struct DashboardAuth {
     /// deliberately set `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`. The token itself
     /// is NOT retained in cleartext; only its digest ([`Self::token_digest`]) is
     /// kept for the comparison.
+    /// Whether requests require authentication. This is true with either the
+    /// legacy bearer token or a complete GitHub SSO configuration.
     has_token: bool,
     /// Precomputed SHA-256 digest of the configured token (D7a R3 #4). Hashing the
     /// configured token ONCE at construction — rather than on every
@@ -263,6 +330,9 @@ pub struct DashboardAuth {
     /// Whether mutating dashboard routes (the D6 kill route) may proceed.
     /// Default off → mutations are 403.
     allow_mutations: bool,
+    /// Validated GitHub OAuth configuration, when SSO is enabled. Secrets stay
+    /// env-only and are redacted from Debug.
+    github_oauth: Option<GithubOAuthConfig>,
 }
 
 impl std::fmt::Debug for DashboardAuth {
@@ -279,6 +349,10 @@ impl std::fmt::Debug for DashboardAuth {
             .field("loopback", &self.loopback)
             .field("allow_insecure", &self.allow_insecure)
             .field("allow_mutations", &self.allow_mutations)
+            .field(
+                "github_oauth",
+                &self.github_oauth.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }
@@ -330,20 +404,22 @@ impl DashboardAuth {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let github_sso = env.github_sso_configured();
+        let authentication_required = token.is_some() || github_sso;
 
         // Tokenless non-loopback access must always be an explicit operator
         // decision. The insecure override is intentionally loud and is the only
         // way to construct this fully unauthenticated state off loopback.
-        if !loopback && token.is_none() && !env.allow_insecure {
+        if !loopback && !authentication_required && !env.allow_insecure {
             return Err(format!(
-                "{ENV_TOKEN} is required on a non-loopback bind; a tokenless dashboard is \
-                 fully unauthenticated (set {ENV_ALLOW_INSECURE}=1 to opt in explicitly)"
+                "GitHub SSO or {ENV_TOKEN} is required on a non-loopback bind; an \
+                 unauthenticated dashboard requires {ENV_ALLOW_INSECURE}=1"
             ));
         }
 
         let session_key = match env.session_key_b64.as_deref() {
             Some(encoded) => decode_session_key(encoded)?,
-            None if loopback || (env.allow_insecure && token.is_none()) => {
+            None if loopback || (env.allow_insecure && !authentication_required) => {
                 // Dev-open mode does not use login sessions, but the auth context
                 // still needs a key for its uniform cookie/CSRF implementation.
                 warnings.push(format!(
@@ -369,11 +445,13 @@ impl DashboardAuth {
             Some(raw) => Some(PublicOrigin::parse(raw, env.allow_insecure)?),
             None => None,
         };
+        let github_oauth =
+            GithubOAuthConfig::from_env(env, public_origin.as_ref(), env.allow_insecure, loopback)?;
 
         // An authenticated non-loopback override still requires an exact origin:
         // unlike dev-open mode, it carries session cookies that a cross-site WS
         // must never be able to ride.
-        if !loopback && env.allow_insecure && token.is_some() && public_origin.is_none() {
+        if !loopback && env.allow_insecure && authentication_required && public_origin.is_none() {
             return Err(format!(
                 "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind requires an explicit \
                  {ENV_PUBLIC_ORIGIN} (http:// is allowed under this override): the Host header is \
@@ -391,13 +469,14 @@ impl DashboardAuth {
 
         Ok(DashboardAuthBuild {
             auth: Arc::new(Self {
-                has_token: token.is_some(),
+                has_token: authentication_required,
                 token_digest,
                 session_key,
                 public_origin,
                 loopback,
                 allow_insecure: env.allow_insecure,
                 allow_mutations: env.allow_mutations,
+                github_oauth,
             }),
             warnings,
         })
@@ -427,6 +506,16 @@ impl DashboardAuth {
         self.allow_mutations
     }
 
+    pub fn github_sso_enabled(&self) -> bool {
+        self.github_oauth.is_some()
+    }
+
+    fn github_oauth_config(&self) -> Result<&GithubOAuthConfig, &'static str> {
+        self.github_oauth
+            .as_ref()
+            .ok_or("GitHub SSO is not configured")
+    }
+
     /// Constant-time check of a presented login/bearer token against the
     /// configured token. When no token is configured (loopback dev), every
     /// presented token is accepted — the server is only reachable from
@@ -440,7 +529,7 @@ impl DashboardAuth {
     /// digest).
     pub fn verify_token(&self, presented: &str) -> bool {
         match self.token_digest.as_ref() {
-            None => true,
+            None => !self.has_token,
             Some(expected) => {
                 let presented_digest = Sha256::digest(presented.as_bytes());
                 bool::from(presented_digest.as_slice().ct_eq(expected.as_slice()))
@@ -450,26 +539,81 @@ impl DashboardAuth {
 
     // -- session cookie sign/verify ---------------------------------------
 
-    /// Mint a signed session-cookie value with `exp = now + SESSION_TTL_SECS`.
-    /// Returns `(cookie_value, exp_unix_secs)`.
+    /// Mint a signed session-cookie value with `exp = now + SESSION_TTL_SECS`
+    /// for a token/dev-open login (no user). Returns `(cookie_value, exp)`.
     pub fn issue_session(&self) -> (String, u64) {
         let exp = now_unix().saturating_add(SESSION_TTL_SECS);
-        (self.sign_session(exp), exp)
+        (self.sign_session(exp, None), exp)
     }
 
-    /// Sign a `{exp}:{nonce}` payload, returning the full cookie value
-    /// `base64url(mac).{exp}:{nonce}`.
-    fn sign_session(&self, exp: u64) -> String {
+    /// Mint a signed session for a user login. The user is embedded in the
+    /// signed payload so every request knows who acts without a lookup.
+    pub fn issue_session_for(&self, user: &crate::accounts::SessionUser) -> (String, u64) {
+        let exp = now_unix().saturating_add(SESSION_TTL_SECS);
+        (self.sign_session(exp, Some(user)), exp)
+    }
+
+    /// Mint a signed cookie referencing a durable delegated session. The policy
+    /// state stays server-side; only the opaque session id and expiry are signed.
+    pub fn issue_delegated_session(&self, session_id: &str, exp: u64) -> String {
+        let payload = format!("{exp}:delegated:{session_id}");
+        let mac = self.mac(payload.as_bytes());
+        format!("{}.{payload}", URL_SAFE_NO_PAD.encode(mac))
+    }
+
+    /// Sign a `{exp}:{nonce}[:{base64url(user json)}]` payload, returning the
+    /// full cookie value `base64url(mac).{payload}`.
+    fn sign_session(&self, exp: u64, user: Option<&crate::accounts::SessionUser>) -> String {
         let nonce = Uuid::new_v4().simple().to_string();
-        let payload = format!("{exp}:{nonce}");
+        let mut payload = format!("{exp}:{nonce}");
+        if let Some(user) = user
+            && let Ok(encoded) = serde_json::to_vec(user)
+        {
+            payload.push(':');
+            payload.push_str(&URL_SAFE_NO_PAD.encode(encoded));
+        }
         let mac = self.mac(payload.as_bytes());
         format!("{}.{payload}", URL_SAFE_NO_PAD.encode(mac))
     }
 
     /// Verify a session-cookie value: split on the FIRST `.`, recompute the MAC
     /// over the payload, compare in constant time, then confirm `exp` is in the
-    /// future. Returns the cookie `exp` (unix secs) on success.
-    pub fn verify_session(&self, cookie_value: &str) -> Option<u64> {
+    /// future. Returns the cookie `exp` (unix secs) and the embedded user.
+    pub fn verify_session(
+        &self,
+        cookie_value: &str,
+    ) -> Option<(u64, Option<crate::accounts::SessionUser>)> {
+        let payload = self.verify_signed_payload(cookie_value)?;
+        let mut parts = payload.splitn(3, ':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        let nonce = parts.next()?;
+        if nonce == "delegated" || exp <= now_unix() {
+            return None;
+        }
+        let user = parts
+            .next()
+            .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        Some((exp, user))
+    }
+
+    /// Resolve a signed delegated cookie to its server-side session id + expiry.
+    pub fn delegated_session(&self, headers: &HeaderMap) -> Option<(String, u64)> {
+        let value = cookie_value(headers, SESSION_COOKIE)?;
+        let payload = self.verify_signed_payload(&value)?;
+        let mut parts = payload.split(':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        if parts.next()? != "delegated" || exp <= now_unix() {
+            return None;
+        }
+        let session_id = parts.next()?.to_string();
+        if session_id.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        Some((session_id, exp))
+    }
+
+    fn verify_signed_payload<'a>(&self, cookie_value: &'a str) -> Option<&'a str> {
         let (mac_b64, payload) = cookie_value.split_once('.')?;
         let presented_mac = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
         let expected_mac = self.mac(payload.as_bytes());
@@ -478,11 +622,7 @@ impl DashboardAuth {
         if !bool::from(presented_mac.ct_eq_padded(&expected_mac)) {
             return None;
         }
-        let exp: u64 = payload.split(':').next()?.parse().ok()?;
-        if exp <= now_unix() {
-            return None;
-        }
-        Some(exp)
+        Some(payload)
     }
 
     fn mac(&self, message: &[u8]) -> Vec<u8> {
@@ -490,6 +630,37 @@ impl DashboardAuth {
             .expect("HMAC accepts a key of any length");
         mac.update(message);
         mac.finalize().into_bytes().to_vec()
+    }
+
+    fn issue_github_oauth_state(&self) -> (String, String, String) {
+        let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let exp = now_unix().saturating_add(GITHUB_OAUTH_TTL_SECS);
+        let payload = format!("{exp}:{state}:{verifier}");
+        let cookie = format!(
+            "{}.{payload}",
+            URL_SAFE_NO_PAD.encode(self.mac(payload.as_bytes()))
+        );
+        (state, verifier, cookie)
+    }
+
+    fn verify_github_oauth_state(&self, cookie: &str, presented_state: &str) -> Option<String> {
+        let payload = self.verify_signed_payload(cookie)?;
+        let mut parts = payload.split(':');
+        let exp: u64 = parts.next()?.parse().ok()?;
+        let expected_state = parts.next()?;
+        let verifier = parts.next()?;
+        if exp <= now_unix()
+            || parts.next().is_some()
+            || !bool::from(
+                expected_state
+                    .as_bytes()
+                    .ct_eq_padded(presented_state.as_bytes()),
+            )
+        {
+            return None;
+        }
+        Some(verifier.to_string())
     }
 
     // -- request authentication -------------------------------------------
@@ -501,24 +672,38 @@ impl DashboardAuth {
         !self.has_token
     }
 
-    /// Authenticate an HTTP request from its headers: dev-open mode (no token
-    /// configured → always authenticated), a valid signed session cookie, OR
-    /// (non-browser fallback) a constant-time `Authorization: Bearer` token
-    /// match. Returns the session `exp` (cookie path) or `u64::MAX` (dev-open /
-    /// bearer path — neither has a cookie expiry to track).
-    pub fn authenticate(&self, headers: &HeaderMap) -> Option<u64> {
-        if self.dev_open() {
-            return Some(u64::MAX);
-        }
+    /// Authenticate an HTTP request from its headers: a valid signed session
+    /// cookie (user or token login), dev-open mode (no token configured →
+    /// always authenticated), OR (non-browser fallback) a constant-time
+    /// `Authorization: Bearer` token match. The cookie is checked FIRST so a
+    /// user login is attributed even on a dev-open listener. Returns the
+    /// session with its `exp` (`u64::MAX` for the dev-open / bearer paths).
+    pub fn authenticate(&self, headers: &HeaderMap) -> Option<AuthSession> {
         if let Some(value) = cookie_value(headers, SESSION_COOKIE)
-            && let Some(exp) = self.verify_session(&value)
+            && let Some((exp, user)) = self.verify_session(&value)
         {
-            return Some(exp);
+            let kind = if user.is_some() {
+                AuthSessionKind::User
+            } else {
+                AuthSessionKind::DashboardToken
+            };
+            return Some(AuthSession { exp, user, kind });
+        }
+        if self.dev_open() {
+            return Some(AuthSession {
+                exp: u64::MAX,
+                user: None,
+                kind: AuthSessionKind::DevOpen,
+            });
         }
         if let Some(token) = bearer_token(headers)
             && self.verify_token(&token)
         {
-            return Some(u64::MAX);
+            return Some(AuthSession {
+                exp: u64::MAX,
+                user: None,
+                kind: AuthSessionKind::DashboardToken,
+            });
         }
         None
     }
@@ -540,7 +725,9 @@ impl DashboardAuth {
             // No cookie to expire → no per-connection close timer.
             return Some(u64::MAX);
         }
-        cookie_value(headers, SESSION_COOKIE).and_then(|value| self.verify_session(&value))
+        cookie_value(headers, SESSION_COOKIE)
+            .and_then(|value| self.verify_session(&value))
+            .map(|(exp, _user)| exp)
     }
 
     /// Whether the request's `Origin` is allowed for a WS upgrade. A request
@@ -555,7 +742,7 @@ impl DashboardAuth {
     /// - If NO `PUBLIC_ORIGIN` is configured, the request's `Origin` must match
     ///   its `Host`. This fallback is enabled on loopback and in explicitly
     ///   insecure tokenless mode, preserving a same-origin CSWSH boundary.
-    fn origin_allowed(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
             return true;
         };
@@ -733,9 +920,11 @@ impl RouteDecision {
 /// so the routes refuse rather than register with an unusable origin; the
 /// precise parse error is surfaced when [`DashboardAuth::from_env`] runs.
 pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> RouteDecision {
+    let github_sso = env.github_sso_configured();
+    let authentication_required = env.token.is_some() || github_sso;
     if bind_addr.ip().is_loopback() {
         let mut warnings = Vec::new();
-        if env.token.is_none() {
+        if !authentication_required {
             warnings.push(format!(
                 "{ENV_TOKEN} not set on a loopback dev bind; /dashboard and /debug are served \
                  WITHOUT a login token (localhost only)"
@@ -747,7 +936,7 @@ pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> Rout
     // Explicit tokenless insecure mode. This is intentionally checked before
     // the authenticated requirements because neither a session key nor a public
     // origin is needed for login; WS still enforces Origin == Host.
-    if env.token.is_none() {
+    if !authentication_required {
         if env.allow_insecure {
             return RouteDecision::Register {
                 warnings: vec![format!(
@@ -819,41 +1008,147 @@ fn has_valid_session_key(env: &DashboardEnv) -> bool {
 // Login / logout handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+/// Either a dashboard token or a username + password.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
-    pub token: String,
+    /// The dashboard token (`LLMCONDUIT_DASHBOARD_TOKEN`); used only when
+    /// `username` + `password` are not both present.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Username of a SQL `users` account; takes the password path together
+    /// with `password`.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
-/// `POST /dashboard/login` — constant-time token check; on success set the
-/// signed `HttpOnly; SameSite=Strict[; Secure]; Path=/; Max-Age=86400` session
-/// cookie plus the non-`HttpOnly` double-submit CSRF cookie. Response is always
-/// `no-store`.
+/// `POST /dashboard/login` success body (documentation of the handler's
+/// inline JSON; the handler itself builds it with `json!`).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct LoginResponse {
+    /// Always `true`.
+    authenticated: bool,
+    /// The signed-in user for a username/password login; `null` for a token login.
+    user: Option<crate::accounts::SessionUser>,
+}
+
+/// `POST /dashboard/login` — a username/password login is verified against
+/// the SQL `users` table (Argon2id); otherwise the constant-time token check
+/// applies. On success set the signed `HttpOnly; SameSite=Strict[; Secure];
+/// Path=/; Max-Age=86400` session cookie plus the non-`HttpOnly` double-submit
+/// CSRF cookie. Response is always `no-store`.
+#[utoipa::path(
+    post,
+    path = "/dashboard/login",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_login",
+    request_body(content = Option<LoginRequest>, description = "`{username, password}` (verified against the SQL `users` table, Argon2id) when both are present; otherwise `{token}` (constant-time match against the dashboard token). A missing or unparsable JSON body is treated as an empty token login."),
+    responses(
+        (status = 200, description = "Signed in. Sets two cookies: `llmconduit_session` (HMAC-signed, `HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`) and the double-submit CSRF cookie `llmconduit_csrf` (same attributes but NOT `HttpOnly`, so the SPA can echo it in `x-csrf-token`); both add `Secure` when a public https origin is configured. `Cache-Control: no-store`.", body = LoginResponse),
+        (status = 400, description = "Malformed body, wrong content type, or an unknown field (the body is strict); the message names the field.", body = crate::openapi::DashboardError),
+        (status = 401, description = "Rejected, `Cache-Control: no-store`. Messages: `invalid username or password`; `user login needs a SQL store` (username/password given but no SQL store is configured); `sign in with username and password` (a token login once user accounts exist, unless the listener is dev-open); `invalid token`.", body = crate::openapi::DashboardError),
+    )
+)]
 pub async fn dashboard_login(
+    axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
     payload: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let token = match payload {
-        Ok(Json(body)) => body.token,
-        Err(_) => String::new(),
+    let body = match payload {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            // Strict: a malformed body or an unknown field is a 400 that names
+            // the problem, never a silent fall-through to a failed token login.
+            return no_store(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "invalid JSON body, expected {{token}} or {{username, password}}: {}",
+                            rejection.body_text()
+                        )
+                    })),
+                )
+                    .into_response(),
+            );
+        }
     };
-    if !auth.verify_token(&token) {
-        return no_store(
+    login_response(Some(gateway.as_ref()), &auth, body).await
+}
+
+/// The login decision, separated from the axum extractors for tests. `gateway`
+/// supplies the SQL store for user logins; `None` means token-only.
+pub async fn login_response(
+    gateway: Option<&crate::engine::Gateway>,
+    auth: &DashboardAuth,
+    body: LoginRequest,
+) -> Response {
+    let unauthorized = |message: &str| {
+        no_store(
             (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid token"})),
+                Json(serde_json::json!({"error": message})),
             )
                 .into_response(),
-        );
-    }
+        )
+    };
+    let session_user = match (body.username.as_deref(), body.password.as_deref()) {
+        (Some(username), Some(password)) => {
+            let Some(store) = gateway.and_then(|gateway| gateway.persistence_store()) else {
+                return unauthorized("user login needs a SQL store");
+            };
+            let Ok(username) = crate::accounts::validate_username(username) else {
+                return unauthorized("invalid username or password");
+            };
+            match store.get_user_auth(username).await {
+                Ok(Some(user))
+                    if crate::accounts::verify_password(&user.password_hash, password) =>
+                {
+                    Some(crate::accounts::SessionUser {
+                        id: user.id,
+                        username: user.username,
+                        is_admin: user.is_admin,
+                    })
+                }
+                Ok(_) => return unauthorized("invalid username or password"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "user login lookup failed");
+                    return unauthorized("invalid username or password");
+                }
+            }
+        }
+        _ => {
+            let token = body.token.unwrap_or_default();
+            // Once users exist the shared token no longer opens the dashboard
+            // (dev-open loopback listeners keep accepting anything).
+            let users_configured = match gateway {
+                Some(gateway) => crate::accounts_api::auth_mode(gateway, auth).await == "users",
+                None => false,
+            };
+            if users_configured && !auth.dev_open() {
+                return unauthorized("sign in with username and password");
+            }
+            if !auth.verify_token(&token) {
+                return unauthorized("invalid token");
+            }
+            None
+        }
+    };
 
-    let (session_value, _exp) = auth.issue_session();
+    let (session_value, _exp) = match &session_user {
+        Some(user) => auth.issue_session_for(user),
+        None => auth.issue_session(),
+    };
     let csrf = auth.issue_csrf_token();
     let secure = auth.secure_cookies();
 
     let mut response = no_store(
         (
             StatusCode::OK,
-            Json(serde_json::json!({"authenticated": true})),
+            Json(serde_json::json!({"authenticated": true, "user": session_user})),
         )
             .into_response(),
     );
@@ -865,6 +1160,15 @@ pub async fn dashboard_login(
 
 /// `POST /dashboard/logout` — clear both cookies (stateless; a copied session
 /// cookie remains valid until its `exp`).
+#[utoipa::path(
+    post,
+    path = "/dashboard/logout",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_logout",
+    responses(
+        (status = 204, description = "Always. Expires both cookies (`llmconduit_session=; Max-Age=0; HttpOnly` and `llmconduit_csrf=; Max-Age=0`, `SameSite=Strict; Path=/`, plus `Secure` when configured). No session is required; sessions are stateless, so a copied session cookie stays valid until its `exp`. `Cache-Control: no-store`."),
+    )
+)]
 pub async fn dashboard_logout(Extension(auth): Extension<Arc<DashboardAuth>>) -> Response {
     let secure = auth.secure_cookies();
     let mut response = no_store(StatusCode::NO_CONTENT.into_response());
@@ -874,17 +1178,406 @@ pub async fn dashboard_logout(Extension(auth): Extension<Arc<DashboardAuth>>) ->
     response
 }
 
+#[derive(Clone)]
+struct GithubOAuthConfig {
+    client_id: String,
+    client_secret: String,
+    callback_url: String,
+    allowed_users: HashSet<String>,
+    admin_users: HashSet<String>,
+}
+
+impl GithubOAuthConfig {
+    fn from_env(
+        env: &DashboardEnv,
+        public_origin: Option<&PublicOrigin>,
+        allow_insecure: bool,
+        loopback: bool,
+    ) -> Result<Option<Self>, String> {
+        if !env.github_sso_partially_configured() {
+            return Ok(None);
+        }
+        if !env.github_sso_configured() {
+            return Err(format!(
+                "GitHub SSO requires {ENV_GITHUB_CLIENT_ID}, {ENV_GITHUB_CLIENT_SECRET}, and {ENV_GITHUB_ALLOWED_USERS}"
+            ));
+        }
+        Self::from_values(env, public_origin, allow_insecure, loopback).map(Some)
+    }
+
+    fn from_values(
+        env: &DashboardEnv,
+        public_origin: Option<&PublicOrigin>,
+        allow_insecure: bool,
+        loopback: bool,
+    ) -> Result<Self, String> {
+        let callback_url = env.github_callback_url.clone().or_else(|| {
+            public_origin
+                .map(|origin| format!("{}/dashboard/auth/github/callback", origin.as_str()))
+        });
+        let users = |raw: Option<String>| -> HashSet<String> {
+            raw.unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        };
+        let config = Self {
+            client_id: env
+                .github_client_id
+                .clone()
+                .ok_or_else(|| "GitHub SSO is not configured".to_string())?,
+            client_secret: env
+                .github_client_secret
+                .clone()
+                .ok_or_else(|| "GitHub SSO is not configured".to_string())?,
+            callback_url: validate_github_callback_url(
+                public_origin,
+                allow_insecure,
+                loopback,
+                callback_url
+                    .ok_or_else(|| "GitHub SSO callback URL is not configured".to_string())?,
+            )?,
+            allowed_users: users(env.github_allowed_users.clone()),
+            admin_users: users(env.github_admin_users.clone()),
+        };
+        if config.allowed_users.is_empty() {
+            return Err("GitHub SSO has no allowed users".to_string());
+        }
+        for admin in &config.admin_users {
+            if !config.allowed_users.contains(admin) {
+                return Err(format!(
+                    "GitHub SSO administrator '{admin}' is not present in the allowed-users list"
+                ));
+            }
+        }
+        Ok(config)
+    }
+}
+
+fn validate_github_callback_url(
+    public_origin: Option<&PublicOrigin>,
+    allow_insecure: bool,
+    loopback: bool,
+    raw: String,
+) -> Result<String, String> {
+    let url = url::Url::parse(raw.trim())
+        .map_err(|_| "GitHub SSO callback URL is invalid".to_string())?;
+    if url.username() != "" || url.password().is_some() {
+        return Err("GitHub SSO callback URL must not contain credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("GitHub SSO callback URL must not contain query or fragment".to_string());
+    }
+    if url.path() != "/dashboard/auth/github/callback" {
+        return Err(
+            "GitHub SSO callback URL must end with /dashboard/auth/github/callback".to_string(),
+        );
+    }
+    let scheme = url.scheme();
+    let host = url
+        .host_str()
+        .ok_or_else(|| "GitHub SSO callback URL is invalid".to_string())?;
+    let loopback_callback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if scheme != "https"
+        && !(allow_insecure && scheme == "http")
+        && !(loopback && loopback_callback && scheme == "http")
+    {
+        return Err("GitHub SSO callback URL must use https".to_string());
+    }
+    let origin = url.origin().ascii_serialization();
+    if let Some(public_origin) = public_origin
+        && origin != public_origin.as_str()
+    {
+        return Err(
+            "GitHub SSO callback URL origin must match LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN"
+                .to_string(),
+        );
+    }
+    Ok(format!("{origin}/dashboard/auth/github/callback"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GithubCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubUserResponse {
+    id: u64,
+    login: String,
+}
+
+/// Begin the GitHub OAuth web flow. The short-lived state cookie is signed and
+/// uses SameSite=Lax so it is returned on GitHub's cross-site callback.
+#[utoipa::path(
+    get,
+    path = "/dashboard/auth/github/start",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_github_start",
+    responses(
+        (status = 303, description = "Redirects to GitHub OAuth authorization and sets a short-lived signed OAuth state cookie. `Cache-Control: no-store`."),
+        (status = 503, description = "GitHub SSO is not configured or is invalid. Plain text error, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+    )
+)]
+pub async fn dashboard_github_start(Extension(auth): Extension<Arc<DashboardAuth>>) -> Response {
+    let config = match auth.github_oauth_config() {
+        Ok(config) => config,
+        Err(message) => {
+            return no_store((StatusCode::SERVICE_UNAVAILABLE, message).into_response());
+        }
+    };
+    let (state, verifier, oauth_cookie) = auth.issue_github_oauth_state();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let mut authorize =
+        url::Url::parse("https://github.com/login/oauth/authorize").expect("static GitHub URL");
+    authorize
+        .query_pairs_mut()
+        .append_pair("client_id", &config.client_id)
+        .append_pair("redirect_uri", &config.callback_url)
+        .append_pair("state", &state)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+    let mut response = no_store(Redirect::to(authorize.as_str()).into_response());
+    append_set_cookie(
+        response.headers_mut(),
+        &github_oauth_cookie(&oauth_cookie, auth.secure_cookies()),
+    );
+    response
+}
+
+/// Complete GitHub OAuth, enforce the explicit user allow-list, and mint the
+/// same hardened dashboard session/CSRF cookies used by other login methods.
+#[utoipa::path(
+    get,
+    path = "/dashboard/auth/github/callback",
+    tag = "dashboard-auth",
+    operation_id = "dashboard_github_callback",
+    params(
+        ("code" = Option<String>, Query, description = "GitHub OAuth authorization code."),
+        ("state" = Option<String>, Query, description = "Signed OAuth state returned by GitHub."),
+        ("error" = Option<String>, Query, description = "GitHub OAuth error marker; redirects to a safe login-error code."),
+    ),
+    responses(
+        (status = 200, description = "Successful sign-in completion page. Sets dashboard session and CSRF cookies, clears the OAuth state cookie, and starts a fresh same-origin navigation to `/dashboard`. `Cache-Control: no-store`."),
+        (status = 303, description = "On denial/error, redirects to `/dashboard?login_error=github_*`. `Cache-Control: no-store`."),
+    )
+)]
+pub async fn dashboard_github_callback(
+    axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    headers: HeaderMap,
+    Query(query): Query<GithubCallbackQuery>,
+) -> Response {
+    if query.error.is_some() {
+        return github_login_error(&auth, "cancelled");
+    }
+    let config = match auth.github_oauth_config() {
+        Ok(config) => config,
+        Err(_) => return github_login_error(&auth, "configuration"),
+    };
+    let (Some(code), Some(state), Some(cookie)) = (
+        query.code.as_deref(),
+        query.state.as_deref(),
+        cookie_value(&headers, GITHUB_OAUTH_COOKIE),
+    ) else {
+        return github_login_error(&auth, "state");
+    };
+    let Some(verifier) = auth.verify_github_oauth_state(&cookie, state) else {
+        return github_login_error(&auth, "state");
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return github_login_error(&auth, "exchange"),
+    };
+    let token_response = client
+        .post("https://github.com/login/oauth/access_token")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&serde_json::json!({
+            "client_id": config.client_id,
+            "client_secret": config.client_secret,
+            "code": code,
+            "redirect_uri": config.callback_url,
+            "code_verifier": verifier,
+        }))
+        .send()
+        .await;
+    let Ok(token_response) = token_response else {
+        return github_login_error(&auth, "exchange");
+    };
+    if !token_response.status().is_success() {
+        return github_login_error(&auth, "exchange");
+    }
+    let Ok(token) = token_response.json::<GithubTokenResponse>().await else {
+        return github_login_error(&auth, "exchange");
+    };
+    let Some(access_token) = token.access_token.filter(|_| token.error.is_none()) else {
+        return github_login_error(&auth, "exchange");
+    };
+    let user_response = client
+        .get("https://api.github.com/user")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "llmconduit-dashboard")
+        .bearer_auth(access_token)
+        .send()
+        .await;
+    let Ok(user_response) = user_response else {
+        return github_login_error(&auth, "profile");
+    };
+    if !user_response.status().is_success() {
+        return github_login_error(&auth, "profile");
+    }
+    let Ok(github_user) = user_response.json::<GithubUserResponse>().await else {
+        return github_login_error(&auth, "profile");
+    };
+    let login = github_user.login.to_ascii_lowercase();
+    if !config.allowed_users.contains(&login) {
+        return github_login_error(&auth, "denied");
+    }
+    let user = match provision_github_user(&gateway, config, &github_user).await {
+        Ok(user) => user,
+        Err(reason) => return github_login_error(&auth, reason),
+    };
+    let (session, _) = auth.issue_session_for(&user);
+    let csrf = auth.issue_csrf_token();
+    github_login_complete(&auth, &session, &csrf)
+}
+
+/// Finish OAuth on a committed same-origin document before entering the SPA.
+///
+/// A `SameSite=Strict` cookie set on GitHub's cross-site callback is stored, but
+/// browsers do not send it on an immediate HTTP redirect because that request
+/// still belongs to the cross-site redirect chain. A document-level refresh is
+/// a new navigation initiated by our own origin, so the Strict session cookie
+/// is present on the first `/dashboard` request without weakening its policy.
+fn github_login_complete(auth: &DashboardAuth, session: &str, csrf: &str) -> Response {
+    const COMPLETE_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0;url=/dashboard\"><title>Sign-in complete</title></head><body><p>Sign-in complete. <a href=\"/dashboard\">Continue to the dashboard</a>.</p></body></html>";
+
+    let secure = auth.secure_cookies();
+    let mut response = no_store(Html(COMPLETE_HTML).into_response());
+    append_set_cookie(response.headers_mut(), &session_cookie(session, secure));
+    append_set_cookie(response.headers_mut(), &csrf_cookie(csrf, secure));
+    append_set_cookie(
+        response.headers_mut(),
+        &expire_cookie_lax(GITHUB_OAUTH_COOKIE, secure),
+    );
+    response
+}
+
+async fn provision_github_user(
+    gateway: &crate::engine::Gateway,
+    config: &GithubOAuthConfig,
+    github_user: &GithubUserResponse,
+) -> Result<crate::accounts::SessionUser, &'static str> {
+    let Some(store) = gateway.persistence_store() else {
+        tracing::error!("GitHub SSO login requires configured SQL storage");
+        return Err("configuration");
+    };
+    let login = github_user.login.to_ascii_lowercase();
+    let id = format!("github:{}", github_user.id);
+    let username = format!("github:{}", github_user.login);
+    let is_admin = config.admin_users.contains(&login);
+    let user = store
+        .upsert_external_user(&id, &username, is_admin, "github-sso")
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to provision GitHub SSO user");
+            "configuration"
+        })?;
+    gateway.set_users_configured(true);
+    Ok(crate::accounts::SessionUser::from(&user))
+}
+
+fn github_login_error(auth: &DashboardAuth, reason: &str) -> Response {
+    let target = format!("/dashboard?login_error=github_{reason}");
+    let mut response = no_store(Redirect::to(&target).into_response());
+    append_set_cookie(
+        response.headers_mut(),
+        &expire_cookie_lax(GITHUB_OAUTH_COOKIE, auth.secure_cookies()),
+    );
+    response
+}
+
+/// Build the successful key-login response without exposing session or CSRF
+/// material in the body. Both values are carried only by hardened cookies.
+pub(crate) fn delegated_login_response(
+    auth: &DashboardAuth,
+    session_id: &str,
+    csrf: &str,
+    exp: u64,
+) -> Response {
+    let secure = auth.secure_cookies();
+    let session_value = auth.issue_delegated_session(session_id, exp);
+    let max_age = exp.saturating_sub(now_unix());
+    let mut response = no_store(
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"authenticated": true})),
+        )
+            .into_response(),
+    );
+    append_set_cookie(
+        response.headers_mut(),
+        &session_cookie_with_max_age(&session_value, secure, max_age),
+    );
+    append_set_cookie(response.headers_mut(), &csrf_cookie(csrf, secure));
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Auth middleware + extractor for the protected HTTP routes
 // ---------------------------------------------------------------------------
 
 /// A successful authentication, attached to the request so handlers can read
-/// the session `exp` without re-validating.
-#[derive(Debug, Clone, Copy)]
+/// the session `exp` and user without re-validating.
+#[derive(Debug, Clone)]
 pub struct AuthSession {
     /// Session expiry (unix secs); `u64::MAX` for a bearer-authenticated
     /// (non-browser) request.
     pub exp: u64,
+    /// The user behind a username/password login; `None` for token/dev-open
+    /// and delegated dashboard sessions.
+    pub user: Option<crate::accounts::SessionUser>,
+    /// The credential class that authenticated this dashboard session.
+    pub kind: AuthSessionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthSessionKind {
+    User,
+    DashboardToken,
+    DevOpen,
+    Delegated,
+}
+
+impl AuthSession {
+    pub fn delegated(exp: u64) -> Self {
+        Self {
+            exp,
+            user: None,
+            kind: AuthSessionKind::Delegated,
+        }
+    }
+
+    pub fn bootstrap_admin(&self) -> bool {
+        matches!(
+            self.kind,
+            AuthSessionKind::DashboardToken | AuthSessionKind::DevOpen
+        )
+    }
 }
 
 /// `axum` middleware enforcing a valid session on the protected HTTP routes
@@ -899,8 +1592,8 @@ pub async fn require_session(mut request: axum::extract::Request, next: Next) ->
         return unauthorized();
     };
     match auth.authenticate(request.headers()) {
-        Some(exp) => {
-            request.extensions_mut().insert(AuthSession { exp });
+        Some(session) => {
+            request.extensions_mut().insert(session);
             next.run(request).await
         }
         None => unauthorized(),
@@ -920,16 +1613,14 @@ where
         // Prefer an extension inserted by `require_session` (avoids re-verifying
         // the HMAC); fall back to validating the headers directly.
         if let Some(session) = parts.extensions.get::<AuthSession>() {
-            return Ok(*session);
+            return Ok(session.clone());
         }
         let auth = parts
             .extensions
             .get::<Arc<DashboardAuth>>()
             .cloned()
             .ok_or_else(unauthorized)?;
-        auth.authenticate(&parts.headers)
-            .map(|exp| AuthSession { exp })
-            .ok_or_else(unauthorized)
+        auth.authenticate(&parts.headers).ok_or_else(unauthorized)
     }
 }
 
@@ -947,14 +1638,12 @@ where
         _state: &S,
     ) -> Result<Option<Self>, Self::Rejection> {
         if let Some(session) = parts.extensions.get::<AuthSession>() {
-            return Ok(Some(*session));
+            return Ok(Some(session.clone()));
         }
         let Some(auth) = parts.extensions.get::<Arc<DashboardAuth>>().cloned() else {
             return Ok(None);
         };
-        Ok(auth
-            .authenticate(&parts.headers)
-            .map(|exp| AuthSession { exp }))
+        Ok(auth.authenticate(&parts.headers))
     }
 }
 
@@ -967,9 +1656,12 @@ where
 /// SAME cookie authorizes `/dashboard` AND `/debug`), `Max-Age=86400`, and
 /// `Secure` only when a public https origin is configured.
 fn session_cookie(value: &str, secure: bool) -> String {
-    let mut cookie = format!(
-        "{SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
+    session_cookie_with_max_age(value, secure, SESSION_TTL_SECS)
+}
+
+fn session_cookie_with_max_age(value: &str, secure: bool, max_age: u64) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -982,6 +1674,25 @@ fn session_cookie(value: &str, secure: bool) -> String {
 fn csrf_cookie(value: &str, secure: bool) -> String {
     let mut cookie =
         format!("{CSRF_COOKIE}={value}; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn github_oauth_cookie(value: &str, secure: bool) -> String {
+    let mut cookie = format!(
+        "{GITHUB_OAUTH_COOKIE}={value}; HttpOnly; SameSite=Lax; Path=/dashboard/auth/github; Max-Age={GITHUB_OAUTH_TTL_SECS}"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn expire_cookie_lax(name: &str, secure: bool) -> String {
+    let mut cookie =
+        format!("{name}=; HttpOnly; SameSite=Lax; Path=/dashboard/auth/github; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -1228,11 +1939,97 @@ mod tests {
             public_origin: Some("https://dash.example.com".to_string()),
             allow_insecure: false,
             allow_mutations: false,
+            ..Default::default()
         }
     }
 
     fn build(bind: SocketAddr, env: &DashboardEnv) -> Arc<DashboardAuth> {
         DashboardAuth::from_env(bind, env).unwrap().auth
+    }
+
+    #[test]
+    fn github_oauth_state_is_signed_bound_and_single_purpose() {
+        let auth = build(loopback(), &env_with_token());
+        let (state, verifier, cookie) = auth.issue_github_oauth_state();
+        assert_eq!(
+            auth.verify_github_oauth_state(&cookie, &state),
+            Some(verifier)
+        );
+        assert!(
+            auth.verify_github_oauth_state(&cookie, "wrong-state")
+                .is_none()
+        );
+        assert!(auth.verify_github_oauth_state("tampered", &state).is_none());
+    }
+
+    #[test]
+    fn github_sso_env_counts_as_authenticated_startup() {
+        let mut env = env_with_token();
+        env.token = None;
+        env.github_client_id = Some("client-id".to_string());
+        env.github_client_secret = Some("client-secret".to_string());
+        env.github_allowed_users = Some("octocat".to_string());
+        let decision = startup_route_decision(public_bind(), &env);
+        assert!(
+            decision.should_register(),
+            "complete GitHub SSO config should satisfy non-loopback auth"
+        );
+        let auth = build(public_bind(), &env);
+        assert!(auth.github_sso_enabled());
+    }
+
+    #[test]
+    fn github_admin_users_are_explicit_not_allowed_by_default() {
+        let auth = build(public_bind(), &env_with_token());
+        let env = DashboardEnv {
+            github_client_id: Some("client-id".to_string()),
+            github_client_secret: Some("client-secret".to_string()),
+            github_allowed_users: Some("octocat".to_string()),
+            ..Default::default()
+        };
+        let config = GithubOAuthConfig::from_values(&env, auth.public_origin(), false, false)
+            .expect("config");
+        assert!(config.admin_users.is_empty());
+        assert!(
+            !config.admin_users.contains("octocat"),
+            "allowed users are not admins unless listed in LLMCONDUIT_GITHUB_ADMIN_USERS"
+        );
+    }
+
+    #[test]
+    fn github_callback_url_is_strictly_validated() {
+        let auth = build(public_bind(), &env_with_token());
+        let mut env = DashboardEnv {
+            github_client_id: Some("client-id".to_string()),
+            github_client_secret: Some("client-secret".to_string()),
+            github_callback_url: Some(
+                "https://dash.example.com/dashboard/auth/github/callback".to_string(),
+            ),
+            github_allowed_users: Some("octocat".to_string()),
+            github_admin_users: Some("octocat".to_string()),
+            ..Default::default()
+        };
+        let ok = GithubOAuthConfig::from_values(&env, auth.public_origin(), false, false)
+            .expect("valid callback");
+        assert_eq!(
+            ok.callback_url,
+            "https://dash.example.com/dashboard/auth/github/callback"
+        );
+
+        for bad in [
+            "https://dash.example.com/dashboard/auth/github/callback?code=secret",
+            "https://dash.example.com/dashboard/auth/github/callback#frag",
+            "https://user:pw@dash.example.com/dashboard/auth/github/callback",
+            "https://dash.example.com/other/callback",
+            "https://attacker.example.com/dashboard/auth/github/callback",
+            "http://dash.example.com/dashboard/auth/github/callback",
+        ] {
+            env.github_callback_url = Some(bad.to_string());
+            assert!(
+                GithubOAuthConfig::from_values(&env, auth.public_origin(), false, false,).is_err(),
+                "bad callback should be rejected: {bad}"
+            );
+        }
     }
 
     /// Construct a `DashboardAuth` directly with an explicit `loopback`/
@@ -1250,6 +2047,7 @@ mod tests {
             loopback,
             allow_insecure: false,
             allow_mutations: false,
+            github_oauth: None,
         })
     }
 
@@ -1372,7 +2170,10 @@ mod tests {
 
         let auth = build(public_bind(), &env);
         assert!(auth.dev_open());
-        assert_eq!(auth.authenticate(&HeaderMap::new()), Some(u64::MAX));
+        assert_eq!(
+            auth.authenticate(&HeaderMap::new()).map(|s| s.exp),
+            Some(u64::MAX)
+        );
 
         let same_origin = headers_with(&[
             ("origin", "http://192.168.1.10:4000"),
@@ -1602,7 +2403,16 @@ mod tests {
 
     #[test]
     fn debug_redacts_secrets() {
-        let auth = build(loopback(), &env_with_token());
+        let mut env = env_with_token();
+        env.github_client_id = Some("client-id".to_string());
+        env.github_client_secret = Some("github-client-secret".to_string());
+        env.github_allowed_users = Some("octocat".to_string());
+        let rendered_env = format!("{env:?}");
+        assert!(!rendered_env.contains("s3cret-token"));
+        assert!(!rendered_env.contains("github-client-secret"));
+        assert!(!rendered_env.contains(&key_b64()));
+
+        let auth = build(loopback(), &env);
         let rendered = format!("{auth:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("s3cret-token"));
@@ -1679,7 +2489,53 @@ mod tests {
         let auth = build(public_bind(), &env_with_token());
         let (cookie, exp) = auth.issue_session();
         let verified = auth.verify_session(&cookie).expect("valid cookie verifies");
-        assert_eq!(verified, exp);
+        assert_eq!(verified, (exp, None));
+    }
+
+    #[test]
+    fn user_session_roundtrips_the_embedded_user() {
+        let auth = build(public_bind(), &env_with_token());
+        let user = crate::accounts::SessionUser {
+            id: "u-1".to_string(),
+            username: "koen".to_string(),
+            is_admin: true,
+        };
+        let (cookie, exp) = auth.issue_session_for(&user);
+        let (verified_exp, verified_user) = auth.verify_session(&cookie).expect("valid");
+        assert_eq!(verified_exp, exp);
+        assert_eq!(verified_user, Some(user));
+        // Tampering with the embedded user (swapping the signed segment for an
+        // admin "root") breaks the MAC.
+        let (mac, payload) = cookie.split_once('.').unwrap();
+        let mut parts = payload.splitn(3, ':');
+        let (exp_text, nonce) = (parts.next().unwrap(), parts.next().unwrap());
+        let root = crate::accounts::SessionUser {
+            id: "u-0".to_string(),
+            username: "root".to_string(),
+            is_admin: true,
+        };
+        let forged_user = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&root).unwrap());
+        let forged = format!("{mac}.{exp_text}:{nonce}:{forged_user}");
+        assert!(auth.verify_session(&forged).is_none());
+        let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
+        assert_eq!(
+            auth.authenticate(&headers).unwrap().user.unwrap().username,
+            "koen"
+        );
+    }
+
+    #[test]
+    fn delegated_cookie_is_typed_and_never_accepted_as_bootstrap() {
+        let auth = build(public_bind(), &env_with_token());
+        let exp = now_unix() + 300;
+        let cookie = auth.issue_delegated_session("dsh_example", exp);
+        assert!(auth.verify_session(&cookie).is_none());
+        let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
+        assert_eq!(
+            auth.delegated_session(&headers),
+            Some(("dsh_example".to_string(), exp))
+        );
+        assert!(auth.authenticate(&headers).is_none());
     }
 
     #[test]
@@ -1708,7 +2564,7 @@ mod tests {
     fn expired_session_is_rejected() {
         let auth = build(public_bind(), &env_with_token());
         // Sign with an exp in the past.
-        let cookie = auth.sign_session(now_unix().saturating_sub(10));
+        let cookie = auth.sign_session(now_unix().saturating_sub(10), None);
         assert!(auth.verify_session(&cookie).is_none());
     }
 
@@ -1728,7 +2584,7 @@ mod tests {
         let auth = build(public_bind(), &env_with_token());
         let (cookie, exp) = auth.issue_session();
         let headers = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
-        assert_eq!(auth.authenticate(&headers), Some(exp));
+        assert_eq!(auth.authenticate(&headers).map(|s| s.exp), Some(exp));
     }
 
     #[test]
@@ -1741,7 +2597,7 @@ mod tests {
     fn bearer_fallback_authenticates_with_configured_token() {
         let auth = build(public_bind(), &env_with_token());
         let headers = headers_with(&[("authorization", "Bearer s3cret-token")]);
-        assert_eq!(auth.authenticate(&headers), Some(u64::MAX));
+        assert_eq!(auth.authenticate(&headers).map(|s| s.exp), Some(u64::MAX));
         let bad = headers_with(&[("authorization", "Bearer nope")]);
         assert!(auth.authenticate(&bad).is_none());
     }
@@ -2139,6 +2995,47 @@ mod tests {
         assert!(cookie.contains("Path=/"));
     }
 
+    #[tokio::test]
+    async fn github_login_completion_breaks_the_cross_site_redirect_chain() {
+        let auth = build(public_bind(), &env_with_token());
+        let (session, _) = auth.issue_session();
+        let response = github_login_complete(&auth, &session, "csrf-token");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with(&format!("{SESSION_COOKIE}="))
+                && cookie.contains("SameSite=Strict")
+                && cookie.contains("Secure")
+        }));
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with(&format!("{CSRF_COOKIE}=csrf-token"))
+                && cookie.contains("SameSite=Strict")
+        }));
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with(&format!("{GITHUB_OAUTH_COOKIE}=")) && cookie.contains("Max-Age=0")
+        }));
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("http-equiv=\"refresh\""));
+        assert!(body.contains("url=/dashboard"));
+        assert!(!body.contains(&session));
+        assert!(!body.contains("csrf-token"));
+    }
+
     // -- Secure cookie derives from the origin SCHEME (D7a R4) -------------
 
     #[test]
@@ -2227,11 +3124,14 @@ mod tests {
     async fn login_response_carries_security_headers() {
         // The successful login response must carry the headers AND its cookies.
         let auth = build(public_bind(), &env_with_token());
-        let resp = dashboard_login(
-            Extension(Arc::clone(&auth)),
-            Ok(Json(LoginRequest {
-                token: "s3cret-token".to_string(),
-            })),
+        let resp = login_response(
+            None,
+            &auth,
+            LoginRequest {
+                token: Some("s3cret-token".to_string()),
+                username: None,
+                password: None,
+            },
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);

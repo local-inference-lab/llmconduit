@@ -1007,7 +1007,7 @@ impl TurnCaptureState {
     /// failure NEVER blocks publishing a valid capture nor the registry eviction,
     /// and a tmp-build failure NEVER publishes a partial/empty final.
     fn assemble_blocking(&self) {
-        if let Err(err) = std::fs::create_dir_all(&self.capture_dir) {
+        if let Err(err) = create_private_dir_all(&self.capture_dir) {
             tracing::warn!(
                 dir = %self.capture_dir.display(),
                 error = %err,
@@ -1041,6 +1041,12 @@ impl TurnCaptureState {
                         "turn-capture: failed to publish artifact (rename)"
                     );
                     let _ = std::fs::remove_file(&tmp);
+                } else if let Err(err) = sync_directory(&self.capture_dir) {
+                    tracing::warn!(
+                        dir = %self.capture_dir.display(),
+                        error = %err,
+                        "turn-capture: failed to fsync capture dir after publish"
+                    );
                 }
             }
             Err(err) => {
@@ -1101,7 +1107,7 @@ impl TurnCaptureState {
     /// encoding, content}` object where `content` is a JSON value (a request that
     /// parses), a JSON string (valid UTF-8), or a base64 string (non-UTF-8).
     fn write_artifact_file(&self, tmp: &Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(tmp)?;
+        let file = create_private_file(tmp)?;
         let mut w = std::io::BufWriter::new(file);
 
         w.write_all(b"{\"api_call_id\":")?;
@@ -1585,7 +1591,7 @@ fn create_section_file(meta: &SectionMeta) -> Option<tokio::fs::File> {
     // Idempotent + race-tolerant across the turn's sibling sections all racing to
     // create the shared work dir.
     if let Some(parent) = meta.path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
+        && let Err(err) = create_private_capture_work_tree(parent)
     {
         tracing::warn!(
             path = %meta.path.display(),
@@ -1594,7 +1600,7 @@ fn create_section_file(meta: &SectionMeta) -> Option<tokio::fs::File> {
         );
         meta.partial.store(true, Ordering::Release);
     }
-    match std::fs::File::create(&meta.path) {
+    match create_private_file(&meta.path) {
         Ok(file) => Some(tokio::fs::File::from_std(file)),
         Err(err) => {
             tracing::warn!(
@@ -1606,6 +1612,61 @@ fn create_section_file(meta: &SectionMeta) -> Option<tokio::fs::File> {
             None
         }
     }
+}
+
+fn create_private_capture_work_tree(work_dir: &Path) -> std::io::Result<()> {
+    create_private_dir_all(work_dir)?;
+    if let Some(work_root) = work_dir.parent() {
+        secure_private_dir(work_root)?;
+        if let Some(capture_root) = work_root.parent() {
+            secure_private_dir(capture_root)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    secure_private_dir(path)
+}
+
+#[cfg(unix)]
+fn secure_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn secure_private_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The background writer for one [`Section`]. The work dir + section file are
@@ -2200,6 +2261,24 @@ mod tests {
             state.work_dir(),
             dir.join(".work").join("api_abc123").as_path()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for private_dir in [&dir, &dir.join(".work"), state.work_dir()] {
+                assert_eq!(
+                    std::fs::metadata(private_dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(state.inbound_request_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]
@@ -2328,6 +2407,18 @@ mod tests {
         assert_eq!(section["content"]["model"], "served-model");
         assert_eq!(section["content"]["max_tokens"], 123);
         assert_eq!(section["partial"], false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("api_ur.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     /// F1d last-writer-wins: a SECOND `write_upstream_request` call REPLACES the

@@ -329,6 +329,7 @@ mod integration {
 
     fn config_for(server_uri: &str) -> Config {
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: format!("{server_uri}/v1/").parse().expect("url"),
             upstream_api_key: None,
@@ -362,6 +363,8 @@ mod integration {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: llmconduit::config::MeshConfig::default(),
         }
     }
 
@@ -372,7 +375,7 @@ mod integration {
             "choices": [{
                 "index": 0,
                 "delta": {"role": "assistant", "content": "hello after retry"},
-                "finish_reason": null
+                "finish_reason": "stop"
             }],
             "usage": null
         });

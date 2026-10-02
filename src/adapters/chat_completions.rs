@@ -23,7 +23,14 @@ use uuid::Uuid;
 pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesRequest> {
     let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
-    let extra_body = request.extra_body.clone();
+    let mut extra_body = request.extra_body.clone();
+    // Conversation affinity belongs to the canonical request, rather than
+    // becoming an unknown vendor kwarg on the upstream chat request.
+    let prompt_cache_key = match extra_body.remove("prompt_cache_key") {
+        Some(Value::String(key)) => Some(key),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err(AppError::bad_request("prompt_cache_key must be a string")),
+    };
     Ok(ResponsesRequest {
         model: request.model,
         instructions: String::new(),
@@ -43,7 +50,7 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
         stream: true,
         include: Vec::new(),
         service_tier: None,
-        prompt_cache_key: None,
+        prompt_cache_key,
         text: convert_response_format(request.response_format.as_ref()),
         client_metadata: None,
         previous_response_id: None,
@@ -365,6 +372,39 @@ impl ChatSseEvent {
     }
 }
 
+/// One converter output before it is rendered. Chunks stay typed so the hot
+/// streaming path can serialize them straight to the wire, instead of building
+/// a `Value` tree per token and then serializing that.
+enum ChatChunkOut {
+    Chunk(ChatStreamChunk),
+    Value(Value),
+    Done,
+}
+
+impl ChatChunkOut {
+    fn into_event(self) -> ChatSseEvent {
+        match self {
+            Self::Chunk(chunk) => {
+                ChatSseEvent::Data(serde_json::to_value(chunk).unwrap_or(Value::Null))
+            }
+            Self::Value(value) => ChatSseEvent::Data(value),
+            Self::Done => ChatSseEvent::Done,
+        }
+    }
+
+    /// Byte-identical to `self.into_event().to_sse_data()`: the chunk structs
+    /// declare their fields in the sorted order a `Value` map serializes in.
+    fn into_sse_data(self) -> String {
+        match self {
+            Self::Chunk(chunk) => {
+                serde_json::to_string(&chunk).unwrap_or_else(|_| "null".to_string())
+            }
+            Self::Value(value) => value.to_string(),
+            Self::Done => "[DONE]".to_string(),
+        }
+    }
+}
+
 struct ChatToolStreamState {
     index: usize,
     name_emitted: bool,
@@ -392,6 +432,23 @@ impl ChatCompletionStreamConverter {
     }
 
     pub fn convert(&mut self, event: &SseEvent) -> Vec<ChatSseEvent> {
+        self.convert_chunks(event)
+            .into_iter()
+            .map(ChatChunkOut::into_event)
+            .collect()
+    }
+
+    /// [`Self::convert`] rendered straight to SSE `data:` payloads — the same
+    /// bytes as `convert(..)` + [`ChatSseEvent::to_sse_data`], without the
+    /// per-chunk intermediate `Value`.
+    pub fn convert_sse_data(&mut self, event: &SseEvent) -> Vec<String> {
+        self.convert_chunks(event)
+            .into_iter()
+            .map(ChatChunkOut::into_sse_data)
+            .collect()
+    }
+
+    fn convert_chunks(&mut self, event: &SseEvent) -> Vec<ChatChunkOut> {
         let mut output = Vec::new();
         match event.event.as_str() {
             "response.created" => {
@@ -406,7 +463,7 @@ impl ChatCompletionStreamConverter {
             "response.output_text.delta" => {
                 if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
                     self.ensure_role_chunk(&mut output);
-                    output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+                    output.push(ChatChunkOut::Chunk(self.chunk(vec![ChatStreamChoice {
                         index: 0,
                         delta: ChatStreamDelta {
                             content: Some(delta.to_string()),
@@ -419,7 +476,7 @@ impl ChatCompletionStreamConverter {
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event.data.get("delta").and_then(Value::as_str) {
                     self.ensure_role_chunk(&mut output);
-                    output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+                    output.push(ChatChunkOut::Chunk(self.chunk(vec![ChatStreamChoice {
                         index: 0,
                         delta: ChatStreamDelta {
                             reasoning_content: Some(delta.to_string()),
@@ -455,7 +512,7 @@ impl ChatCompletionStreamConverter {
             "response.completed" | "response.incomplete" => {
                 self.ensure_role_chunk(&mut output);
                 let finish_reason = finish_reason_from_response(&event.data, self.has_tool_calls());
-                output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+                output.push(ChatChunkOut::Chunk(self.chunk(vec![ChatStreamChoice {
                     index: 0,
                     delta: ChatStreamDelta::default(),
                     finish_reason: Some(finish_reason),
@@ -463,12 +520,12 @@ impl ChatCompletionStreamConverter {
                 if self.include_usage
                     && let Some(usage) = usage_from_response(&event.data)
                 {
-                    output.push(ChatSseEvent::Data(self.usage_chunk(usage)));
+                    output.push(ChatChunkOut::Chunk(self.usage_chunk(usage)));
                 }
-                output.push(ChatSseEvent::Done);
+                output.push(ChatChunkOut::Done);
             }
             "response.failed" => {
-                output.push(ChatSseEvent::Data(json!({
+                output.push(ChatChunkOut::Value(json!({
                     "error": {
                         "message": response_error_message(&event.data),
                         // The OpenAI Chat error object carries a structured `code`
@@ -477,19 +534,19 @@ impl ChatCompletionStreamConverter {
                         "code": response_error_code(&event.data),
                     }
                 })));
-                output.push(ChatSseEvent::Done);
+                output.push(ChatChunkOut::Done);
             }
             _ => {}
         }
         output
     }
 
-    fn ensure_role_chunk(&mut self, output: &mut Vec<ChatSseEvent>) {
+    fn ensure_role_chunk(&mut self, output: &mut Vec<ChatChunkOut>) {
         if self.role_sent {
             return;
         }
         self.role_sent = true;
-        output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+        output.push(ChatChunkOut::Chunk(self.chunk(vec![ChatStreamChoice {
             index: 0,
             delta: ChatStreamDelta {
                 role: Some("assistant"),
@@ -504,7 +561,7 @@ impl ChatCompletionStreamConverter {
         call_id: &str,
         name: Option<&str>,
         delta: &str,
-        output: &mut Vec<ChatSseEvent>,
+        output: &mut Vec<ChatChunkOut>,
     ) {
         let (index, first_delta) = self.register_tool_call(call_id);
         let name = self.take_unemitted_tool_name(call_id, name);
@@ -522,7 +579,7 @@ impl ChatCompletionStreamConverter {
         );
     }
 
-    fn emit_tool_call(&mut self, mut tool_call: ChatToolCall, output: &mut Vec<ChatSseEvent>) {
+    fn emit_tool_call(&mut self, mut tool_call: ChatToolCall, output: &mut Vec<ChatChunkOut>) {
         let Some(call_id) = tool_call.id.clone() else {
             return;
         };
@@ -580,9 +637,9 @@ impl ChatCompletionStreamConverter {
         Some(name.to_string())
     }
 
-    fn push_tool_call(&mut self, tool_call: ChatToolCall, output: &mut Vec<ChatSseEvent>) {
+    fn push_tool_call(&mut self, tool_call: ChatToolCall, output: &mut Vec<ChatChunkOut>) {
         self.ensure_role_chunk(output);
-        output.push(ChatSseEvent::Data(self.chunk(vec![ChatStreamChoice {
+        output.push(ChatChunkOut::Chunk(self.chunk(vec![ChatStreamChoice {
             index: 0,
             delta: ChatStreamDelta {
                 tool_calls: Some(vec![tool_call]),
@@ -596,28 +653,26 @@ impl ChatCompletionStreamConverter {
         !self.emitted_tool_calls.is_empty()
     }
 
-    fn chunk(&self, choices: Vec<ChatStreamChoice>) -> Value {
-        serde_json::to_value(ChatStreamChunk {
+    fn chunk(&self, choices: Vec<ChatStreamChoice>) -> ChatStreamChunk {
+        ChatStreamChunk {
             id: self.chat_id(),
             object: "chat.completion.chunk",
             created: self.created,
             model: self.model.clone(),
             choices,
             usage: None,
-        })
-        .unwrap_or(Value::Null)
+        }
     }
 
-    fn usage_chunk(&self, usage: ChatUsage) -> Value {
-        serde_json::to_value(ChatStreamChunk {
+    fn usage_chunk(&self, usage: ChatUsage) -> ChatStreamChunk {
+        ChatStreamChunk {
             id: self.chat_id(),
             object: "chat.completion.chunk",
             created: self.created,
             model: self.model.clone(),
             choices: Vec::new(),
             usage: Some(usage),
-        })
-        .unwrap_or(Value::Null)
+        }
     }
 
     fn chat_id(&self) -> String {
@@ -912,6 +967,12 @@ fn response_value_usage(response: &Value) -> Option<ChatUsage> {
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cost: usage.get("cost").and_then(Value::as_f64),
+        cost_source: usage
+            .get("cost_source")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        cost_details: usage.get("cost_details").cloned(),
         prompt_tokens_details: usage
             .get("input_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
@@ -984,46 +1045,101 @@ struct ChatCompletionMessage {
     tool_calls: Option<Vec<ChatToolCall>>,
 }
 
+// The streamed chunk types declare their fields in SORTED key order. Chunks were
+// historically rendered through a `serde_json::Value` (a sorted map), and the
+// direct-serialization fast path (`ChatChunkOut::into_sse_data`) must emit the
+// exact same bytes, so keep new fields in alphabetical position.
 #[derive(Serialize)]
 struct ChatStreamChunk {
-    id: String,
-    object: &'static str,
-    created: i64,
-    model: String,
     choices: Vec<ChatStreamChoice>,
+    created: i64,
+    id: String,
+    model: String,
+    object: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<ChatUsage>,
 }
 
 #[derive(Serialize)]
 struct ChatStreamChoice {
-    index: usize,
     delta: ChatStreamDelta,
     #[serde(skip_serializing_if = "Option::is_none")]
     finish_reason: Option<String>,
+    index: usize,
 }
 
 #[derive(Default, Serialize)]
 struct ChatStreamDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_tool_calls_sorted"
+    )]
     tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+/// Serialize wire `ChatToolCall`s (declared in `models::chat` in wire order)
+/// with their keys sorted, matching what a `Value` round-trip produced.
+fn serialize_tool_calls_sorted<S: serde::Serializer>(
+    calls: &Option<Vec<ChatToolCall>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    struct SortedFunction<'a>(&'a ChatFunctionCall);
+    impl Serialize for SortedFunction<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(None)?;
+            if let Some(arguments) = &self.0.arguments {
+                map.serialize_entry("arguments", arguments)?;
+            }
+            if let Some(name) = &self.0.name {
+                map.serialize_entry("name", name)?;
+            }
+            map.end()
+        }
+    }
+
+    struct SortedCall<'a>(&'a ChatToolCall);
+    impl Serialize for SortedCall<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let call = self.0;
+            let mut map = serializer.serialize_map(None)?;
+            map.serialize_entry("function", &SortedFunction(&call.function))?;
+            if let Some(id) = &call.id {
+                map.serialize_entry("id", id)?;
+            }
+            if let Some(index) = &call.index {
+                map.serialize_entry("index", index)?;
+            }
+            map.serialize_entry("type", &call.kind)?;
+            map.end()
+        }
+    }
+
+    serializer.collect_seq(calls.iter().flatten().map(SortedCall))
 }
 
 #[derive(Clone, Serialize)]
 struct ChatUsage {
-    prompt_tokens: i64,
     completion_tokens: i64,
-    total_tokens: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_tokens_details: Option<ChatPromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completion_tokens_details: Option<ChatCompletionTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_source: Option<String>,
+    prompt_tokens: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_tokens_details: Option<ChatPromptTokensDetails>,
+    total_tokens: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -1044,6 +1160,86 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    /// The direct-serialization streaming path must emit exactly the bytes the
+    /// `Value` path (`convert` + `to_sse_data`) does, for every chunk shape.
+    #[test]
+    fn direct_sse_data_matches_value_path_byte_for_byte() {
+        use super::ChatCompletionStreamConverter;
+        use crate::engine::SseEvent;
+        let event = |name: &str, data: Value| SseEvent {
+            event: name.to_string(),
+            data,
+        };
+        let events = vec![
+            event("response.created", json!({"response": {"id": "resp_1"}})),
+            event(
+                "response.output_text.delta",
+                json!({"delta": "he said \"hi\" é\n"}),
+            ),
+            event("response.reasoning_text.delta", json!({"delta": "think"})),
+            event(
+                "response.function_call_arguments.delta",
+                json!({"call_id": "call_a", "name": "lookup", "delta": "{\"q\":"}),
+            ),
+            event(
+                "response.function_call_arguments.delta",
+                json!({"call_id": "call_a", "delta": "1}"}),
+            ),
+            event(
+                "response.function_call_arguments.done",
+                json!({"call_id": "call_b", "name": "other", "arguments": "{}"}),
+            ),
+            event(
+                "response.output_item.done",
+                json!({"item": {"type": "function_call", "call_id": "call_c", "name": "third", "arguments": "{\"x\":true}"}}),
+            ),
+            event(
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": {
+                    "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                    "cost": 0.0042, "cost_source": "openrouter",
+                    "cost_details": {"upstream": 0.004, "a": [1, 2]},
+                    "input_tokens_details": {"cached_tokens": 3},
+                    "output_tokens_details": {"reasoning_tokens": 2}
+                }}}),
+            ),
+            event(
+                "response.failed",
+                json!({"response": {"error": {"message": "boom", "code": "server_error"}}}),
+            ),
+        ];
+        let mut via_value = ChatCompletionStreamConverter::new("model-x".to_string(), true);
+        let mut direct = ChatCompletionStreamConverter::new("model-x".to_string(), true);
+        direct.created = via_value.created;
+        let mut chunks = 0;
+        for event in &events {
+            let expected: Vec<String> = via_value
+                .convert(event)
+                .iter()
+                .map(super::ChatSseEvent::to_sse_data)
+                .collect();
+            let actual = direct.convert_sse_data(event);
+            assert_eq!(actual, expected, "event {}", event.event);
+            chunks += actual.len();
+        }
+        assert!(chunks >= 10, "every chunk shape was exercised");
+
+        let mut golden = ChatCompletionStreamConverter::new("m".to_string(), false);
+        golden.created = 1;
+        golden.role_sent = true;
+        golden.id = Some("resp_1".to_string());
+        assert_eq!(
+            golden.convert_sse_data(&event(
+                "response.output_text.delta",
+                json!({"delta": "hi"})
+            )),
+            vec![
+                r#"{"choices":[{"delta":{"content":"hi"},"index":0}],"created":1,"id":"resp_1","model":"m","object":"chat.completion.chunk"}"#
+                    .to_string()
+            ]
+        );
+    }
 
     #[test]
     fn convert_request_preserves_extra_body() {
@@ -1158,6 +1354,43 @@ mod tests {
     #[test]
     fn collected_preserves_reasoning() {
         assert_eq!(collected_reasoning(), Some("hidden".to_string()));
+    }
+
+    #[test]
+    fn stream_usage_preserves_openrouter_cost_fields() {
+        let mut converter = ChatCompletionStreamConverter::new("model".to_string(), true);
+        let events = converter.convert(&SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "total_tokens": 15,
+                        "cost": 0.0042,
+                        "cost_source": "openrouter",
+                        "cost_details": {
+                            "upstream_inference_cost": 0.0031
+                        }
+                    }
+                }
+            }),
+        });
+
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                ChatSseEvent::Data(value) => value.get("usage"),
+                ChatSseEvent::Done => None,
+            })
+            .expect("usage chunk");
+        assert_eq!(usage["cost"], json!(0.0042));
+        assert_eq!(usage["cost_source"], json!("openrouter"));
+        assert_eq!(
+            usage["cost_details"]["upstream_inference_cost"],
+            json!(0.0031)
+        );
     }
 
     fn function_arguments_delta(call_id: &str, name: Option<&str>, delta: &str) -> SseEvent {

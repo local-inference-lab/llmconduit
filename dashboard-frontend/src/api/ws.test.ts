@@ -26,13 +26,17 @@ function snapshot(): SnapshotFrame {
 /** A fully-valid MetricsResponse (passes `isMetricsResponse`) for staged-snapshot tests. */
 const METRIC_WINDOW = {
   reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
-  samples: 7, usage_samples: 7, priced_samples: 7, cost_confidence: 'estimated' as const,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10,
+  prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50, cost_per_min: 0.5,
+  samples: 7, usage_samples: 7, prefill_samples: 7, decode_samples: 7,
+  priced_samples: 7, cost_confidence: 'estimated' as const,
 };
 const METRICS_SNAP = {
   metrics_seq: 5, reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
-  samples: 7, usage_samples: 7, priced_samples: 7, cost_confidence: 'estimated' as const,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10,
+  prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50, cost_per_min: 0.5,
+  samples: 7, usage_samples: 7, prefill_samples: 7, decode_samples: 7,
+  priced_samples: 7, cost_confidence: 'estimated' as const,
   windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
 };
 
@@ -387,10 +391,10 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   });
 
   it('accepts a metric_tick frame carrying the new denominators (regression guard)', () => {
-    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' };
+    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50, cost_per_min: 0, samples: 1, usage_samples: 1, prefill_samples: 1, decode_samples: 1, priced_samples: 1, cost_confidence: 'estimated' };
     expect(isDashboardFrame({
       domain: 'metrics', seq: 1,
-      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated', windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50, cost_per_min: 0, samples: 1, usage_samples: 1, prefill_samples: 1, decode_samples: 1, priced_samples: 1, cost_confidence: 'estimated', windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
     })).toBe(true);
   });
 

@@ -43,10 +43,24 @@ export function isMockEnabled(): boolean {
  */
 export function parseBootstrap(raw: unknown): DashboardBootstrap {
   const obj = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
+  const user = obj.user;
+  const parsedUser =
+    typeof user === 'object' && user !== null &&
+    typeof (user as Record<string, unknown>).id === 'string' &&
+    typeof (user as Record<string, unknown>).username === 'string'
+      ? {
+          id: (user as Record<string, unknown>).id as string,
+          username: (user as Record<string, unknown>).username as string,
+          is_admin: (user as Record<string, unknown>).is_admin === true,
+        }
+      : null;
+  const mode = obj.auth_mode;
   return {
     authenticated: obj.authenticated === true,
     csrf_token: typeof obj.csrf_token === 'string' ? obj.csrf_token : null,
     mutations_enabled: obj.mutations_enabled === true,
+    user: parsedUser,
+    auth_mode: mode === 'users' || mode === 'open' || mode === 'github' ? mode : 'token',
   };
 }
 
@@ -64,5 +78,7 @@ export function readBootstrap(): DashboardBootstrap {
     authenticated: false,
     csrf_token: isMockEnabled() ? mockBootstrapCsrf : null,
     mutations_enabled: isMockEnabled(),
+    user: null,
+    auth_mode: 'token',
   };
 }

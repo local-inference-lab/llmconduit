@@ -14,9 +14,12 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
     samples,
     usage_samples: samples,
+    prefill_samples: samples,
+    decode_samples: samples,
     priced_samples: samples,
     cost_confidence: 'estimated',
     ...over,
@@ -47,10 +50,10 @@ describe('metricHistory', () => {
 
   it('extracts the per-metric series independently per window', () => {
     let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 10 }, h1: { tokens_per_sec: 99 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 20 }, h1: { tokens_per_sec: 88 } }));
-    expect(seriesFor(h, 'm1', 'tokens_per_sec')).toEqual([10, 20]);
-    expect(seriesFor(h, 'h1', 'tokens_per_sec')).toEqual([99, 88]);
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 10 }, h1: { decode_tokens_per_sec: 99 } }));
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 20 }, h1: { decode_tokens_per_sec: 88 } }));
+    expect(seriesFor(h, 'm1', 'decode_tokens_per_sec')).toEqual([10, 20]);
+    expect(seriesFor(h, 'h1', 'decode_tokens_per_sec')).toEqual([99, 88]);
   });
 
   it('caps each ring at HISTORY_DEPTH (oldest evicted)', () => {
@@ -76,10 +79,10 @@ describe('metricHistory', () => {
     let h = emptyHistory();
     // Sample A: usage reported → real tok/s (142). Sample B: NO usage (usage_samples 0)
     // with a raw 0 tok/s on the wire. Sample C: usage again → real tok/s (50).
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 142, usage_samples: 5, priced_samples: 5 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 0, usage_samples: 0, priced_samples: 0 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 50, usage_samples: 5, priced_samples: 5 } }));
-    const series = seriesFor(h, 'm1', 'tokens_per_sec');
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 142, decode_samples: 5 } }));
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 0, decode_samples: 0 } }));
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 50, decode_samples: 5 } }));
+    const series = seriesFor(h, 'm1', 'decode_tokens_per_sec');
     expect(series).toHaveLength(3);
     expect(series[0]).toBe(142);
     expect(Number.isNaN(series[1])).toBe(true); // GAP, not a fabricated 0
@@ -95,10 +98,10 @@ describe('metricHistory', () => {
     expect(series).toEqual([0, 2.5]); // both plotted, no NaN gap
   });
 
-  it('gaps cost_per_min when pricing is missing but plots tok/s when usage is present', () => {
+  it('gaps cost_per_min when pricing is missing but plots phase speed when measured', () => {
     let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 142, cost_per_min: 0, samples: 4, usage_samples: 4, priced_samples: 0 } }));
+    h = appendTick(h, tick({ m1: { decode_tokens_per_sec: 142, cost_per_min: 0, samples: 4, decode_samples: 4, priced_samples: 0 } }));
     expect(Number.isNaN(seriesFor(h, 'm1', 'cost_per_min')[0])).toBe(true); // unpriced → gap
-    expect(seriesFor(h, 'm1', 'tokens_per_sec')[0]).toBe(142); // usage present → plotted
+    expect(seriesFor(h, 'm1', 'decode_tokens_per_sec')[0]).toBe(142);
   });
 });

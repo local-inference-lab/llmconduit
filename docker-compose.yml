@@ -1,0 +1,36 @@
+# Runnable local deployment. The checked-in example stays read-only bootstrap
+# configuration; durable SQLite state belongs on the named /data volume.
+#
+#   docker compose up --build
+#
+# Point LLMCONDUIT_CONFIG_FILE at a private config file to replace the example:
+#
+#   LLMCONDUIT_CONFIG_FILE=./config.yaml docker compose up --build
+services:
+  llmconduit:
+    build:
+      context: .
+    image: llmconduit:local
+    ports:
+      # Development default: do not expose the open example gateway to the LAN.
+      - "127.0.0.1:4000:4000"
+    environment:
+      LLMCONDUIT_BIND_ADDR: "0.0.0.0:4000"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # Add equivalent mappings when api_key_env uses a different name.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - type: bind
+        source: "${LLMCONDUIT_CONFIG_FILE:-./config.example.yaml}"
+        target: /etc/llmconduit/config.yaml
+        read_only: true
+      - type: volume
+        source: llmconduit-data
+        target: /data
+    command: ["start", "--config", "/etc/llmconduit/config.yaml"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  llmconduit-data:

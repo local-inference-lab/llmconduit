@@ -10,16 +10,20 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples, usage_samples: samples, priced_samples: samples, cost_confidence: 'estimated',
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
+    samples, usage_samples: samples, prefill_samples: samples, decode_samples: samples,
+    priced_samples: samples, cost_confidence: 'estimated',
     ...over,
   };
 }
 function metrics(seq: number, reqs: number): MetricsResponse {
   return {
     metrics_seq: seq, reqs_per_sec: reqs, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples: 252, usage_samples: 252, priced_samples: 252, cost_confidence: 'estimated',
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
+    samples: 252, usage_samples: 252, prefill_samples: 252, decode_samples: 252,
+    priced_samples: 252, cost_confidence: 'estimated',
     windows: { m1: win({ reqs_per_sec: reqs }), m5: win(), h1: win() },
   };
 }

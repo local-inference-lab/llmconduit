@@ -6,7 +6,16 @@ import { test as base, expect, type Page } from '@playwright/test';
  */
 export const FIXED_NOW = Date.UTC(2026, 5, 21, 14, 20, 0); // 2026-06-21T14:20:00Z
 
-export type ViewName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview';
+export type ViewName =
+  | 'flows'
+  | 'sessions'
+  | 'topology'
+  | 'sankey'
+  | 'theater'
+  | 'overview'
+  | 'chat'
+  | 'providers'
+  | 'access';
 
 /** Each view: the nav-tab label to click + a route-specific "ready" marker (text/regex). */
 export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = [
@@ -16,6 +25,11 @@ export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = 
   { name: 'theater', tab: 'Theater', ready: /No active streams/i },
   // Gap 16 — the control-room overview (the 5th route). Its masthead text is the ready marker.
   { name: 'overview', tab: 'Overview', ready: /control room/i },
+  // The live active-sessions board (the dashboard's primary view). Masthead subtitle is the ready marker.
+  { name: 'sessions', tab: 'Sessions', ready: /active in the last 15 minutes/i },
+  { name: 'chat', tab: 'Chat', ready: /^chat$/i },
+  { name: 'providers', tab: 'Providers', ready: /provider inventory/i },
+  { name: 'access', tab: 'Access', ready: /Access control/i },
 ];
 
 /**

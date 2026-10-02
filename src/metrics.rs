@@ -27,8 +27,9 @@
 //!   producing a true atomic cut across all three stores into a body-free
 //!   [`DashboardSnapshot`]. The summaries are body-free [`SnapshotFlowSummary`]
 //!   (NO `Arc<[u8]>`, NO live-store reference) — body retention on snapshots
-//!   recreates a 135 GiB worst case (AGENTS.md don't-rule). A snapshot-summary quota
-//!   bounds peak ring memory to ≤ ~400 MiB (720 cuts × 512 summaries × <1 KiB).
+//!   recreates a 135 GiB worst case (AGENTS.md don't-rule). Cuts SHARE unchanged
+//!   summaries, and a quota over unique allocations bounds peak ring memory
+//!   (default 64 MiB, `LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES` overrides).
 
 use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::AttemptErrorClass;
@@ -36,7 +37,9 @@ use crate::dashboard_flow::AttemptStatus;
 use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
+use crate::dashboard_flow::SharedFlowSummary;
 use crate::dashboard_flow::SnapshotFlowSummary;
+use crate::dashboard_flow::SnapshotSummaries;
 use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::ProviderHealthSnapshot;
 use serde::Serialize;
@@ -82,12 +85,14 @@ const MAX_TRACKED_PROVIDERS: usize = 64;
 /// provider name (a configured provider/route id is never this sentinel).
 const OVERFLOW_PROVIDER: &str = "__other__";
 
-/// Default peak snapshot-ring memory quota (bytes). 720 cuts × 512 summaries ×
-/// <1 KiB ≈ 360 MiB; the 400 MiB quota is the HARD bound the ring cannot exceed —
-/// when a fresh cut would push the retained summary-byte total over quota, the
-/// OLDEST cuts are dropped first until it fits. This is the 135 GiB fix: bodies are
-/// never on a snapshot, and the summary bytes are quota-bounded.
-const DEFAULT_SNAPSHOT_QUOTA_BYTES: usize = 400 * 1024 * 1024;
+/// Default peak snapshot-ring memory quota (bytes), the HARD bound the ring cannot
+/// exceed — when a fresh cut would push the retained total over quota, the OLDEST
+/// cuts are dropped first until it fits. Cuts share every summary that did not
+/// change, and the quota charges each UNIQUE allocation once, so a full hour of
+/// 512 resident flows costs ~1 KiB per distinct flow VERSION, not 720 copies of
+/// each flow; 64 MiB fits on a 2 GB host. `LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES`
+/// overrides it. Bodies are never on a snapshot (the 135 GiB fix).
+const DEFAULT_SNAPSHOT_QUOTA_BYTES: usize = 64 * 1024 * 1024;
 
 /// HTTP status class for a terminal flow, the metrics bucket key dimension. Derived
 /// from the [`FlowStatus`] terminal (the engine does not thread a raw numeric code
@@ -141,6 +146,18 @@ pub struct BucketCounts {
     pub completion_tokens: i64,
     pub cached_tokens: i64,
     pub reasoning_tokens: i64,
+    /// Prompt tokens from flows with a measured prefill phase.
+    pub prefill_tokens: i64,
+    /// Summed measured first-byte → first-content time for `prefill_tokens`.
+    pub prefill_ms: u128,
+    /// Completion tokens from flows with a measured decode phase.
+    pub decode_tokens: i64,
+    /// Summed measured first-content → stream-end time for `decode_tokens`.
+    pub decode_ms: u128,
+    /// Flows contributing a non-zero measured prefill duration.
+    pub prefill_samples: u64,
+    /// Flows contributing a non-zero measured decode duration.
+    pub decode_samples: u64,
     /// Count of the TERMINAL flows in this bucket that actually carried token usage
     /// (gap 01 review round 1, finding 3): token throughput is only MEASURABLE for a
     /// flow whose final usage was reported. A finalized flow with no `usage` (an
@@ -175,7 +192,7 @@ impl BucketCounts {
 /// A 30-bucket log-spaced latency histogram (1 ms .. 120 s) over the in-window
 /// samples, plus p50/p95/p99 via linear interpolation over the cumulative counts.
 /// Counts are `u64`; an empty histogram reports `0.0` for every quantile.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Histogram {
     /// Per-bucket sample counts. `buckets[i]` counts samples whose latency is
     /// ≤ `bucket_upper_ms(i)` and > `bucket_upper_ms(i - 1)`. The final bucket is
@@ -309,19 +326,27 @@ impl Histogram {
 /// per-class `0` here is honest (that class did not occur); the don't-lie-with-zeros
 /// rule lives at the PROVIDER level (a provider with NO samples in the window is absent
 /// from the per-provider report entirely, never a fabricated all-zero distribution).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(default)]
 pub struct ProviderErrorDistribution {
+    /// Failed attempts whose class was `connect` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub connect: u64,
+    /// Failed attempts whose class was `http_status` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub http_status: u64,
+    /// Failed attempts whose class was `timeout` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub timeout: u64,
+    /// Failed attempts whose class was `stream` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub stream: u64,
+    /// Failed attempts whose class was `terminal` (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub terminal: u64,
+    /// Failed attempts whose class was `other`, including an unclassed failure (omitted when 0).
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub other: u64,
 }
@@ -361,7 +386,7 @@ impl ProviderErrorDistribution {
 /// distribution 6 `u64`s) so a provider's per-slot footprint is O(1) regardless of
 /// traffic — samples-per-provider are bounded by the histogram, provider COUNT by
 /// [`MAX_TRACKED_PROVIDERS`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProviderSample {
     histogram: Histogram,
     served: u64,
@@ -539,6 +564,13 @@ impl WindowRing {
                 entry.reasoning_tokens = entry
                     .reasoning_tokens
                     .saturating_add(counts.reasoning_tokens);
+                entry.prefill_tokens = entry.prefill_tokens.saturating_add(counts.prefill_tokens);
+                entry.prefill_ms = entry.prefill_ms.saturating_add(counts.prefill_ms);
+                entry.decode_tokens = entry.decode_tokens.saturating_add(counts.decode_tokens);
+                entry.decode_ms = entry.decode_ms.saturating_add(counts.decode_ms);
+                entry.prefill_samples =
+                    entry.prefill_samples.saturating_add(counts.prefill_samples);
+                entry.decode_samples = entry.decode_samples.saturating_add(counts.decode_samples);
                 entry.usage_samples = entry.usage_samples.saturating_add(counts.usage_samples);
                 entry.unreported_cached_samples = entry
                     .unreported_cached_samples
@@ -556,7 +588,7 @@ impl WindowRing {
 
 /// The collapsed per-window view: the merged per-key counts + the merged latency
 /// histogram, from which p50/p95/p99 are reported.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct WindowReport {
     pub buckets: BTreeMap<BucketKey, BucketCounts>,
     pub histogram: Histogram,
@@ -596,6 +628,60 @@ impl WindowReport {
         self.buckets
             .values()
             .map(|counts| counts.usage_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Aggregate effective prefill speed across flows with measured prompt usage and
+    /// a non-zero first-byte → first-content phase.
+    pub fn prefill_tokens_per_sec(&self) -> f64 {
+        let tokens = self
+            .buckets
+            .values()
+            .map(|counts| counts.prefill_tokens)
+            .fold(0i64, i64::saturating_add);
+        let ms = self
+            .buckets
+            .values()
+            .map(|counts| counts.prefill_ms)
+            .fold(0u128, u128::saturating_add);
+        if ms == 0 {
+            0.0
+        } else {
+            tokens as f64 * 1000.0 / ms as f64
+        }
+    }
+
+    /// Aggregate decode speed across flows with measured completion usage and a
+    /// non-zero first-content → stream-end phase.
+    pub fn decode_tokens_per_sec(&self) -> f64 {
+        let tokens = self
+            .buckets
+            .values()
+            .map(|counts| counts.decode_tokens)
+            .fold(0i64, i64::saturating_add);
+        let ms = self
+            .buckets
+            .values()
+            .map(|counts| counts.decode_ms)
+            .fold(0u128, u128::saturating_add);
+        if ms == 0 {
+            0.0
+        } else {
+            tokens as f64 * 1000.0 / ms as f64
+        }
+    }
+
+    pub fn prefill_sample_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.prefill_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn decode_sample_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.decode_samples)
             .fold(0u64, u64::saturating_add)
     }
 
@@ -697,9 +783,10 @@ fn finite_ms(value: f64) -> f64 {
 /// ABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is
 /// always a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to
 /// match the cross-cutting DQ-tag contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetricQuality {
+    /// Computed from the provider's own attempt-latency histogram.
     Derived,
 }
 
@@ -710,7 +797,7 @@ pub enum ProviderMetricQuality {
 /// is the percentage of the provider's attempts that FAILED. A provider with zero
 /// in-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has
 /// `samples >= 1`. All floats are finite (the frozen finite-number wire contract).
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ProviderLatency {
     /// The provider label these metrics are for (the bounded provider/route id, or the
     /// `__other__` overflow bucket once the per-slot provider cap is exceeded).
@@ -758,7 +845,7 @@ pub struct Percentiles {
 /// windows' collapsed reports + their percentiles, as of the snapshot instant. This
 /// is a pure value (no `Arc`, no live-store reference), so a retained snapshot
 /// cannot pin live state.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct MetricsView {
     pub window_1m: WindowReport,
     pub window_5m: WindowReport,
@@ -821,7 +908,9 @@ pub struct DomainCursors {
 /// - `cursors`: per-domain `{flow,metrics,topology,monitor}` sequences at the cut.
 /// - `summaries`: body-free [`SnapshotFlowSummary`]s (NO `Arc<[u8]>` — the 135 GiB
 ///   fix; a retained snapshot holds at most ~1 KiB per flow, never a 128 KiB body).
-/// - `metrics`: the collapsed [`MetricsView`].
+///   SHARED with neighbouring cuts: an unchanged flow is one allocation across every
+///   cut that captured it, and an unchanged list is one allocation too.
+/// - `metrics`: the collapsed [`MetricsView`], shared with the previous cut when equal.
 /// - `topology`: the ONE `Arc<ProviderHealthSnapshot>` captured in the cut.
 ///
 /// Immutable once built; `Arc`-wrapped in the ring so a reader's clone is cheap and
@@ -830,53 +919,35 @@ pub struct DomainCursors {
 pub struct DashboardSnapshot {
     pub taken_at_ms: u128,
     pub cursors: DomainCursors,
-    pub summaries: Vec<SnapshotFlowSummary>,
-    pub metrics: MetricsView,
+    pub summaries: SnapshotSummaries,
+    /// Serialized by DEREF, like `topology` (no serde `rc` feature).
+    #[serde(serialize_with = "serialize_arc")]
+    pub metrics: Arc<MetricsView>,
     /// The ONE topology cut captured in this snapshot. Serialized by DEREF (serde's
     /// blanket `Arc: Serialize` needs the `rc` feature, which we don't enable
     /// crate-wide; the inner `ProviderHealthSnapshot` already derives `Serialize`).
-    #[serde(serialize_with = "serialize_topology")]
+    #[serde(serialize_with = "serialize_arc")]
     pub topology: Arc<ProviderHealthSnapshot>,
 }
 
-/// Serialize an `Arc<ProviderHealthSnapshot>` by dereferencing to the inner value
-/// (avoids enabling serde's `rc` feature just for the snapshot DTO).
-fn serialize_topology<S>(
-    topology: &Arc<ProviderHealthSnapshot>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+/// Serialize an `Arc<T>` by dereferencing to the inner value (avoids enabling serde's
+/// `rc` feature just for the snapshot DTO).
+fn serialize_arc<T, S>(value: &Arc<T>, serializer: S) -> Result<S::Ok, S::Error>
 where
+    T: Serialize,
     S: serde::Serializer,
 {
-    (**topology).serialize(serializer)
-}
-
-impl DashboardSnapshot {
-    /// Approximate retained bytes of this cut, for the snapshot-ring memory quota.
-    /// Counts ONLY the body-free summary scalar strings + the metrics view + a small
-    /// topology estimate — there are NO body `Arc<[u8]>`s to count (that is the
-    /// point: a cut is provably body-free, so its memory is bounded at ~1 KiB/flow).
-    fn approx_bytes(&self) -> usize {
-        let summary_bytes: usize = self
-            .summaries
-            .iter()
-            .map(summary_approx_bytes)
-            .fold(0usize, usize::saturating_add);
-        summary_bytes
-            .saturating_add(self.metrics.approx_bytes())
-            // A small fixed estimate for the shared topology Arc (counted once; the
-            // Arc is shared across cuts that captured the same version).
-            .saturating_add(std::mem::size_of::<ProviderHealthSnapshot>())
-    }
+    (**value).serialize(serializer)
 }
 
 /// Approximate retained bytes of one body-free [`SnapshotFlowSummary`]: the sum of
 /// its dynamic scalar string lengths + the fixed struct size. There are NO body
 /// fields to count (the summary is body-free by construction), so this is the full
-/// memory footprint — the basis for the ≤400 MiB ring-quota assertion.
+/// memory footprint — the basis for the ring-quota assertion.
 fn summary_approx_bytes(summary: &SnapshotFlowSummary) -> usize {
     let opt = |value: &Option<String>| value.as_ref().map(String::len).unwrap_or(0);
     std::mem::size_of::<SnapshotFlowSummary>()
+        + std::mem::size_of::<usize>() * 2 // the `Arc` strong/weak counts
         + summary.api_call_id.len()
         + opt(&summary.response_id)
         + summary.method.len()
@@ -887,14 +958,63 @@ fn summary_approx_bytes(summary: &SnapshotFlowSummary) -> usize {
         + opt(&summary.terminal_reason)
 }
 
+/// Reference counts of the shared allocations the ring retains, keyed by allocation
+/// address (stable while the ring holds the `Arc`, so it cannot be reused under us).
+/// The quota charges an allocation's bytes ONCE — when the first cut holding it is
+/// pushed — and releases them when the last such cut is popped. That makes the quota
+/// measure what is actually resident, not `cuts × flows`.
+#[derive(Debug, Default)]
+struct SharedAllocations {
+    counts: std::collections::HashMap<usize, (usize, usize)>,
+}
+
+impl SharedAllocations {
+    /// Take a reference; returns the bytes NEWLY retained (non-zero only for the
+    /// first holder).
+    fn acquire(&mut self, id: usize, bytes: impl FnOnce() -> usize) -> usize {
+        match self.counts.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().0 += 1;
+                0
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let bytes = bytes();
+                entry.insert((1, bytes));
+                bytes
+            }
+        }
+    }
+
+    /// Drop a reference; returns the bytes freed (non-zero only for the last holder).
+    fn release(&mut self, id: usize) -> usize {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.counts.entry(id) else {
+            return 0;
+        };
+        entry.get_mut().0 -= 1;
+        if entry.get().0 == 0 {
+            entry.remove().1
+        } else {
+            0
+        }
+    }
+}
+
 /// The bounded ring of body-free [`DashboardSnapshot`] cuts (720 = 1 h at 5 s). A
 /// fresh cut is pushed at the back; the ring is bounded BOTH by slot count (720) AND
-/// by a retained-summary-byte quota (the HARD ≤400 MiB bound — when a push would
-/// exceed it, the OLDEST cuts are dropped first). `snapshot_at(ts)` binary-searches
-/// the time-ordered cuts for the nearest cut with `taken_at_ms ≤ ts`.
+/// by a retained-byte quota over UNIQUE allocations (a summary shared by 360 cuts is
+/// charged once) — when a push would exceed it, the OLDEST cuts are dropped first.
+/// `snapshot_at(ts)` binary-searches the time-ordered cuts for the nearest cut with
+/// `taken_at_ms ≤ ts`.
 #[derive(Debug, Default)]
 struct SnapshotRing {
     cuts: std::collections::VecDeque<Arc<DashboardSnapshot>>,
+    /// Summary lists (outer level: an idle cut re-holding the same list is O(1)).
+    lists: SharedAllocations,
+    /// Individual summaries (inner level: charged when the first list holding them
+    /// is retained).
+    summaries: SharedAllocations,
+    /// Metrics views and topology cuts.
+    views: SharedAllocations,
     retained_bytes: usize,
     quota_bytes: usize,
 }
@@ -903,17 +1023,18 @@ impl SnapshotRing {
     fn new(quota_bytes: usize) -> Self {
         Self {
             cuts: std::collections::VecDeque::with_capacity(SNAPSHOT_RING_SLOTS),
-            retained_bytes: 0,
             quota_bytes,
+            ..Self::default()
         }
     }
 
-    /// Push a fresh cut, then enforce BOTH the slot cap (720) and the byte quota
-    /// (≤400 MiB) by dropping the OLDEST cuts. Cuts are pushed in monotonic
-    /// `taken_at_ms` order (the 5 s task is the only writer), so the deque stays
-    /// time-sorted for `snapshot_at`'s binary search.
+    /// Push a fresh cut, then enforce BOTH the slot cap (720) and the byte quota by
+    /// dropping the OLDEST cuts. Cuts are pushed in monotonic `taken_at_ms` order (the
+    /// 5 s task is the only writer), so the deque stays time-sorted for
+    /// `snapshot_at`'s binary search.
     fn push(&mut self, cut: Arc<DashboardSnapshot>) {
-        self.retained_bytes = self.retained_bytes.saturating_add(cut.approx_bytes());
+        let added = self.acquire(&cut);
+        self.retained_bytes = self.retained_bytes.saturating_add(added);
         self.cuts.push_back(cut);
         while self.cuts.len() > SNAPSHOT_RING_SLOTS {
             self.pop_oldest();
@@ -927,31 +1048,56 @@ impl SnapshotRing {
 
     fn pop_oldest(&mut self) {
         if let Some(old) = self.cuts.pop_front() {
-            self.retained_bytes = self.retained_bytes.saturating_sub(old.approx_bytes());
+            let freed = self.release(&old);
+            self.retained_bytes = self.retained_bytes.saturating_sub(freed);
         }
+    }
+
+    fn acquire(&mut self, cut: &DashboardSnapshot) -> usize {
+        let mut added = std::mem::size_of::<DashboardSnapshot>();
+        let list = &cut.summaries;
+        let list_bytes = self.lists.acquire(list.alloc_id(), || {
+            std::mem::size_of_val::<[SharedFlowSummary]>(list)
+        });
+        if list_bytes > 0 {
+            added += list_bytes;
+            for summary in list {
+                added += self
+                    .summaries
+                    .acquire(summary.alloc_id(), || summary_approx_bytes(summary));
+            }
+        }
+        added += self.views.acquire(Arc::as_ptr(&cut.metrics) as usize, || {
+            cut.metrics.approx_bytes()
+        });
+        added += self.views.acquire(Arc::as_ptr(&cut.topology) as usize, || {
+            std::mem::size_of::<ProviderHealthSnapshot>()
+        });
+        added
+    }
+
+    fn release(&mut self, cut: &DashboardSnapshot) -> usize {
+        let mut freed = std::mem::size_of::<DashboardSnapshot>();
+        let list_bytes = self.lists.release(cut.summaries.alloc_id());
+        if list_bytes > 0 {
+            freed += list_bytes;
+            for summary in &cut.summaries {
+                freed += self.summaries.release(summary.alloc_id());
+            }
+        }
+        freed += self.views.release(Arc::as_ptr(&cut.metrics) as usize);
+        freed += self.views.release(Arc::as_ptr(&cut.topology) as usize);
+        freed
     }
 
     /// The nearest retained cut with `taken_at_ms ≤ ts` (the `/snapshot?at=`
     /// backend). `None` when the ring is empty or every cut is newer than `ts`.
     /// Binary search over the time-sorted deque.
     fn snapshot_at(&self, ts: u128) -> Option<Arc<DashboardSnapshot>> {
-        if self.cuts.is_empty() {
-            return None;
-        }
-        // VecDeque is contiguous-enough for a manual binary search by index.
-        let mut lo = 0usize;
-        let mut hi = self.cuts.len();
-        let mut best: Option<usize> = None;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.cuts[mid].taken_at_ms <= ts {
-                best = Some(mid);
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        best.map(|index| Arc::clone(&self.cuts[index]))
+        let index = self.cuts.partition_point(|cut| cut.taken_at_ms <= ts);
+        index
+            .checked_sub(1)
+            .map(|index| Arc::clone(&self.cuts[index]))
     }
 
     /// The most recent cut, if any (the live `/snapshot` with no `at=`).
@@ -1006,12 +1152,15 @@ impl MetricsState {
     /// each computing its own `now_epoch_s()` under its own lock — could do across a
     /// second boundary). Both join the same `{status, model, endpoint, upstream}`
     /// bucket key, so a completed flow's count + tokens are always co-located.
+    #[allow(clippy::too_many_arguments)]
     fn record_terminal(
         &mut self,
         epoch_s: u64,
         key: &BucketKey,
         elapsed_ms: f64,
         usage: Option<FlowUsage>,
+        prefill_ms: Option<u128>,
+        decode_ms: Option<u128>,
         attempts: &[Attempt],
     ) {
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
@@ -1046,6 +1195,16 @@ impl MetricsState {
                 if usage.cached.is_none() {
                     entry.unreported_cached_samples =
                         entry.unreported_cached_samples.saturating_add(1);
+                }
+                if let Some(prefill_ms) = prefill_ms.filter(|duration| *duration > 0) {
+                    entry.prefill_tokens = entry.prefill_tokens.saturating_add(usage.prompt);
+                    entry.prefill_ms = entry.prefill_ms.saturating_add(prefill_ms);
+                    entry.prefill_samples = entry.prefill_samples.saturating_add(1);
+                }
+                if let Some(decode_ms) = decode_ms.filter(|duration| *duration > 0) {
+                    entry.decode_tokens = entry.decode_tokens.saturating_add(usage.completion);
+                    entry.decode_ms = entry.decode_ms.saturating_add(decode_ms);
+                    entry.decode_samples = entry.decode_samples.saturating_add(1);
                 }
             }
             slot.histogram.record(elapsed_ms);
@@ -1125,12 +1284,14 @@ impl std::fmt::Debug for MetricsLayer {
 }
 
 impl MetricsLayer {
-    /// Enabled layer (debug UI on). Uses the default 400 MiB snapshot-ring quota.
+    /// Enabled layer (debug UI on). Uses the default 64 MiB snapshot-ring quota.
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            state: Arc::new(Mutex::new(MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES))),
-        }
+        let quota = std::env::var("LLMCONDUIT_DASHBOARD_SNAPSHOT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|quota| *quota > 0)
+            .unwrap_or(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        Self::with_snapshot_quota(quota)
     }
 
     /// No-op layer (debug UI off). Every method early-returns and takes NO lock, so
@@ -1143,9 +1304,7 @@ impl MetricsLayer {
         }
     }
 
-    /// Test-only constructor with an explicit snapshot-ring byte quota, so the
-    /// memory-quota test can drive eviction without allocating 400 MiB.
-    #[cfg(test)]
+    /// Explicit quota also lets tests drive eviction without allocating 400 MiB.
     fn with_snapshot_quota(quota_bytes: usize) -> Self {
         Self {
             enabled: true,
@@ -1248,6 +1407,35 @@ impl MetricsLayer {
         usage: Option<FlowUsage>,
         attempts: &[Attempt],
     ) {
+        self.record_terminal_with_phases(
+            status,
+            served_model,
+            endpoint,
+            upstream,
+            elapsed_ms,
+            usage,
+            None,
+            None,
+            attempts,
+        );
+    }
+
+    /// Record a terminal response with measured prefill and decode durations.
+    /// The phase durations are optional because older/non-streaming capture paths may
+    /// not observe both phase boundaries; missing measurements never become fake zeroes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_terminal_with_phases(
+        &self,
+        status: FlowStatus,
+        served_model: Option<&str>,
+        endpoint: &str,
+        upstream: Option<&str>,
+        elapsed_ms: u128,
+        usage: Option<FlowUsage>,
+        prefill_ms: Option<u128>,
+        decode_ms: Option<u128>,
+        attempts: &[Attempt],
+    ) {
         if !self.enabled {
             return;
         }
@@ -1258,8 +1446,15 @@ impl MetricsLayer {
             upstream: label_or_unknown(upstream),
         };
         let epoch_s = now_epoch_s();
-        self.lock()
-            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage, attempts);
+        self.lock().record_terminal(
+            epoch_s,
+            &key,
+            elapsed_ms as f64,
+            usage,
+            prefill_ms,
+            decode_ms,
+            attempts,
+        );
     }
 
     /// The current metrics domain sequence (the per-domain cursor). `0` when
@@ -1422,7 +1617,13 @@ impl MetricsLayer {
             // Cut instant fixed: release the FlowStore lock and finish the metrics-only
             // work (aggregation + push) under the metrics guard alone.
             flow_guard.release();
-            let metrics = state.view(now_epoch);
+            let view = state.view(now_epoch);
+            // An idle box produces the same view cut after cut: share the previous
+            // cut's allocation instead of retaining 720 equal copies.
+            let metrics = match state.snapshots.latest() {
+                Some(previous) if *previous.metrics == view => Arc::clone(&previous.metrics),
+                _ => Arc::new(view),
+            };
             let cursors = DomainCursors {
                 flow_seq,
                 metrics_seq,
@@ -1808,6 +2009,39 @@ mod tests {
     }
 
     #[test]
+    fn phase_token_rates_use_measured_durations_and_independent_sample_counts() {
+        let metrics = MetricsLayer::new();
+        for (prompt, completion, prefill_ms, decode_ms) in [
+            (1000, 100, Some(100), Some(1000)),
+            (500, 50, Some(50), None),
+        ] {
+            metrics.record_terminal_with_phases(
+                FlowStatus::Completed,
+                Some("m"),
+                "/v1/responses",
+                Some("p"),
+                1200,
+                Some(FlowUsage {
+                    prompt,
+                    completion,
+                    total: prompt + completion,
+                    cached: None,
+                    reasoning: None,
+                }),
+                prefill_ms,
+                decode_ms,
+                &[],
+            );
+        }
+
+        let report = metrics.view().window_1m;
+        assert_eq!(report.prefill_sample_count(), 2);
+        assert_eq!(report.decode_sample_count(), 1);
+        assert!((report.prefill_tokens_per_sec() - 10_000.0).abs() < 1e-9);
+        assert!((report.decode_tokens_per_sec() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn record_terminal_without_usage_records_count_only() {
         // A terminal with no usage (e.g. a pre-spawn failure) records the count + the
         // latency but no tokens — still one atomic seq bump.
@@ -2152,6 +2386,8 @@ mod tests {
                     },
                     10.0,
                     None,
+                    None,
+                    None,
                     &[failed_attempt(
                         &format!("rot-{index}"),
                         10,
@@ -2198,7 +2434,7 @@ mod tests {
         // (a) a terminal with NO attempts → no per-provider entries.
         let without = {
             let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
-            state.record_terminal(epoch, &key, 40.0, None, &[]);
+            state.record_terminal(epoch, &key, 40.0, None, None, None, &[]);
             state.view(epoch).approx_bytes()
         };
         // (b) the SAME terminal but WITH several distinct-provider attempts → populated
@@ -2210,7 +2446,7 @@ mod tests {
                 failed_attempt("provider-beta", 70, AttemptErrorClass::Timeout),
                 served_attempt("provider-gamma", 40),
             ];
-            state.record_terminal(epoch, &key, 40.0, None, &attempts);
+            state.record_terminal(epoch, &key, 40.0, None, None, None, &attempts);
             state.view(epoch).approx_bytes()
         };
 
@@ -2270,6 +2506,8 @@ mod tests {
                     upstream: "provider-a".to_string(),
                 },
                 40.0,
+                None,
+                None,
                 None,
                 &[served_attempt("provider-a", 40)],
             );
@@ -2420,6 +2658,154 @@ mod tests {
             retained <= quota,
             "snapshot ring retained {retained} bytes <= quota {quota} (NOT 135 GiB)"
         );
+    }
+
+    fn open_finalized(flow: &DashboardFlowStore, api: &str) {
+        flow.open(
+            api.to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+            None,
+            crate::dashboard_flow::ClientAttribution::none(),
+        );
+        flow.finalize(api, FlowStatus::Completed, None, Some("p".to_string()));
+    }
+
+    /// Recompute the ring's unique-allocation bytes from scratch (the invariant the
+    /// incremental refcounting must always equal).
+    fn recomputed_ring_bytes(ring: &SnapshotRing) -> usize {
+        let mut fresh = SnapshotRing::new(usize::MAX);
+        let mut total = 0usize;
+        for cut in &ring.cuts {
+            total += fresh.acquire(cut);
+        }
+        total
+    }
+
+    #[test]
+    fn unchanged_flows_are_shared_between_cuts() {
+        let metrics = MetricsLayer::new();
+        let flow = DashboardFlowStore::new();
+        let topo = ProviderHealthPublisher::default();
+        topo.publish(Vec::new());
+        for index in 0..64 {
+            open_finalized(&flow, &format!("api_{index}"));
+        }
+
+        let first = metrics.snapshot(&flow, &topo).expect("cut");
+        let idle = metrics.snapshot(&flow, &topo).expect("cut");
+        // Nothing mutated: the whole list (and the equal metrics view) is shared.
+        assert_eq!(first.summaries.alloc_id(), idle.summaries.alloc_id());
+        assert!(Arc::ptr_eq(&first.metrics, &idle.metrics));
+        assert!(idle.taken_at_ms >= first.taken_at_ms);
+
+        // One flow mutates: only its summary is re-projected.
+        flow.set_upstream("api_7", None, Some("served-new".to_string()), None);
+        let changed = metrics.snapshot(&flow, &topo).expect("cut");
+        assert_ne!(changed.summaries.alloc_id(), idle.summaries.alloc_id());
+        assert_eq!(changed.summaries.len(), 64);
+        let mut fresh = 0;
+        for (before, after) in idle.summaries.iter().zip(changed.summaries.iter()) {
+            assert_eq!(before.api_call_id, after.api_call_id, "order unchanged");
+            if before.alloc_id() != after.alloc_id() {
+                fresh += 1;
+                assert_eq!(after.api_call_id, "api_7");
+                assert_eq!(after.model_served.as_deref(), Some("served-new"));
+            }
+        }
+        assert_eq!(fresh, 1, "only the mutated flow is a new allocation");
+        // The older cut still shows the pre-mutation state (seek is frozen).
+        let old = idle
+            .summaries
+            .iter()
+            .find(|summary| summary.api_call_id == "api_7")
+            .unwrap();
+        assert_ne!(old.model_served.as_deref(), Some("served-new"));
+    }
+
+    #[test]
+    fn a_full_ring_of_resident_flows_costs_one_copy_per_flow() {
+        // Before sharing, 720 cuts × 512 resident flows deep-copied every summary
+        // into every cut (~360 copies per flow on average, hundreds of MiB). Now a
+        // flow that never changes is charged once.
+        let metrics = MetricsLayer::with_snapshot_quota(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        let flow = DashboardFlowStore::new();
+        let topo = ProviderHealthPublisher::default();
+        topo.publish(Vec::new());
+        for index in 0..512 {
+            open_finalized(&flow, &format!("api_{index}"));
+        }
+        let one_cut = metrics.snapshot(&flow, &topo).expect("cut");
+        let single_cut_bytes = metrics.lock().snapshots.retained_bytes;
+        for _ in 1..SNAPSHOT_RING_SLOTS {
+            metrics.snapshot(&flow, &topo);
+        }
+        let state = metrics.lock();
+        assert_eq!(state.snapshots.cuts.len(), SNAPSHOT_RING_SLOTS);
+        let per_cut_overhead = std::mem::size_of::<DashboardSnapshot>();
+        assert_eq!(
+            state.snapshots.retained_bytes,
+            single_cut_bytes + (SNAPSHOT_RING_SLOTS - 1) * per_cut_overhead,
+            "idle cuts add only their fixed header"
+        );
+        assert!(state.snapshots.retained_bytes < 2 * 1024 * 1024);
+        assert_eq!(
+            state.snapshots.retained_bytes,
+            recomputed_ring_bytes(&state.snapshots)
+        );
+        // Every cut references the first cut's summaries (no deep copies).
+        assert!(
+            state
+                .snapshots
+                .cuts
+                .iter()
+                .all(|cut| { cut.summaries.alloc_id() == one_cut.summaries.alloc_id() })
+        );
+    }
+
+    #[test]
+    fn ring_accounting_stays_exact_under_churn_and_eviction() {
+        let metrics = MetricsLayer::with_snapshot_quota(64 * 1024);
+        let flow = DashboardFlowStore::new();
+        let topo = ProviderHealthPublisher::default();
+        topo.publish(Vec::new());
+        for index in 0..32 {
+            open_finalized(&flow, &format!("api_{index}"));
+        }
+        for round in 0..400 {
+            if round % 3 == 0 {
+                flow.set_upstream(
+                    &format!("api_{}", round % 32),
+                    None,
+                    Some(format!("m{round}")),
+                    None,
+                );
+            }
+            if round % 50 == 0 {
+                topo.publish(Vec::new());
+            }
+            if round % 7 == 0 {
+                open_finalized(&flow, &format!("new_{round}"));
+            }
+            metrics.snapshot(&flow, &topo);
+            let state = metrics.lock();
+            assert!(state.snapshots.retained_bytes <= 64 * 1024 || state.snapshots.cuts.len() == 1);
+            assert_eq!(
+                state.snapshots.retained_bytes,
+                recomputed_ring_bytes(&state.snapshots),
+                "round {round}"
+            );
+        }
+        // Draining the ring releases everything it charged.
+        let mut state = metrics.lock();
+        while !state.snapshots.cuts.is_empty() {
+            state.snapshots.pop_oldest();
+        }
+        assert_eq!(state.snapshots.retained_bytes, 0);
+        assert!(state.snapshots.lists.counts.is_empty());
+        assert!(state.snapshots.summaries.counts.is_empty());
+        assert!(state.snapshots.views.counts.is_empty());
     }
 
     #[test]

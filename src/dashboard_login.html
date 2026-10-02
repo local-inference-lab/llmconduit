@@ -59,6 +59,7 @@
       cursor: pointer;
     }
     button:disabled { opacity: 0.6; cursor: default; }
+    button.link { background: none; border: none; color: var(--muted, #8b93ad); font-size: 12px; margin-top: 10px; cursor: pointer; padding: 0; width: auto; }
     .error {
       margin-top: 12px;
       color: var(--red);
@@ -70,28 +71,60 @@
 <body>
   <main class="card">
     <h1>llmconduit dashboard</h1>
-    <p class="sub">Enter the dashboard access token to continue.</p>
-    <form id="login-form" autocomplete="off">
-      <label for="token">Access token</label>
-      <input id="token" name="token" type="password" autocomplete="current-password" spellcheck="false" autofocus>
+    <p class="sub" id="sub">Sign in to continue.</p>
+    <form id="login-form" autocomplete="on" data-auth-mode="{AUTH_MODE}">
+      <div id="user-fields">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" spellcheck="false" autofocus>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password">
+      </div>
+      <div id="token-fields" hidden>
+        <label for="token">Access token</label>
+        <input id="token" name="token" type="password" autocomplete="current-password" spellcheck="false">
+      </div>
       <button id="submit" type="submit">Sign in</button>
+      <button id="toggle" type="button" class="link">Use an access token instead</button>
       <div class="error" id="error" role="alert"></div>
     </form>
   </main>
   <script nonce="{NONCE}">
     const form = document.getElementById("login-form");
     const tokenInput = document.getElementById("token");
+    const userInput = document.getElementById("username");
+    const passInput = document.getElementById("password");
     const submitBtn = document.getElementById("submit");
+    const toggleBtn = document.getElementById("toggle");
     const errorEl = document.getElementById("error");
+    const userFields = document.getElementById("user-fields");
+    const tokenFields = document.getElementById("token-fields");
+    // "users" ⇒ accounts exist, password login is the default; "token" ⇒ only the
+    // shared token exists; "open" ⇒ dev-open loopback (anything signs in).
+    let tokenMode = form.dataset.authMode !== "users";
+    function render() {
+      userFields.hidden = tokenMode;
+      tokenFields.hidden = !tokenMode;
+      toggleBtn.textContent = tokenMode ? "Use a username and password instead" : "Use an access token instead";
+      document.getElementById("sub").textContent = tokenMode
+        ? "Enter the dashboard access token to continue."
+        : "Sign in with your username and password.";
+      (tokenMode ? tokenInput : userInput).focus();
+    }
+    toggleBtn.addEventListener("click", () => { tokenMode = !tokenMode; render(); });
+    render();
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       errorEl.textContent = "";
       submitBtn.disabled = true;
       try {
-        const response = await fetch("/dashboard/login", {
+        const delegated = tokenMode && tokenInput.value.startsWith("llmc_");
+        const body = tokenMode
+          ? (delegated ? { api_key: tokenInput.value } : { token: tokenInput.value })
+          : { username: userInput.value, password: passInput.value };
+        const response = await fetch(delegated ? "/dashboard/auth/key-login" : "/dashboard/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: tokenInput.value }),
+          body: JSON.stringify(body),
         });
         if (response.ok) {
           // The signed session cookie is now set; reload to the SPA shell.
@@ -99,7 +132,7 @@
           return;
         }
         errorEl.textContent = response.status === 401
-          ? "Invalid token."
+          ? (tokenMode ? "Invalid token." : "Invalid username or password.")
           : `Sign-in failed (${response.status}).`;
       } catch (err) {
         errorEl.textContent = "Network error — please retry.";

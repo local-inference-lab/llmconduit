@@ -11,6 +11,7 @@ import { getConnection, resetConnection } from '../api/connection';
 import { dashboardStore } from '../store/dashboardStore';
 import { authStore } from '../store/authStore';
 import { flowFilterStore } from '../store/flowFilterStore';
+import { resetMockAccounts } from '../api/mock';
 import type { FlowSummary } from '../api/types';
 
 /**
@@ -28,10 +29,11 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
   // The shared FlowTable filter (D12) is a global singleton — clear it so a filter set by one
   // test (or a Topology/Sankey cross-link) never carries into the next.
   flowFilterStore.getState().clear();
+  resetMockAccounts();
   if (opts.mock) {
     delete window.__LLMCONDUIT_DASHBOARD__;
   } else {
-    window.__LLMCONDUIT_DASHBOARD__ = { authenticated: true, csrf_token: 'test-csrf', mutations_enabled: true };
+    window.__LLMCONDUIT_DASHBOARD__ = { authenticated: true, csrf_token: 'test-csrf', mutations_enabled: true, user: null, auth_mode: 'token' };
   }
 }
 

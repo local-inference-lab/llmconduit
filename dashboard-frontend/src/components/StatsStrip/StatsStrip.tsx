@@ -83,11 +83,14 @@ export function StatsStrip() {
   const chips = useMemo(() => deriveChips(cur, prev), [cur, prev]);
 
   return (
-    <Panel className="m-4 mb-0 flex items-center gap-1 px-2 py-1" data-testid="stats-strip">
+    <Panel
+      className="mx-4 mt-2 grid grid-cols-2 items-stretch gap-0 px-1 py-0.5 sm:grid-cols-4 xl:flex xl:items-center"
+      data-testid="stats-strip"
+    >
       {chips.map((chip) => (
         <ChipCell key={chip.key} chip={chip} series={seriesFor(history, window, chip.key)} />
       ))}
-      <div className="ml-auto flex items-center gap-2 pr-1">
+      <div className="col-span-2 flex items-center justify-end gap-2 border-t border-line/50 px-2 py-1 sm:col-span-4 xl:ml-auto xl:border-t-0 xl:px-1 xl:py-0">
         <WindowSelector value={window} onChange={setWindow} />
         <ConnectionDot state={connection} />
       </div>
@@ -122,7 +125,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
   const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
-      className="flex flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
+      className="flex flex-col gap-0.5 border-l border-line/50 px-2 py-0.5 first:border-l-0"
       data-testid={`chip-${chip.key}`}
       // Provenance exposed to the DOM (finding 4): tests + tooling can assert the tag, and
       // the `title` gives operators a hover hint. EVERY chip carries one of
@@ -130,10 +133,10 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
       data-quality={chip.quality}
       title={`${chip.label}: ${qualityText}`}
     >
-      <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{chip.label}</span>
+      <span className="text-[9px] uppercase tracking-[0.12em] text-text-muted">{chip.label}</span>
       <div className="flex items-baseline gap-1">
         <span
-          className={cn('font-mono text-xl font-semibold tabular-nums tracking-tight', ACCENT_TEXT[chip.accent])}
+          className={cn('font-mono text-base font-semibold leading-none tabular-nums tracking-tight', ACCENT_TEXT[chip.accent])}
           data-testid="chip-value"
           // Make the provenance available to assistive tech without cluttering the visual
           // (the value reads e.g. "142 (derived from finalized-flow samples)").
@@ -145,7 +148,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
           {deltaGlyph(chip.delta)}
         </span>
       </div>
-      <Sparkline data={series} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+      <Sparkline data={series} width={72} height={16} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
     </div>
   );
 }
@@ -161,7 +164,7 @@ function WindowSelector({ value, onChange }: { value: WindowKey; onChange: (w: W
           onClick={() => onChange(w)}
           aria-pressed={value === w}
           className={cn(
-            'px-2 py-1 text-xs tabular-nums transition-colors',
+            'px-2 py-0.5 text-[10px] tabular-nums transition-colors',
             value === w ? 'bg-accent/20 text-accent' : 'bg-transparent text-text-muted hover:text-text',
           )}
         >
@@ -179,8 +182,8 @@ function ConnectionDot({ state }: { state: string }) {
     : state === 'error' ? 'bg-status-down'
     : 'bg-text-muted';
   return (
-    <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-text-muted">
-      <span className={`h-2 w-2 rounded-full ${color}`} aria-hidden />
+    <span className="flex items-center gap-1.5 text-[9px] uppercase tracking-[0.12em] text-text-muted">
+      <span className={`h-1.5 w-1.5 rounded-full ${color}`} aria-hidden />
       {state}
     </span>
   );

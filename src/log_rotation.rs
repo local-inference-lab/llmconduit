@@ -52,6 +52,47 @@ pub fn cleanup_dump_files(dir: &Path, max_age: Duration, now: SystemTime) -> usi
     cleanup_dump_files_with_remover(dir, max_age, now, |path| fs::remove_file(path))
 }
 
+/// Delete one explicitly configured request-log file when it is stale. Unlike
+/// directory sweeping this can safely handle `.jsonl` without touching an
+/// operator's unrelated JSON files in the same directory.
+pub fn cleanup_exact_file(path: &Path, max_age: Duration, now: SystemTime) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file()
+        && is_older_than_cutoff(&metadata, now.checked_sub(max_age))
+        && fs::remove_file(path).is_ok()
+}
+
+/// Delete only published turn-capture artifacts owned by llmconduit. HTTP
+/// capture ids are minted with the `api_` prefix; other JSON files are left
+/// alone even when an operator shares the directory accidentally.
+pub fn cleanup_turn_capture_artifacts(
+    capture_dir: &Path,
+    max_age: Duration,
+    now: SystemTime,
+) -> usize {
+    let Ok(entries) = fs::read_dir(capture_dir) else {
+        return 0;
+    };
+    let cutoff = now.checked_sub(max_age);
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("api_") && name.ends_with(".json"))
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && is_older_than_cutoff(&metadata, cutoff))
+        })
+        .filter(|entry| fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
 /// [`cleanup_dump_files`] with the per-file removal injected, so a test can drive
 /// the removal-error-tolerance path deterministically (force `Err` for one
 /// eligible file and confirm cleanup still removes the rest, counting only the
@@ -344,6 +385,51 @@ pub fn spawn_cleanup(
             }
         }
     });
+}
+
+/// Run narrowly scoped startup cleanup and wait for it to finish before the
+/// listener accepts traffic. Request logs are exact paths; turn-capture cleanup
+/// is restricted to gateway-owned `api_*.json`/work/temp artifacts.
+pub async fn cleanup_scoped(
+    request_log_files: Vec<PathBuf>,
+    turn_capture_dir: Option<PathBuf>,
+    max_age_hours: Option<u64>,
+) {
+    let Some(max_age_hours) = max_age_hours.filter(|value| *value > 0) else {
+        return;
+    };
+    let max_age = Duration::from_secs(max_age_hours.saturating_mul(3600));
+    let result = tokio::task::spawn_blocking(move || {
+        let now = SystemTime::now();
+        let request_logs = request_log_files
+            .iter()
+            .filter(|path| cleanup_exact_file(path, max_age, now))
+            .count();
+        let mut artifacts = 0;
+        let mut work_dirs = 0;
+        let mut temp_files = 0;
+        if let Some(capture_dir) = turn_capture_dir.as_ref() {
+            artifacts = cleanup_turn_capture_artifacts(capture_dir, max_age, now);
+            work_dirs = cleanup_orphan_work_dirs(capture_dir, max_age, now);
+            temp_files = cleanup_orphan_tmp_files(capture_dir, max_age, now);
+        }
+        (request_logs, artifacts, work_dirs, temp_files)
+    })
+    .await;
+    match result {
+        Ok((request_logs, artifacts, work_dirs, temp_files)) => {
+            if request_logs + artifacts + work_dirs + temp_files > 0 {
+                tracing::info!(
+                    request_logs,
+                    artifacts,
+                    work_dirs,
+                    temp_files,
+                    "cleaned up expired gateway-owned log artifacts"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(%error, "startup log cleanup task failed"),
+    }
 }
 
 fn is_eligible_extension(path: &Path) -> bool {

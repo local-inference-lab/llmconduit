@@ -1,0 +1,99 @@
+# Docker-ready example. Copy this file to config.yaml for private endpoints,
+# credentials, and model names; docker-compose.yml can use either file.
+bind_addr: "127.0.0.1:4000"
+
+# Legacy/default route. It remains the passthrough target when a request does
+# not select the operational alias below.
+upstream_base_url: "http://host.docker.internal:8000/v1"
+upstream_model: "Qwen3.5"
+
+# The control-plane namespace is additive: ordinary upstream llmconduit fields
+# remain at the document root and survive operational edits unchanged.
+control_plane:
+  storage:
+    backend: sqlite
+    url: "sqlite:///data/llmconduit.sqlite3"
+    # Request-path persistence is non-blocking. A full queue drops telemetry
+    # rather than delaying inference; shutdown logs report its counters.
+    queue_capacity: 1024
+    # SQL history and daily JSONL files older than this are pruned.
+    # Small hosts (2 GB / 2 vCPU): 7-14 days keeps the SQLite file and its
+    # page cache small.
+    retention_days: 30
+    # Request bodies are stored in full, split into content-addressed items.
+    # Secrets are always redacted; this keeps or strips image/data URIs.
+    # Small hosts: `keep_media: false` avoids storing base64 images.
+    keep_media: true
+
+  # Client inference auth is separate from /dashboard session auth. With no
+  # operational keys and require:false, /v1 inference endpoints remain open.
+  # Dashboard users and their API keys live in the SQL store; bootstrap the
+  # first admin with LLMCONDUIT_ADMIN_USERNAME/LLMCONDUIT_ADMIN_PASSWORD or
+  # `llmconduit user create`. SQL keys join the YAML keys below live.
+  auth:
+    require: false
+    conversation_id_header: "x-conversation-id"
+
+  # Harness/session detection. Built-in profiles cover Claude Code, Codex, opencode, pi,
+  # oh-my-pi, pi-agent (x-llm-* headers) and a generic fallback; list your own
+  # here to extend or override them (same name replaces the built-in).
+  sessions:
+    infer_sub_sessions: true
+    builtin: extend
+    harnesses: []
+
+  # Upstream engine metrics: every backend's Prometheus /metrics (vLLM, SGLang)
+  # is scraped and stored per model next to the gateway's own health samples.
+  # The URL is derived from the backend base_url (…/v1 -> …/metrics) only for
+  # self-hosted backends (loopback, private/Tailscale IPs, single-label or
+  # .local/.internal/.lan/.ts.net hosts); public hosted APIs are skipped unless
+  # given an explicit `url` or `enabled: true`. Bodies are capped at 2 MiB.
+  metrics:
+    enabled: true
+    scrape_interval_secs: 60
+    backends: {}
+    #  local: { url: "http://host.docker.internal:8000/metrics" }
+    #  openrouter: { enabled: false }
+
+  # Native-vision detection: each routed backend model is sent a one-pixel
+  # image at startup, whenever dashboard providers change, and every interval
+  # (default 3600 s); a model that accepts it receives images unchanged, a
+  # model that rejects it gets the text placeholder. Each probe is a real
+  # inference request, so keep the interval long on paid/GPU backends.
+  vision_probe:
+    enabled: true
+    interval_secs: 3600
+
+  operational:
+    backends:
+      - id: "10000000-0000-4000-8000-000000000001"
+        name: "local"
+        base_url: "http://host.docker.internal:8000/v1"
+        # For authenticated providers, prefer an env reference over an inline secret.
+        # api_key_env: OPENAI_API_KEY
+        enabled: true
+
+    # Profiles retain the complete upstream profile schema. `backends` is an
+    # ordered list of stable backend UUIDs and therefore survives renames.
+    model_profiles:
+      - id: "20000000-0000-4000-8000-000000000001"
+        name: "qwen-local"
+        # Opt-in repairs for models that mix tool-call encodings (GLM emits its
+        # native <arg_key>/<arg_value> markup inside the first JSON argument).
+        # Off unless listed; see README "Tool-call repairs".
+        # tool_call_repairs: [glm_arg_markup]
+        backends:
+          - "10000000-0000-4000-8000-000000000001"
+        upstream_model: "Qwen3.5"
+
+    # The client-facing alias expands to the profiles' ordered backend chains.
+    aliases:
+      - id: "30000000-0000-4000-8000-000000000001"
+        name: "local"
+        profiles:
+          - "20000000-0000-4000-8000-000000000001"
+
+    # Add virtual keys here before setting auth.require to true. Store a
+    # `sha256:<hex>` digest for deployed keys; allowed_aliases contains UUIDs.
+    keys: []
+    unknown_model_policy: passthrough

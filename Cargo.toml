@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 async-stream = "0.3"
-chrono = { version = "0.4", features = ["clock"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "macros", "ws"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -14,10 +15,12 @@ dirs = "6"
 eventsource-stream = "0.2"
 futures = "0.3"
 hex = "0.4"
+iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
 # Dashboard session-cookie auth (D7): HMAC-SHA256 signing (`hmac` + the existing
 # `sha2`), constant-time comparison of tokens/MACs (`subtle`), and base64url
 # cookie encoding (`base64`). Secrets are read from the environment in the auth
 # layer and never stored on the persisted `Config`.
+argon2 = "0.5"
 base64 = "0.22"
 hmac = "0.12"
 subtle = "2"
@@ -38,6 +41,7 @@ http-body = "1"
 include_dir = "0.7"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -48,8 +52,9 @@ serde_yaml = "0.9"
 # identically to the YAML path — load-bearing for first-match-wins routing.
 toml = { version = "1", default-features = false, features = ["parse", "serde", "preserve_order"] }
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "migrate", "macros"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 # D6 AbortHub: `CancellationToken` for server-side flow kill. Race-free `cancelled()`
 # future (no lost-wakeup, unlike a hand-rolled `Notify`) composed alongside every
@@ -71,6 +76,21 @@ zstd = "0.13"
 flate2 = "1"
 brotli = "8"
 uuid = { version = "1", features = ["serde", "v4"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+# Global allocator for the BINARY only (`src/main.rs`). Returns freed pages to
+# the OS promptly and avoids glibc's per-thread arena growth, keeping RSS low on
+# small hosts. The lib keeps the system allocator (its `#[cfg(test)]`
+# allocation probe installs its own `#[global_allocator]` in the lib test crate).
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+# Thin LTO + a single codegen unit: smaller, faster binary for one extra build
+# minute. `panic` stays `unwind` — request handling relies on unwind isolation.
+# Small build hosts can override with CARGO_PROFILE_RELEASE_LTO=false and
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 (see scripts/install-github-sso-production.sh).
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [dev-dependencies]
 pretty_assertions = "1"

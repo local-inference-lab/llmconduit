@@ -904,3 +904,45 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     expect(dashboardStore.getState().flows.size).toBe(0);
   });
 });
+
+
+describe('FlowDetail — Chain tab (predecessor diff from the durable content store)', () => {
+  beforeEach(() => {
+    resetWorld({ mock: true });
+    // api_004 is the codex flow whose tool list changed vs its predecessor api_005 (mock seed).
+    seedFlows([makeFlow({ api_call_id: 'api_004', response_id: 'resp_004', status: 'completed', harness: 'codex', session_id: 'sess_codex', chain_parent_request_id: 'api_005', divergence_kind: 'tools_changed', cache_bust: true, started_ms: 1_700_000_000_000 })]);
+  });
+  afterEach(cleanup);
+
+  it('shows the lineage summary and diffs this body against the predecessor', async () => {
+    const { getByTestId, getByRole, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_004" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    expect(queryByTestId('chain-pane-row')).toBeNull();
+    fireEvent.click(getByRole('tab', { name: 'Chain' }));
+    const tab = getByTestId('chain-tab');
+    expect(tab.getAttribute('data-cache-bust')).toBe('true');
+    expect(getByTestId('chain-harness').textContent).toBe('codex');
+    expect(getByTestId('chain-session').textContent).toBe('sess_codex');
+    expect(getByTestId('chain-lineage').textContent).toBe('cache bust · tools');
+    expect(getByTestId('chain-predecessor').textContent).toBe('api_005');
+    // Both reassembled bodies load from the mock history API; the diff tints the added tool.
+    await waitFor(() => expect(getByTestId('jsonpane-code-T · this request').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+    await waitFor(() => expect(getByTestId('jsonpane-code-P · predecessor').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+    const tinted = getByTestId('jsonpane-code-T · this request').querySelectorAll('.json-line[data-diff]');
+    expect(tinted.length).toBeGreaterThan(0);
+    // The transformation panes come back when leaving the tab.
+    fireEvent.click(getByRole('tab', { name: 'Headers' }));
+    expect(queryByTestId('chain-pane-row')).toBeNull();
+    expect(getByTestId('pane-row')).toBeTruthy();
+  });
+
+  it('a chain start has no predecessor pane content and says so', async () => {
+    seedFlows([makeFlow({ api_call_id: 'api_005', status: 'completed', harness: 'codex', session_id: 'sess_codex', divergence_kind: 'new_chain', cache_bust: false, started_ms: 1_700_000_000_000 })]);
+    const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_005" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    fireEvent.click(getByRole('tab', { name: 'Chain' }));
+    expect(getByTestId('chain-predecessor').textContent).toBe('—');
+    expect(getByTestId('chain-lineage').textContent).toBe('new');
+    expect(getByTestId('jsonpane-empty-P · predecessor').textContent).toContain('no predecessor');
+  });
+});

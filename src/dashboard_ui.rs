@@ -59,26 +59,82 @@ const DASHBOARD_CSP_BASE: &str = "default-src 'self'; script-src 'self'{NONCE}; 
 /// (`style-src 'unsafe-inline'`).
 const LOGIN_SHELL_TEMPLATE: &str = include_str!("dashboard_login.html");
 
+const GITHUB_LOGIN_SHELL_TEMPLATE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>llmconduit dashboard - sign in</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101214; --panel:#171a1f; --line:#303741; --text:#edf1f5; --muted:#9aa6b2; --blue:#6bb6ff; --red:#ff6b6b; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--text); display: grid; place-items: center; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 28px 26px; width: min(360px, 90vw); box-shadow: 0 16px 40px rgba(0,0,0,.4); }
+    h1 { font-size: 17px; margin: 0 0 4px; }
+    p { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+    a { display: flex; align-items: center; justify-content: center; width: 100%; background: var(--blue); color: #06121f; border-radius: 8px; padding: 11px 12px; font-size: 14px; font-weight: 650; text-decoration: none; }
+    .error { margin-bottom: 14px; color: var(--red); font-size: 13px; min-height: 16px; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>llmconduit dashboard</h1>
+    <p>Sign in with an approved GitHub account.</p>
+    <div class="error" id="error" role="alert"></div>
+    <a href="/dashboard/auth/github/start">Continue with GitHub</a>
+  </main>
+  <script nonce="{NONCE}">
+    const reason = new URLSearchParams(window.location.search).get("login_error");
+    const messages = {
+      github_cancelled: "GitHub sign-in was cancelled.",
+      github_configuration: "GitHub SSO is not configured on this server.",
+      github_state: "The GitHub sign-in request expired or could not be verified.",
+      github_exchange: "GitHub could not complete the sign-in exchange.",
+      github_profile: "The GitHub profile could not be loaded.",
+      github_denied: "This GitHub account is not allowed to use the dashboard."
+    };
+    if (reason) document.getElementById("error").textContent = messages[reason] || "GitHub sign-in failed.";
+  </script>
+</body>
+</html>"#;
+
 /// `GET /dashboard` — auth-aware shell. Authenticated → the embedded SPA with an
 /// injected bootstrap script + a refreshed CSRF cookie. Unauthenticated → the
 /// login shell. Always carries the dashboard CSP + security headers + `no-store`
 /// (transcripts/credentials must not be cached).
+#[utoipa::path(
+    get,
+    path = "/dashboard",
+    tag = "ui",
+    operation_id = "dashboard_index",
+    responses(
+        (status = 200, description = "HTML. With a valid session (`llmconduit_session` cookie, bearer token, or dev-open): the embedded SPA `index.html` with a nonce-bearing bootstrap script element setting `window.__LLMCONDUIT_DASHBOARD__ = {authenticated: true, csrf_token, mutations_enabled, user, auth_mode}` and a freshly issued `llmconduit_csrf` cookie. Without one: the login shell (token/username form posting to `/dashboard/login`) — never a 401. Both carry the dashboard CSP (per-response `script-src` nonce), `X-Frame-Options: DENY`, `nosniff`, `no-referrer` and `Cache-Control: no-store`.", content_type = "text/html", body = String),
+        (status = 500, description = "Authenticated, but the embedded dashboard build has no `index.html`. Plain text `dashboard index.html missing from embedded build`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_index(
+    axum::extract::State(gateway): axum::extract::State<Arc<crate::engine::Gateway>>,
     Extension(auth): Extension<Arc<DashboardAuth>>,
     session: Option<AuthSession>,
 ) -> Response {
     let nonce = new_nonce();
-    if session.is_some() {
-        serve_authenticated_shell(&auth, &nonce)
-    } else {
-        serve_login_shell(&nonce)
+    let auth_mode = crate::accounts_api::auth_mode(&gateway, &auth).await;
+    match session {
+        Some(session) => serve_authenticated_shell(&auth, &nonce, session.user.as_ref(), auth_mode),
+        None => serve_login_shell(&auth, &nonce, auth_mode),
     }
 }
 
 /// Build the authenticated SPA response: inject the bootstrap script into
 /// `index.html`, set a fresh `llmconduit_csrf` cookie, and stamp the CSP +
 /// headers.
-fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
+fn serve_authenticated_shell(
+    auth: &DashboardAuth,
+    nonce: &str,
+    user: Option<&crate::accounts::SessionUser>,
+    auth_mode: &str,
+) -> Response {
     let Some(file) = DASHBOARD_DIST.get_file("index.html") else {
         return security_headers(
             (
@@ -90,11 +146,14 @@ fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
         );
     };
     let csrf = auth.issue_csrf_token();
+    let user_json = serde_json::to_string(&user).unwrap_or_else(|_| "null".to_string());
     let bootstrap = format!(
         "<script nonce=\"{nonce}\">window.__LLMCONDUIT_DASHBOARD__={{\"authenticated\":true,\
-         \"csrf_token\":{csrf},\"mutations_enabled\":{mutations}}};</script>",
+         \"csrf_token\":{csrf},\"mutations_enabled\":{mutations},\"user\":{user_json},\
+         \"auth_mode\":{mode}}};</script>",
         csrf = json_string(&csrf),
         mutations = auth.mutations_enabled(),
+        mode = json_string(auth_mode),
     );
     let html = inject_before_head_close(&String::from_utf8_lossy(file.contents()), &bootstrap);
 
@@ -107,8 +166,15 @@ fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
 }
 
 /// Build the login-shell response (unauthenticated `/dashboard`).
-fn serve_login_shell(nonce: &str) -> Response {
-    let html = LOGIN_SHELL_TEMPLATE.replace("{NONCE}", nonce);
+fn serve_login_shell(auth: &DashboardAuth, nonce: &str, auth_mode: &str) -> Response {
+    let template = if auth.github_sso_enabled() {
+        GITHUB_LOGIN_SHELL_TEMPLATE
+    } else {
+        LOGIN_SHELL_TEMPLATE
+    };
+    let html = template
+        .replace("{NONCE}", nonce)
+        .replace("{AUTH_MODE}", auth_mode);
     let response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     security_headers(response, Some(nonce))
 }
@@ -119,6 +185,19 @@ fn serve_login_shell(nonce: &str) -> Response {
 /// headers (no CSP needed on a sub-resource, but `nosniff`/`no-referrer`/
 /// frame-deny still apply) but NOT `no-store` — hashed Vite assets are
 /// immutable and may be cached.
+#[utoipa::path(
+    get,
+    path = "/dashboard/assets/{path}",
+    tag = "ui",
+    operation_id = "dashboard_asset",
+    params(
+        ("path" = String, Path, description = "Wildcard (axum `{*path}`): the file path below the embedded `assets/` directory, e.g. `index-DEADBEEF.js`; may contain `/`."),
+    ),
+    responses(
+        (status = 200, description = "The embedded file bytes. `Content-Type` is derived from the extension (html, js/mjs, css, json/map, svg, png, jpg/jpeg, gif, webp, ico, woff2, woff, ttf, txt, wasm; anything else `application/octet-stream`). No session required; `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, but no `Cache-Control: no-store` (hashed assets are immutable)."),
+        (status = 404, description = "No embedded file at that path. Plain text `asset not found`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn dashboard_asset(Path(path): Path<String>) -> Response {
     let asset_path = format!("assets/{path}");
     match DASHBOARD_DIST.get_file(&asset_path) {

@@ -367,7 +367,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         usage: p.usage ?? prev?.usage ?? null,
         status: p.status,
         started_ms: prev?.started_ms ?? p.started_ms,
-        finished_ms: prev?.finished_ms ?? null,
+        finished_ms: p.finished_ms ?? prev?.finished_ms ?? null,
         elapsed_ms: p.elapsed_ms ?? prev?.elapsed_ms ?? null,
         terminal_reason: prev?.terminal_reason ?? null,
         cost: prev?.cost ?? null,

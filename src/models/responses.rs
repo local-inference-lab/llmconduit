@@ -604,6 +604,12 @@ pub struct ResponseUsage {
     pub output_tokens: i64,
     pub total_tokens: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<ResponseInputTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<ResponseOutputTokensDetails>,

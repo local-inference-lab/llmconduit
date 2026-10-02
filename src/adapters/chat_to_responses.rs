@@ -99,6 +99,11 @@ pub struct FinalizedAssistantTurn {
 
 #[derive(Debug, Default)]
 pub struct StreamState {
+    /// Tool-call repairs enabled for THIS turn's backend model
+    /// (`config.profile_tool_call_repairs`). Non-empty switches the tool-call
+    /// path from streaming fragments to a single repaired call (see
+    /// `apply_tool_call_delta`); empty leaves the upstream's bytes untouched.
+    tool_call_repairs: Vec<crate::tool_repair::ToolCallRepair>,
     message_id: Option<String>,
     reasoning_id: Option<String>,
     output_text: String,
@@ -133,6 +138,15 @@ impl ToolCallAccumulator {
 }
 
 impl StreamState {
+    /// Build a state whose tool calls are repaired per the model's profile.
+    /// `repairs` empty ⇒ identical behaviour to [`StreamState::default`].
+    pub fn with_tool_call_repairs(repairs: Vec<crate::tool_repair::ToolCallRepair>) -> Self {
+        Self {
+            tool_call_repairs: repairs,
+            ..Self::default()
+        }
+    }
+
     pub fn apply_chunk(&mut self, chunk: &ChatCompletionChunk) -> Vec<StreamEmission> {
         let mut emissions = Vec::new();
         for choice in &chunk.choices {
@@ -263,7 +277,12 @@ impl StreamState {
             let before_len = entry.arguments_text.len();
             append_argument_fragment(&mut entry.arguments_text, arguments);
             let delta = entry.arguments_text[before_len..].to_string();
-            if !delta.is_empty() {
+            // With a repair enabled, argument fragments are NOT streamed: the
+            // repair can only be judged on the COMPLETE text (the markup starts
+            // mid-value), and a fragment already sent cannot be taken back. The
+            // call still reaches the client — whole and repaired — through
+            // `response.output_item.done`, which every client protocol renders.
+            if !delta.is_empty() && self.tool_call_repairs.is_empty() {
                 emissions.push(StreamEmission::FunctionCallArgumentsDelta {
                     call_id,
                     name: entry.name.clone(),
@@ -342,6 +361,12 @@ impl StreamState {
                 Value::Object(Default::default())
             } else {
                 let cleaned = extract_json_arguments(&accumulator.arguments_text);
+                // Opt-in vendor repair (e.g. GLM's `<arg_key>` markup leaking
+                // into the first JSON argument) before the parse that the
+                // harness's contract depends on.
+                let repaired =
+                    crate::tool_repair::repair_arguments(cleaned, &self.tool_call_repairs);
+                let cleaned = repaired.as_deref().unwrap_or(cleaned);
                 serde_json::from_str(cleaned).map_err(|err| {
                     AppError::upstream(format!(
                         "failed to parse upstream tool arguments for {name}: {err}"
@@ -717,6 +742,72 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         )
+    }
+
+    /// GLM streams its native `<arg_key>` markup INSIDE the first JSON argument
+    /// (captured verbatim off GLM-5.2). With the repair enabled for that model the
+    /// swallowed argument is split back out, and the fragments are held back so a
+    /// client assembling deltas can never see the broken text; with it disabled the
+    /// upstream's bytes are forwarded untouched.
+    #[test]
+    fn glm_hybrid_tool_call_is_repaired_only_when_the_profile_asks() {
+        let fragments = [
+            Some("{\"action\": \"edit"),
+            Some("<arg_key>"),
+            Some("appendContent</arg_key><arg_value>"),
+            Some("## NOTES\\n- one"),
+            Some("\", \"scope\": \"local\"}"),
+        ];
+        let registry = || {
+            simple_registry(vec![(
+                "memory",
+                ToolKind::Function {
+                    public_name: "memory".to_string(),
+                    namespace: None,
+                },
+            )])
+        };
+        let run = |repairs: Vec<crate::tool_repair::ToolCallRepair>| {
+            let mut state = StreamState::with_tool_call_repairs(repairs);
+            let mut streamed = String::new();
+            for (i, fragment) in fragments.iter().enumerate() {
+                let chunk = tool_call_chunk(
+                    "c1",
+                    (i == 0).then_some("call_1"),
+                    0,
+                    (i == 0).then_some("memory"),
+                    *fragment,
+                );
+                for emission in state.apply_chunk(&chunk) {
+                    if let StreamEmission::FunctionCallArgumentsDelta { delta, .. } = emission {
+                        streamed.push_str(&delta);
+                    }
+                }
+            }
+            let finalized = state.finalize(&registry()).expect("finalizes");
+            (streamed, finalized)
+        };
+
+        let (streamed, finalized) = run(vec![crate::tool_repair::ToolCallRepair::GlmArgMarkup]);
+        assert!(
+            streamed.is_empty(),
+            "no fragment may reach the client before the repair is judged: {streamed:?}"
+        );
+        let arguments = &finalized.tool_calls[0].arguments;
+        assert_eq!(arguments["action"], "edit");
+        assert_eq!(arguments["appendContent"], "## NOTES\n- one");
+        assert_eq!(arguments["scope"], "local");
+
+        let (streamed, finalized) = run(Vec::new());
+        assert!(
+            streamed.contains("<arg_key>"),
+            "off by default: forwarded as-is"
+        );
+        assert_eq!(
+            finalized.tool_calls[0].arguments["action"],
+            "edit<arg_key>appendContent</arg_key><arg_value>## NOTES\n- one",
+            "unrepaired, the first argument still swallows the second"
+        );
     }
 
     #[test]

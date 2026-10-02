@@ -207,3 +207,49 @@ describe('FlowTable — live WS update + interactions', () => {
     expect(getByTestId('flow-count').textContent).toContain('2 / 3');
   });
 });
+
+
+describe('FlowTable — sessions facts (harness column + cache-bust marker)', () => {
+  it('renders the detected harness (— when undetected) and flags cache-busting rows', async () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_h1', started_ms: 3, harness: 'claude-code', harness_version: '2.1.205', session_id: 'sess_1', divergence_kind: 'tools_changed', cache_bust: true }),
+      makeFlow({ api_call_id: 'api_h2', started_ms: 2, harness: 'codex', divergence_kind: 'append', cache_bust: false }),
+      makeFlow({ api_call_id: 'api_h3', started_ms: 1 }),
+    ]);
+    const { getAllByTestId, queryAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    await act(async () => {});
+    const cells = getAllByTestId('flow-harness');
+    expect(cells.map((c) => c.textContent)).toEqual(['claude-code', 'codex', '—']);
+    expect(cells[0]!.getAttribute('data-quality')).toBe('measured');
+    expect(cells[2]!.getAttribute('data-quality')).toBe('unavailable');
+    expect(cells[0]!.getAttribute('title')).toContain('2.1.205');
+    // Only the busting row carries the marker, tagged with its divergence kind.
+    const busts = queryAllByTestId('flow-cache-bust');
+    expect(busts.length).toBe(1);
+    expect(busts[0]!.getAttribute('data-kind')).toBe('tools_changed');
+  });
+
+  it('the harness facet and the cache-bust facet scope the rows', async () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_f1', started_ms: 3, harness: 'claude-code', cache_bust: true, divergence_kind: 'history_rewritten' }),
+      makeFlow({ api_call_id: 'api_f2', started_ms: 2, harness: 'codex', cache_bust: false, divergence_kind: 'append' }),
+      makeFlow({ api_call_id: 'api_f3', started_ms: 1, harness: 'codex' }),
+    ]);
+    const { getAllByTestId, getByTestId, getByText } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    await act(async () => {});
+    expect(getAllByTestId('flow-row').length).toBe(3);
+    // Harness chips are derived from the rows in view.
+    const bar = getByTestId('flow-filter-bar');
+    const harnessGroup = within(bar).getByText('harness').parentElement as HTMLElement;
+    const codexChip = within(harnessGroup).getByText('codex');
+    fireEvent.click(codexChip);
+    await act(async () => {});
+    expect(getAllByTestId('flow-row').length).toBe(2);
+    fireEvent.click(codexChip); // toggle off
+    await act(async () => {});
+    fireEvent.click(getByText('busts'));
+    await act(async () => {});
+    expect(getAllByTestId('flow-row').length).toBe(1);
+    expect(getByTestId('flow-count').textContent).toBe('1 / 3');
+  });
+});

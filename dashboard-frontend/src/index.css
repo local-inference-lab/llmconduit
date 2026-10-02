@@ -34,6 +34,25 @@ pre,
   font-family: var(--font-mono);
 }
 
+/* Chat markdown stays within the shared palette while giving fenced code useful syntax contrast. */
+.chat-markdown > :first-child { margin-top: 0; }
+.chat-markdown > :last-child { margin-bottom: 0; }
+.chat-markdown-compact { color: rgb(var(--color-text-muted)); }
+.chat-markdown .hljs-keyword,
+.chat-markdown .hljs-selector-tag,
+.chat-markdown .hljs-literal { color: rgb(var(--color-accent)); }
+.chat-markdown .hljs-string,
+.chat-markdown .hljs-title,
+.chat-markdown .hljs-section { color: rgb(var(--color-status-healthy)); }
+.chat-markdown .hljs-number,
+.chat-markdown .hljs-symbol,
+.chat-markdown .hljs-bullet { color: rgb(var(--color-status-cooling)); }
+.chat-markdown .hljs-comment,
+.chat-markdown .hljs-quote { color: rgb(var(--color-text-muted)); }
+.chat-markdown .hljs-built_in,
+.chat-markdown .hljs-type,
+.chat-markdown .hljs-attr { color: rgb(var(--color-meta)); }
+
 /* Masthead — the Argus eye keeps a slow, vigilant watch (the one ambient brand motion).
    Cut to static by the prefers-reduced-motion block at the bottom of this file. */
 @keyframes argus-watch {

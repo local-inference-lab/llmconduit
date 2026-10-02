@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,8 +23,13 @@ pub(crate) const REQUEST_EVENT_LIMIT: usize = 512;
 const REQUEST_PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 24 * 1024 * 1024;
 /// Global retained-preview budget across all monitor records. Per-request caps
 /// alone still permit hundreds of large inactive requests to dominate snapshot
-/// cloning and WebSocket replay.
-const MONITOR_PAYLOAD_PREVIEW_CHAR_LIMIT: usize = 128 * 1024 * 1024;
+/// cloning and WebSocket replay. 16 MiB keeps the latest few full payloads
+/// replayable on a 2 GB host; `LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES` overrides.
+const MONITOR_PAYLOAD_PREVIEW_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+/// Expired-record sweeps run at most this often from the emit path (every
+/// `snapshot()` still sweeps first). Sweeping on every token scanned all 512
+/// records per delta for a 30-minute TTL that a 1 s lag cannot affect.
+const PRUNE_INTERVAL_MS: u128 = 1_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MonitorEventKind {
@@ -298,19 +304,71 @@ pub struct DebugEventImage {
 #[derive(Clone)]
 pub struct MonitorHub {
     enabled: bool,
+    payload_preview_byte_limit: usize,
     tx: broadcast::Sender<DebugUpdate>,
     state: Arc<Mutex<MonitorState>>,
+}
+
+/// Messages produced while applying one event. When nobody is subscribed
+/// (`live == false`) the hub still applies every event to the retained records
+/// (a late viewer replays them from `snapshot()`), but builds no per-token
+/// outgoing messages: they would only be redacted and broadcast to no one.
+struct Outbox {
+    live: bool,
+    messages: Vec<DebugWsMessage>,
+}
+
+impl Outbox {
+    fn new(live: bool) -> Self {
+        Self {
+            live,
+            messages: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, message: DebugWsMessage) {
+        if self.live {
+            self.messages.push(message);
+        }
+    }
+
+    /// Like [`push`](Self::push) but builds the message only when someone will
+    /// receive it (the per-token segment clone is the hot allocation).
+    fn push_with(&mut self, build: impl FnOnce() -> DebugWsMessage) {
+        if self.live {
+            self.messages.push(build());
+        }
+    }
+
+    fn extend(&mut self, messages: Vec<DebugWsMessage>) {
+        if self.live {
+            self.messages.extend(messages);
+        }
+    }
 }
 
 #[derive(Debug)]
 struct MonitorState {
     history_limit: usize,
     last_sequence: u64,
+    /// Newest first. `ordinal` strictly decreases from front to back, so a
+    /// record's position is a binary search away from its ordinal.
     records: VecDeque<DebugRequestRecord>,
+    /// `response_id` → record ordinal: per-token lookups stop scanning up to
+    /// 512 records.
+    ordinals: HashMap<String, u64>,
+    next_ordinal: u64,
+    /// Earliest wall-clock instant the emit path sweeps expired records again.
+    next_prune_ms: u128,
 }
 
 #[derive(Debug)]
 struct DebugRequestRecord {
+    /// Insertion ordinal (see `MonitorState::records`).
+    ordinal: u64,
+    /// Running char count of `segments`, so the per-token trim check is O(1)
+    /// instead of re-counting up to 128 Ki chars on every delta.
+    segment_chars: usize,
     request: DebugRequest,
     segments: VecDeque<DebugSegment>,
     events: VecDeque<DebugTimelineEvent>,
@@ -329,15 +387,21 @@ struct DebugPayloadMetadata {
 
 impl MonitorHub {
     pub fn new(capacity: usize) -> Self {
+        let limit = std::env::var("LLMCONDUIT_MONITOR_PAYLOAD_PREVIEW_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(MONITOR_PAYLOAD_PREVIEW_BYTE_LIMIT);
+        Self::with_payload_preview_budget(capacity, limit)
+    }
+
+    fn with_payload_preview_budget(capacity: usize, payload_preview_byte_limit: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             enabled: true,
+            payload_preview_byte_limit,
             tx,
-            state: Arc::new(Mutex::new(MonitorState {
-                history_limit: capacity.max(1),
-                last_sequence: 0,
-                records: VecDeque::new(),
-            })),
+            state: Arc::new(Mutex::new(MonitorState::new(capacity.max(1)))),
         }
     }
 
@@ -345,12 +409,9 @@ impl MonitorHub {
         let (tx, _) = broadcast::channel(1);
         Self {
             enabled: false,
+            payload_preview_byte_limit: 0,
             tx,
-            state: Arc::new(Mutex::new(MonitorState {
-                history_limit: 1,
-                last_sequence: 0,
-                records: VecDeque::new(),
-            })),
+            state: Arc::new(Mutex::new(MonitorState::new(1))),
         }
     }
 
@@ -394,6 +455,11 @@ impl MonitorHub {
         }
         let kind = build();
         let mut state = self.state.lock().expect("monitor state lock poisoned");
+        // Read under the state lock: a viewer subscribes BEFORE taking its
+        // `snapshot()` (which needs this lock), so an event applied while the
+        // count was 0 is always in that viewer's snapshot, and every later event
+        // sees the subscriber and is broadcast.
+        let live = self.tx.receiver_count() > 0;
         state.last_sequence = state.last_sequence.saturating_add(1);
         let event = MonitorEvent {
             sequence: state.last_sequence,
@@ -408,12 +474,19 @@ impl MonitorHub {
                 | MonitorEventKind::FinalResponse { .. }
                 | MonitorEventKind::ResponseItem { .. }
         );
-        let mut messages = state.apply_event(&event);
+        let mut outbox = state.apply_event_to(&event, live);
         if carries_payload {
-            state.trim_total_payload_previews(MONITOR_PAYLOAD_PREVIEW_CHAR_LIMIT);
+            state.trim_total_payload_previews(self.payload_preview_byte_limit);
         }
-        messages.extend(state.prune_expired(event.timestamp_ms));
+        if event.timestamp_ms >= state.next_prune_ms {
+            state.next_prune_ms = event.timestamp_ms.saturating_add(PRUNE_INTERVAL_MS);
+            outbox.extend(state.prune_expired(event.timestamp_ms));
+        }
         drop(state);
+        if !live {
+            return;
+        }
+        let mut messages = outbox.messages;
         // Round-6 #1: redact image `data:`/signed URLs from EVERY outgoing
         // `/debug/ws` message at this single broadcast choke point, so no raw
         // image data/URL ever leaves the process via the monitor. This is on the
@@ -547,7 +620,56 @@ fn redact_ws_message_image_uris(message: &mut DebugWsMessage) {
 }
 
 impl MonitorState {
+    fn new(history_limit: usize) -> Self {
+        Self {
+            history_limit,
+            last_sequence: 0,
+            records: VecDeque::new(),
+            ordinals: HashMap::new(),
+            next_ordinal: 0,
+            next_prune_ms: 0,
+        }
+    }
+
+    fn position(&self, response_id: &str) -> Option<usize> {
+        let ordinal = *self.ordinals.get(response_id)?;
+        // Descending ordinals: compare target-to-element to search a reversed order.
+        self.records
+            .binary_search_by(|record| ordinal.cmp(&record.ordinal))
+            .ok()
+    }
+
+    fn contains(&self, response_id: &str) -> bool {
+        self.ordinals.contains_key(response_id)
+    }
+
+    fn push_front_record(&mut self, mut record: DebugRequestRecord) {
+        record.ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        self.ordinals
+            .insert(record.request.response_id.clone(), record.ordinal);
+        self.records.push_front(record);
+    }
+
+    fn remove_record_at(&mut self, index: usize) -> Option<DebugRequestRecord> {
+        let record = self.records.remove(index)?;
+        self.ordinals.remove(&record.request.response_id);
+        Some(record)
+    }
+
+    fn pop_back_record(&mut self) -> Option<DebugRequestRecord> {
+        let record = self.records.pop_back()?;
+        self.ordinals.remove(&record.request.response_id);
+        Some(record)
+    }
+
+    /// Apply `event` and return every resulting message (test/compat entry point).
+    #[cfg(test)]
     fn apply_event(&mut self, event: &MonitorEvent) -> Vec<DebugWsMessage> {
+        self.apply_event_to(event, true).messages
+    }
+
+    fn apply_event_to(&mut self, event: &MonitorEvent, live: bool) -> Outbox {
         if let Some(record) = self.record_mut(&event.response_id) {
             record.current_event_sequence = event.sequence;
         }
@@ -583,7 +705,7 @@ impl MonitorState {
                     input_chars: *input_chars,
                     instructions_chars: *instructions_chars,
                 };
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.start_record(event, model.clone(), stats, &mut messages);
                 messages.push(DebugWsMessage::RequestUpsert {
                     request: self
@@ -611,7 +733,7 @@ impl MonitorState {
                 payload_entry_count,
                 images,
             } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 self.push_timeline_event_with_images(
                     &event.response_id,
@@ -639,7 +761,7 @@ impl MonitorState {
                 payload_original_chars,
                 images,
             } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 self.push_timeline_event_with_images(
                     &event.response_id,
@@ -668,7 +790,7 @@ impl MonitorState {
                 payload_entry_count,
                 images,
             } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 self.push_timeline_event_with_images(
                     &event.response_id,
@@ -692,7 +814,7 @@ impl MonitorState {
                 summary,
                 payload_preview,
             } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 self.push_timeline_event(
                     &event.response_id,
@@ -706,7 +828,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::OutputTextDelta { delta } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -721,7 +843,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::ReasoningTextDelta { delta } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -737,7 +859,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::RefusalDelta { delta } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -753,7 +875,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::FunctionCallArgumentsDelta { call_id, delta } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -769,7 +891,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::ToolPhase { phase, detail } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 if let Some(line) = tool_phase_line(phase, detail) {
                     let record = self
@@ -802,7 +924,7 @@ impl MonitorState {
                 cached,
                 reasoning,
             } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let usage = DebugUsage {
                     prompt: *prompt,
@@ -828,7 +950,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::Completed => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -861,7 +983,7 @@ impl MonitorState {
                 messages
             }
             MonitorEventKind::Failed { message } => {
-                let mut messages = Vec::new();
+                let mut messages = Outbox::new(live);
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
                     .record_mut(&event.response_id)
@@ -915,7 +1037,7 @@ impl MonitorState {
                 .get(index)
                 .is_some_and(|record| record.request.updated_at_ms < cutoff);
             if should_remove {
-                if let Some(record) = self.records.remove(index) {
+                if let Some(record) = self.remove_record_at(index) {
                     messages.push(DebugWsMessage::RequestRemove {
                         response_id: record.request.response_id,
                         reason: "expired".to_string(),
@@ -929,27 +1051,29 @@ impl MonitorState {
     }
 
     fn trim_total_payload_previews(&mut self, limit: usize) {
-        let mut retained_chars: usize = self
+        // Charge allocations in O(event count), rather than scanning every
+        // retained character on the inference runtime for each payload event.
+        let mut retained_bytes: usize = self
             .records
             .iter()
             .flat_map(|record| record.events.iter())
             .filter_map(|event| event.payload_preview.as_ref())
-            .map(|preview| preview.chars().count())
+            .map(|preview| preview.capacity())
             .sum();
-        if retained_chars <= limit {
+        if retained_bytes <= limit {
             return;
         }
 
         for record in self.records.iter_mut().rev() {
             for event in &mut record.events {
-                if retained_chars <= limit {
+                if retained_bytes <= limit {
                     return;
                 }
                 let Some(preview) = event.payload_preview.take() else {
                     continue;
                 };
                 let chars = preview.chars().count();
-                retained_chars = retained_chars.saturating_sub(chars);
+                retained_bytes = retained_bytes.saturating_sub(preview.capacity());
                 event.payload_original_chars.get_or_insert(chars);
                 event.payload_retention_omitted = true;
                 record.request.payload_previews_omitted =
@@ -963,24 +1087,22 @@ impl MonitorState {
         event: &MonitorEvent,
         model: String,
         stats: DebugRequestStats,
-        messages: &mut Vec<DebugWsMessage>,
+        messages: &mut Outbox,
     ) {
-        if let Some(index) = self
-            .records
-            .iter()
-            .position(|record| record.request.response_id == event.response_id)
-        {
-            let _ = self.records.remove(index);
+        if let Some(index) = self.position(&event.response_id) {
+            let _ = self.remove_record_at(index);
         }
         while self.records.len() >= self.history_limit {
-            if let Some(record) = self.records.pop_back() {
+            if let Some(record) = self.pop_back_record() {
                 messages.push(DebugWsMessage::RequestRemove {
                     response_id: record.request.response_id,
                     reason: "capacity".to_string(),
                 });
             }
         }
-        self.records.push_front(DebugRequestRecord {
+        self.push_front_record(DebugRequestRecord {
+            ordinal: 0,
+            segment_chars: 0,
             request: DebugRequest {
                 response_id: event.response_id.clone(),
                 model,
@@ -1008,27 +1130,25 @@ impl MonitorState {
         &mut self,
         response_id: &str,
         timestamp_ms: u128,
-        messages: &mut Vec<DebugWsMessage>,
+        messages: &mut Outbox,
     ) {
-        if self
-            .records
-            .iter()
-            .any(|record| record.request.response_id == response_id)
-        {
+        if self.contains(response_id) {
             if let Some(record) = self.record_mut(response_id) {
                 record.request.updated_at_ms = timestamp_ms;
             }
             return;
         }
         while self.records.len() >= self.history_limit {
-            if let Some(record) = self.records.pop_back() {
+            if let Some(record) = self.pop_back_record() {
                 messages.push(DebugWsMessage::RequestRemove {
                     response_id: record.request.response_id,
                     reason: "capacity".to_string(),
                 });
             }
         }
-        self.records.push_front(DebugRequestRecord {
+        self.push_front_record(DebugRequestRecord {
+            ordinal: 0,
+            segment_chars: 0,
             request: DebugRequest {
                 response_id: response_id.to_string(),
                 model: String::new(),
@@ -1061,11 +1181,11 @@ impl MonitorState {
     }
 
     fn record_mut(&mut self, response_id: &str) -> Option<&mut DebugRequestRecord> {
-        self.records
-            .iter_mut()
-            .find(|record| record.request.response_id == response_id)
+        let index = self.position(response_id)?;
+        self.records.get_mut(index)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_timeline_event(
         &mut self,
         response_id: &str,
@@ -1074,7 +1194,7 @@ impl MonitorState {
         kind: &str,
         summary: String,
         payload_preview: Option<String>,
-        messages: &mut Vec<DebugWsMessage>,
+        messages: &mut Outbox,
     ) {
         self.push_timeline_event_with_images(
             response_id,
@@ -1100,7 +1220,7 @@ impl MonitorState {
         payload_preview: Option<String>,
         payload_metadata: DebugPayloadMetadata,
         images: Vec<DebugEventImage>,
-        messages: &mut Vec<DebugWsMessage>,
+        messages: &mut Outbox,
     ) {
         let event = DebugTimelineEvent {
             sequence,
@@ -1141,7 +1261,7 @@ fn append_output_text_delta(
     timestamp_ms: u128,
     response_id: &str,
     delta: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     prepare_for_styled_delta(
         record,
@@ -1167,7 +1287,7 @@ fn append_styled_text_delta(
     response_id: &str,
     kind: DebugSegmentKind,
     delta: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if kind != DebugSegmentKind::Output {
         flush_pending_output_backslash(record, timestamp_ms, response_id, messages);
@@ -1181,7 +1301,7 @@ fn prepare_for_styled_delta(
     timestamp_ms: u128,
     response_id: &str,
     kind: DebugSegmentKind,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if record.active_function_call_id.take().is_some() {
         ensure_newline(record, timestamp_ms, response_id, kind, messages);
@@ -1196,7 +1316,7 @@ fn append_function_call_delta(
     response_id: &str,
     call_id: &str,
     delta: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     flush_pending_output_backslash(record, timestamp_ms, response_id, messages);
     if record.active_function_call_id.as_deref() != Some(call_id) {
@@ -1233,7 +1353,7 @@ fn append_segment_line(
     response_id: &str,
     kind: DebugSegmentKind,
     line: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     flush_pending_output_backslash(record, timestamp_ms, response_id, messages);
     record.active_function_call_id = None;
@@ -1247,7 +1367,7 @@ fn ensure_newline(
     timestamp_ms: u128,
     response_id: &str,
     kind: DebugSegmentKind,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if !segments_text_ends_with_newline(record) && !record.segments.is_empty() {
         append_segment_text(record, timestamp_ms, response_id, kind, "\n", messages);
@@ -1259,7 +1379,7 @@ fn ensure_newline_after_kind_change(
     timestamp_ms: u128,
     response_id: &str,
     kind: DebugSegmentKind,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if !record.segments.is_empty()
         && !segments_text_ends_with_newline(record)
@@ -1275,13 +1395,14 @@ fn append_segment_text(
     response_id: &str,
     kind: DebugSegmentKind,
     text: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if text.is_empty() {
         return;
     }
 
     record.request.updated_at_ms = timestamp_ms;
+    record.segment_chars = record.segment_chars.saturating_add(text.chars().count());
     match record.segments.back_mut() {
         Some(segment)
             if segment.kind == kind
@@ -1298,7 +1419,7 @@ fn append_segment_text(
         }),
     }
     trim_segment_prefix(record);
-    messages.push(DebugWsMessage::SegmentAppend {
+    messages.push_with(|| DebugWsMessage::SegmentAppend {
         response_id: response_id.to_string(),
         segment: DebugSegment {
             sequence: record.current_event_sequence,
@@ -1311,15 +1432,12 @@ fn append_segment_text(
 }
 
 fn trim_segment_prefix(record: &mut DebugRequestRecord) {
-    let char_count: usize = record
-        .segments
-        .iter()
-        .map(|segment| segment.text.chars().count())
-        .sum();
+    let char_count = record.segment_chars;
     if char_count <= REQUEST_TEXT_CHAR_LIMIT {
         return;
     }
     let mut drain_chars = char_count - REQUEST_TEXT_CHAR_LIMIT;
+    record.segment_chars = REQUEST_TEXT_CHAR_LIMIT;
     while drain_chars > 0 {
         let Some(front) = record.segments.front_mut() else {
             return;
@@ -1427,7 +1545,7 @@ fn flush_pending_output_backslash(
     record: &mut DebugRequestRecord,
     timestamp_ms: u128,
     response_id: &str,
-    messages: &mut Vec<DebugWsMessage>,
+    messages: &mut Outbox,
 ) {
     if record.pending_output_backslash {
         record.pending_output_backslash = false;
@@ -1495,6 +1613,7 @@ mod tests {
     use super::DEBUG_HISTORY_RETENTION_MS;
     use super::DebugRequestStatus;
     use super::DebugSegmentKind;
+    use super::DebugSnapshot;
     use super::DebugWsMessage;
     use super::MonitorEvent;
     use super::MonitorEventKind;
@@ -1502,7 +1621,6 @@ mod tests {
     use super::MonitorState;
     use super::REQUEST_EVENT_LIMIT;
     use super::REQUEST_TEXT_CHAR_LIMIT;
-    use std::collections::VecDeque;
 
     #[test]
     fn emit_with_skips_closure_when_disabled() {
@@ -1558,6 +1676,152 @@ mod tests {
             message,
             DebugWsMessage::RequestUpsert { request } if request.response_id == "resp_1"
         )));
+    }
+
+    fn snapshot_output_text(snapshot: &DebugSnapshot, response_id: &str) -> String {
+        snapshot
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                DebugWsMessage::SegmentAppend {
+                    response_id: id,
+                    segment,
+                } if id == response_id => Some(segment.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deltas_without_viewers_are_retained_for_a_late_viewer() {
+        let hub = MonitorHub::new(8);
+        hub.emit("resp_quiet", started("model-a"));
+        for word in ["hello ", "quiet ", "world"] {
+            hub.emit(
+                "resp_quiet",
+                MonitorEventKind::OutputTextDelta {
+                    delta: word.to_string(),
+                },
+            );
+        }
+        // The sequence still advances so cursors stay monotonic.
+        assert_eq!(hub.last_sequence(), 4);
+
+        // A late viewer subscribes, then snapshots (the WS handlers' order).
+        let mut rx = hub.subscribe();
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.last_sequence, 4);
+        assert_eq!(
+            snapshot_output_text(&snapshot, "resp_quiet"),
+            "hello quiet world"
+        );
+        assert!(rx.try_recv().is_err(), "nothing was broadcast to no one");
+
+        // From now on every delta is broadcast live.
+        hub.emit(
+            "resp_quiet",
+            MonitorEventKind::OutputTextDelta {
+                delta: "!".to_string(),
+            },
+        );
+        let update = rx.try_recv().expect("live delta");
+        assert_eq!(update.sequence, 5);
+        assert!(update.messages.iter().any(|message| matches!(
+            message,
+            DebugWsMessage::SegmentAppend { segment, .. } if segment.text == "!"
+        )));
+    }
+
+    #[test]
+    fn running_segment_char_count_matches_a_recount_through_trimming() {
+        let hub = MonitorHub::new(4);
+        hub.emit("resp_long", started("model-a"));
+        let chunk = "é漢字x\\n".repeat(997);
+        for index in 0..60 {
+            let kind = if index % 7 == 0 {
+                MonitorEventKind::ReasoningTextDelta {
+                    delta: chunk.clone(),
+                }
+            } else {
+                MonitorEventKind::OutputTextDelta {
+                    delta: chunk.clone(),
+                }
+            };
+            hub.emit("resp_long", kind);
+            let state = hub.state.lock().unwrap();
+            let record = state.records.front().unwrap();
+            let recount: usize = record
+                .segments
+                .iter()
+                .map(|segment| segment.text.chars().count())
+                .sum();
+            assert_eq!(record.segment_chars, recount, "after delta {index}");
+            assert!(record.segment_chars <= REQUEST_TEXT_CHAR_LIMIT);
+        }
+        let state = hub.state.lock().unwrap();
+        assert!(
+            state
+                .records
+                .front()
+                .unwrap()
+                .request
+                .segments_omitted_chars
+                > 0
+        );
+    }
+
+    #[test]
+    fn record_index_tracks_restart_eviction_and_expiry() {
+        let mut state = MonitorState::new(3);
+        let mut sequence = 0;
+        let mut apply = |state: &mut MonitorState, id: &str, at: u128, kind| {
+            sequence += 1;
+            state.apply_event(&event_at(sequence, id, at, kind))
+        };
+        for id in ["a", "b", "c"] {
+            apply(&mut state, id, 10, started("m"));
+        }
+        // Restarting "a" moves it to the front; "d" then evicts the oldest ("b").
+        apply(&mut state, "a", 20, started("m2"));
+        let removed = apply(&mut state, "d", 30, started("m"));
+        assert!(removed.iter().any(|message| matches!(
+            message,
+            DebugWsMessage::RequestRemove { response_id, reason }
+                if response_id == "b" && reason == "capacity"
+        )));
+        // A delta for an unknown id creates a record (evicting "c").
+        apply(
+            &mut state,
+            "e",
+            40,
+            MonitorEventKind::OutputTextDelta {
+                delta: "x".to_string(),
+            },
+        );
+        let ids: Vec<&str> = state
+            .records
+            .iter()
+            .map(|record| record.request.response_id.as_str())
+            .collect();
+        assert_eq!(ids, ["e", "d", "a"]);
+        assert_eq!(state.ordinals.len(), state.records.len());
+        for id in ["a", "d", "e"] {
+            let record = state.record_mut(id).expect("indexed");
+            assert_eq!(record.request.response_id, id);
+        }
+        assert_eq!(state.record_mut("a").unwrap().request.model, "m2");
+        assert!(state.record_mut("b").is_none());
+        assert!(state.record_mut("c").is_none());
+
+        // Expiry removes from the middle and keeps the index consistent.
+        state.records[1].request.updated_at_ms = 0;
+        state.records[0].request.updated_at_ms = DEBUG_HISTORY_RETENTION_MS + 50;
+        state.records[2].request.updated_at_ms = DEBUG_HISTORY_RETENTION_MS + 50;
+        state.prune_expired(DEBUG_HISTORY_RETENTION_MS + 10);
+        assert!(state.record_mut("d").is_none());
+        assert_eq!(state.record_mut("a").unwrap().request.response_id, "a");
+        assert_eq!(state.record_mut("e").unwrap().request.response_id, "e");
+        assert_eq!(state.ordinals.len(), 2);
     }
 
     #[test]
@@ -1799,11 +2063,7 @@ mod tests {
 
     #[test]
     fn stale_records_expire_after_retention_window() {
-        let mut state = MonitorState {
-            history_limit: 8,
-            last_sequence: 0,
-            records: VecDeque::new(),
-        };
+        let mut state = MonitorState::new(8);
         state.apply_event(&event_at(1, "old", 0, started("old-model")));
         state.apply_event(&event_at(
             2,
@@ -1977,6 +2237,37 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn configured_preview_budget_charges_allocations_and_preserves_char_metadata() {
+        let hub = MonitorHub::with_payload_preview_budget(8, 16);
+        hub.emit("resp_budget", started("model-a"));
+        let preview = "é".repeat(12);
+        hub.emit(
+            "resp_budget",
+            MonitorEventKind::RequestPayload {
+                payload_preview: preview,
+                payload_truncated: false,
+                payload_original_chars: 12,
+                payload_entry_count: 0,
+                images: Vec::new(),
+            },
+        );
+        let snapshot = hub.snapshot();
+        let event = snapshot
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                DebugWsMessage::EventAppend { event, .. } if event.kind == "request_payload" => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("payload event remains available without its body");
+        assert!(event.payload_preview.is_none());
+        assert!(event.payload_retention_omitted);
+        assert_eq!(event.payload_original_chars, Some(12));
     }
 
     #[test]

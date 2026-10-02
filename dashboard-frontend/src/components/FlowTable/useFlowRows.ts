@@ -6,7 +6,8 @@
  *     (connection.ts finding 10). It seeds rows the store has not seen and stays the source of
  *     server-only fields (terminal_reason, cost roll-up) until a live frame supersedes them.
  *
- * The store wins on conflict (it carries the freshest status/usage). `flowOrder` defines the
+ * The store wins on volatile data except that a terminal status always beats an `open` status,
+ * regardless of which transport delivered it first. `flowOrder` defines the
  * live-row identity, but the MERGED union is sorted GLOBALLY by `started_ms` descending so a
  * newer REST-only row can never sort below an older live row (finding 4) — newest-on-top holds
  * regardless of source. Filtering + the distinct model/upstream option lists are derived here so
@@ -31,6 +32,8 @@ export interface FlowRowsResult {
   upstreams: string[];
   /** Gap 15 — distinct `client_label`s present, for the per-client filter chips. */
   clients: string[];
+  /** Sessions — distinct detected harnesses present, for the harness filter chips. */
+  harnesses: string[];
 }
 
 /** Union the live store rows (authoritative) with REST-only rows, newest-on-top. */
@@ -71,13 +74,16 @@ function mergeRows(
 
 /**
  * Reconciles a live store row with its REST counterpart. The live frame is the FRESHEST source of
- * the volatile flow STATE (`status`, `usage`), so those always win. But a WS-created row (one the
+ * the volatile flow STATE (`usage` and normally `status`). Status is reconciled monotonically:
+ * terminal beats `open`, so a delayed/stale WS frame cannot resurrect a completed REST row and a
+ * stale REST refetch cannot reopen a terminal WS row. But a WS-created row (one the
  * `flow_status` patch minted before the REST list arrived) carries PLACEHOLDERS for the fields the
  * frame cannot author — `method:'POST'`, `uri:''`, and null `finished/elapsed/cost/terminal_reason`
  * — so it kept showing those placeholders even after the authoritative REST row landed (finding 3).
  *
  * Field policy:
- *  - status / usage / started_ms: LIVE wins (the socket owns the live state + stream start).
+ *  - status: terminal beats `open`; if both agree on terminality, LIVE wins.
+ *  - usage / started_ms: LIVE wins (the socket owns the live state + stream start).
  *  - method / uri: REST-authoritative request line — REST wins when present (it never changes over a
  *    flow's life, so this only replaces a WS placeholder; falls back to live if REST omitted it).
  *  - model_requested / model_served / upstream_target / response_id: LIVE wins when present, else
@@ -102,8 +108,10 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
   // figure and its confidence label always agree: if the live frame supplied the cost, use its tag;
   // else adopt the REST roll-up's tag together with the REST cost.
   const liveAuthoredCost = live.cost != null;
+  const status = live.status === 'open' && rest.status !== 'open' ? rest.status : live.status;
   const merged: FlowSummary = {
     ...live,
+    status,
     // REST-authoritative request line: replace a WS placeholder with the real value.
     method: rest.method || live.method,
     uri: rest.uri || live.uri,
@@ -143,6 +151,14 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     // follows `client_label`'s source so the label + its strength tag always agree.
     client_label: live.client_label ?? rest.client_label ?? null,
     client_source: live.client_label != null ? live.client_source : (rest.client_source ?? live.client_source ?? null),
+    // Sessions: the harness/session facts are immutable per flow (computed once at ingress);
+    // live-first / REST-backfilled like the attribution.
+    harness: live.harness ?? rest.harness ?? null,
+    harness_version: live.harness_version ?? rest.harness_version ?? null,
+    session_id: live.session_id ?? rest.session_id ?? null,
+    chain_parent_request_id: live.chain_parent_request_id ?? rest.chain_parent_request_id ?? null,
+    divergence_kind: live.divergence_kind ?? rest.divergence_kind ?? null,
+    cache_bust: live.cache_bust ?? rest.cache_bust ?? null,
   };
   return shallowEqualSummary(live, merged) ? live : merged;
 }
@@ -150,6 +166,7 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
 /** True when every `FlowSummary` field is identical (so the merge can return `live` unchanged). */
 function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
   return (
+    a.status === b.status &&
     a.method === b.method &&
     a.uri === b.uri &&
     (a.response_id ?? null) === (b.response_id ?? null) &&
@@ -181,6 +198,13 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     // CLIENT cell + the "by client" roll-up re-render with the attribution (else it's discarded).
     (a.client_label ?? null) === (b.client_label ?? null) &&
     (a.client_source ?? null) === (b.client_source ?? null) &&
+    // Sessions: part of row identity so a REST backfill that adds them re-renders the row.
+    (a.harness ?? null) === (b.harness ?? null) &&
+    (a.harness_version ?? null) === (b.harness_version ?? null) &&
+    (a.session_id ?? null) === (b.session_id ?? null) &&
+    (a.chain_parent_request_id ?? null) === (b.chain_parent_request_id ?? null) &&
+    (a.divergence_kind ?? null) === (b.divergence_kind ?? null) &&
+    (a.cache_bust ?? null) === (b.cache_bust ?? null) &&
     // `attempts` is compared via `sameAttempts`: EMPTY and ABSENT are the same "no trace" state
     // (a snapshot's `[]` vs the merge's normalized `undefined` must NOT churn a new object), but a
     // backfilled NON-EMPTY list is a new reference ⇒ unequal, so the row re-renders and the
@@ -197,6 +221,12 @@ function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
     // Gap 15: the per-client facet matches the row's `client_label` exactly. An unattributed row
     // (no label) never matches a client filter (it can't be claimed by a client).
     if (f.client && row.client_label !== f.client) return false;
+    // Sessions: exact matches on the detected harness / the linked session node; the cache-bust
+    // facet keeps only rows whose divergence fell inside the predecessor (a `true` flag — a row
+    // without lineage is never claimed as a bust).
+    if (f.harness && row.harness !== f.harness) return false;
+    if (f.session && row.session_id !== f.session) return false;
+    if (f.cacheBust === true && row.cache_bust !== true) return false;
     return true;
   });
 }
@@ -260,6 +290,7 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   // FilterBar can cap to the top-N busiest (high-cardinality defense — review MEDIUM). Unattributed rows
   // have no label ⇒ contribute nothing (an absent attribution is never a filterable client).
   const clients = useMemo(() => clientsByVolume(merged), [merged]);
+  const harnesses = useMemo(() => distinct(merged, (r) => [r.harness]), [merged]);
 
-  return { rows, total: merged.length, models, upstreams, clients };
+  return { rows, total: merged.length, models, upstreams, clients, harnesses };
 }

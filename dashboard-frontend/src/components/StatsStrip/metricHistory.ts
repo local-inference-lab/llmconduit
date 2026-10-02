@@ -2,7 +2,7 @@
  * Per-window metric history — the ring buffers the StatsStrip sparklines read.
  *
  * Each `MetricTick` (and the seed `/metrics`) carries `windows.{m1,m5,h1}`, every one a full
- * `MetricWindow` (the 8 chip metrics). A sparkline for a chosen window+metric is the recent
+ * `MetricWindow` (the 9 chip metrics). A sparkline for a chosen window+metric is the recent
  * history of that `windows[w][metric]` scalar. So we keep, PER window, a capped ring of the last
  * N `MetricWindow` samples; a chip extracts one field into a `number[]` for its Sparkline.
  *
@@ -24,7 +24,8 @@ export type MetricKey =
   | 'p50'
   | 'p95'
   | 'p99'
-  | 'tokens_per_sec'
+  | 'prefill_tokens_per_sec'
+  | 'decode_tokens_per_sec'
   | 'cost_per_min';
 
 /**
@@ -34,12 +35,13 @@ export type MetricKey =
  * a gap, never a fabricated `0`:
  *  - `always`  — not sample-gated (`req/s` idle-`0`, `active_streams` live count).
  *  - `samples` — needs a finalized flow (err%, p50/p95/p99).
- *  - `usage`   — needs a finalized flow that REPORTED usage (`tokens_per_sec`).
+ *  - `prefill` — needs prompt usage plus a measured non-zero prefill phase.
+ *  - `decode`  — needs completion usage plus a measured non-zero decode phase.
  *  - `priced`  — needs a usage-bearing flow on a PRICED model (`cost_per_min`).
  * Lives here (the pure history module) so both the sparkline (`seriesFor`) and the chip
  * value (`deriveChips`) read one source — and so there is no chips↔history import cycle.
  */
-export type Availability = 'always' | 'samples' | 'usage' | 'priced';
+export type Availability = 'always' | 'samples' | 'prefill' | 'decode' | 'priced';
 
 /** Each metric's measurability denominator (gap 01 finding 3). */
 export const METRIC_AVAILABILITY: Record<MetricKey, Availability> = {
@@ -49,7 +51,8 @@ export const METRIC_AVAILABILITY: Record<MetricKey, Availability> = {
   p50: 'samples',
   p95: 'samples',
   p99: 'samples',
-  tokens_per_sec: 'usage',
+  prefill_tokens_per_sec: 'prefill',
+  decode_tokens_per_sec: 'decode',
   cost_per_min: 'priced',
 };
 
@@ -60,8 +63,10 @@ function denominatorFor(window: MetricWindow, availability: Availability): numbe
       return Number.POSITIVE_INFINITY; // never gated
     case 'samples':
       return window.samples;
-    case 'usage':
-      return window.usage_samples;
+    case 'prefill':
+      return window.prefill_samples;
+    case 'decode':
+      return window.decode_samples;
     case 'priced':
       return window.priced_samples;
   }
@@ -118,7 +123,7 @@ export function appendTick(
  * Extract the `metric` field across a window's ring into the Sparkline's `number[]`.
  *
  * Availability-aware (gap 01 finding 2): a sample-derived point that was UNMEASURABLE in
- * its sample (e.g. `tokens_per_sec` when that sample's `usage_samples === 0`, or
+ * its sample (e.g. prefill/decode tok/s when its phase sample count is `0`, or
  * `cost_per_min` when `priced_samples === 0`) is emitted as `NaN` — uPlot renders a GAP
  * there rather than plotting a raw `0`, so an unavailable p50/tok-s/$/min never draws a
  * misleading zero trend. `metricUnavailable` (above) is the same predicate the chip value

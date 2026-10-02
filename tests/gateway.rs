@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
+use axum::http::StatusCode;
 use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
@@ -57,6 +58,7 @@ type CannedResponses =
 
 #[derive(Clone, Default)]
 struct MockUpstream {
+    affinities: Arc<Mutex<Vec<Option<llmconduit::upstream::RequestAffinity>>>>,
     requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
     responses: CannedResponses,
     supported_models: Arc<Mutex<Vec<String>>>,
@@ -137,6 +139,7 @@ impl UpstreamClient for MockUpstream {
         // reasoning_effort_map is exercised against the real leaf in
         // port_config.rs. Tests asserting a RAW pre-leaf `reasoning_effort` rely
         // on non-family models where the leaf is a no-op on that field.
+        self.affinities.lock().await.push(backend.affinity.clone());
         let mut backend = backend.clone();
         let policies = self
             .finalization_policies
@@ -154,8 +157,32 @@ impl UpstreamClient for MockUpstream {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
-        Err(llmconduit::error::AppError::internal("unused in this test"))
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
+        let models = self
+            .supported_models
+            .lock()
+            .await
+            .iter()
+            .map(|id| json!({"id": id}))
+            .collect::<Vec<_>>();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::header::ETAG,
+            axum::http::HeaderValue::from_static("\"upstream-catalog\""),
+        );
+        Ok(llmconduit::upstream::UpstreamModelsResponse {
+            status: axum::http::StatusCode::OK,
+            headers,
+            body: serde_json::to_vec(&json!({"object": "list", "data": models}))
+                .expect("serialize mock model catalog")
+                .into(),
+        })
     }
 
     async fn count_tokens(
@@ -246,7 +273,9 @@ impl UpstreamClient for PendingChunkUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -306,7 +335,9 @@ impl UpstreamClient for ChunkThenPendingUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -370,7 +401,9 @@ impl UpstreamClient for FloodThenParkUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -653,6 +686,7 @@ async fn uses_configured_upstream_model_override() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -686,6 +720,8 @@ async fn uses_configured_upstream_model_override() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -742,6 +778,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -775,6 +812,8 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -1093,6 +1132,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -1129,6 +1169,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -1158,6 +1200,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
         upstream.clone(),
         MockSearch::default(),
         Config {
+            provider_metrics_targets: Vec::new(),
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
@@ -1206,6 +1249,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
+            auth: Default::default(),
+            mesh: llmconduit::config::MeshConfig::default(),
         },
     );
 
@@ -1883,6 +1928,7 @@ fn authed_env() -> llmconduit::dashboard_auth::DashboardEnv {
         public_origin: Some("https://dash.example.com".to_string()),
         allow_insecure: false,
         allow_mutations: false,
+        ..Default::default()
     }
 }
 
@@ -2104,8 +2150,172 @@ async fn dashboard_serves_login_shell_when_unauthed() {
         "login form posts to /dashboard/login"
     );
     assert!(
+        !body.contains("/dashboard/auth/github/start"),
+        "legacy token/user mode must not render the GitHub-only login shell"
+    );
+    assert!(
         !body.contains("\"authenticated\":true"),
         "unauthed shell must not inject an authenticated bootstrap"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_serves_github_login_shell_when_sso_is_configured() {
+    let mut env = authed_env();
+    env.github_client_id = Some("client-id".to_string());
+    env.github_client_secret = Some("client-secret".to_string());
+    env.github_allowed_users = Some("octocat".to_string());
+    env.github_admin_users = Some("octocat".to_string());
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &env);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("/dashboard/auth/github/start"),
+        "GitHub SSO shell links to the OAuth start route"
+    );
+    assert!(
+        !body.contains("id=\"token\"") && !body.contains("id=\"password\""),
+        "GitHub SSO shell must not expose legacy token/password inputs"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_github_start_fails_closed_when_sso_is_not_configured() {
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 503);
+    assert_security_headers(response.headers());
+    assert!(
+        set_cookie_values(response.headers()).is_empty(),
+        "misconfigured OAuth start must not mint an OAuth state cookie"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_github_start_issues_pkce_redirect_and_hardened_state_cookie() {
+    let mut env = authed_env();
+    env.github_client_id = Some("client-id".to_string());
+    env.github_client_secret = Some("client-secret".to_string());
+    env.github_allowed_users = Some("octocat".to_string());
+    env.github_admin_users = Some("octocat".to_string());
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &env);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("GitHub authorization redirect");
+    assert!(location.starts_with("https://github.com/login/oauth/authorize?"));
+    assert!(location.contains("code_challenge_method=S256"));
+    assert!(location.contains("state="));
+    let cookie = set_cookie_values(response.headers())
+        .into_iter()
+        .find(|cookie| cookie.starts_with("llmconduit_github_oauth="))
+        .expect("OAuth state cookie");
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Lax"));
+    assert!(cookie.contains("Secure"));
+    assert!(cookie.contains("Path=/dashboard/auth/github"));
+    assert!(cookie.contains("Max-Age=600"));
+}
+
+#[tokio::test]
+async fn dashboard_github_callback_rejects_missing_state_before_exchange() {
+    let mut env = authed_env();
+    env.github_client_id = Some("client-id".to_string());
+    env.github_client_secret = Some("client-secret".to_string());
+    env.github_allowed_users = Some("octocat".to_string());
+    env.github_admin_users = Some("octocat".to_string());
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &env);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/auth/github/callback?code=unused")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/dashboard?login_error=github_state")
+    );
+}
+
+#[tokio::test]
+async fn dashboard_github_callback_denial_redirects_to_safe_login_error() {
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/auth/github/callback?error=access_denied&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_redirection(),
+        "callback denial should redirect back to the login shell"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/dashboard?login_error=github_cancelled")
+    );
+    assert_security_headers(response.headers());
+    assert!(
+        set_cookie_values(response.headers())
+            .iter()
+            .any(|cookie| cookie.starts_with("llmconduit_github_oauth=")
+                && cookie.contains("Max-Age=0")),
+        "callback denial should clear any stale OAuth state cookie"
     );
 }
 
@@ -2184,6 +2394,7 @@ async fn insecure_override_non_loopback_still_enforces_real_auth() {
         public_origin: Some("http://dash.lan:4000".to_string()),
         allow_insecure: true,
         allow_mutations: false,
+        ..Default::default()
     };
     let bind: std::net::SocketAddr = "0.0.0.0:4000".parse().unwrap();
     // The startup decision registers under the override...
@@ -2237,6 +2448,7 @@ async fn insecure_override_non_loopback_without_token_is_explicitly_dev_open() {
         public_origin: None,
         allow_insecure: true,
         allow_mutations: false,
+        ..Default::default()
     };
     let bind: std::net::SocketAddr = "0.0.0.0:4000".parse().unwrap();
     assert!(
@@ -2627,8 +2839,15 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
 /// upgrade. A fixed masking key is fine — the server accepts any 32-bit key; only
 /// the mask BIT + masked payload matter.
 async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
+    ws_write_masked_frame(stream, 0x1, text.as_bytes()).await;
+}
+
+async fn ws_write_binary_frame(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+    ws_write_masked_frame(stream, 0x2, payload).await;
+}
+
+async fn ws_write_masked_frame(stream: &mut tokio::net::TcpStream, opcode: u8, payload: &[u8]) {
     use tokio::io::AsyncWriteExt;
-    let payload = text.as_bytes();
     let len = payload.len();
     let masking_key = [0x11u8, 0x22, 0x33, 0x44];
     let mut masked = Vec::with_capacity(len);
@@ -2636,8 +2855,8 @@ async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
         masked.push(byte ^ masking_key[i % 4]);
     }
     let mut frame = Vec::new();
-    // FIN=1, opcode=1 (text).
-    frame.push(0x81);
+    // FIN=1 plus caller-selected opcode (1=text, 2=binary).
+    frame.push(0x80 | (opcode & 0x0f));
     // Mask bit set (0x80) + length form.
     if len < 126 {
         frame.push(0x80 | len as u8);
@@ -2661,6 +2880,13 @@ async fn ws_write_text_frame(stream: &mut tokio::net::TcpStream, text: &str) {
 async fn responses_ws_connect(
     router: axum::Router,
 ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+    responses_ws_connect_with_authorization(router, None).await
+}
+
+async fn responses_ws_connect_with_authorization(
+    router: axum::Router,
+    authorization: Option<&str>,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2668,9 +2894,12 @@ async fn responses_ws_connect(
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router.into_make_service()).await;
     });
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
         "GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{authorization}\r\n",
     );
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -2750,6 +2979,69 @@ async fn responses_ws_upgrades_and_streams_response_events() {
     );
 }
 
+#[tokio::test]
+async fn responses_ws_accepts_response_create_envelope() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let (mut stream, server) = responses_ws_connect(app).await;
+
+    let request = base_request(vec![user_message("hello")]);
+    let frame = serde_json::json!({
+        "type": "response.create",
+        "response": request,
+    });
+    ws_write_text_frame(&mut stream, &frame.to_string()).await;
+
+    let mut types = Vec::new();
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut stream).await {
+            Some((0x1, payload)) => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("event frame is JSON");
+                types.push(value["type"].as_str().unwrap_or("").to_string());
+            }
+            Some((0x8, _)) | None => break,
+            Some(_) => {}
+        }
+    }
+    drop(stream);
+    server.abort();
+
+    assert!(
+        types.iter().any(|ty| ty == "response.completed"),
+        "{types:?}"
+    );
+    assert!(!types.iter().any(|ty| ty == "response.failed"), "{types:?}");
+}
+
+#[tokio::test]
+async fn responses_ws_rejects_zstd_binary_frame_when_decoded_body_exceeds_limit() {
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(MockUpstream::default(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let (mut stream, server) = responses_ws_connect(app).await;
+
+    let compressed = zstd::encode_all(&vec![b'a'; 4096][..], 3).expect("zstd encode");
+    ws_write_binary_frame(&mut stream, &compressed).await;
+
+    let (opcode, payload) = ws_read_frame(&mut stream).await;
+    drop(stream);
+    server.abort();
+
+    assert_eq!(opcode, 0x1, "expected response.failed text frame");
+    let value: serde_json::Value = serde_json::from_slice(&payload).expect("WS error is JSON");
+    assert_eq!(value["type"], "response.failed");
+    assert_eq!(
+        value["response"]["error"]["code"],
+        serde_json::json!("payload_too_large")
+    );
+}
+
 /// A plain GET `/v1/responses` (no `Upgrade: websocket` header) returns 426
 /// Upgrade Required (codex's WS attempt always sends the upgrade header, so it
 /// takes the 101 branch; this guards the fallback the `Result<WebSocketUpgrade,
@@ -2817,6 +3109,67 @@ async fn responses_post_decodes_zstd_content_encoding() {
             .any(|m| m.content.as_ref().and_then(|v| v.as_str()) == Some("hello")),
         "the decoded user message reached the upstream"
     );
+}
+
+#[tokio::test]
+async fn responses_post_decodes_zstd_under_small_body_limit() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let request = base_request(vec![user_message("hello")]);
+    let json = serde_json::to_string(&request).expect("serialize request");
+    let zstd_body = zstd::encode_all(json.as_bytes(), 3).expect("zstd encode");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("content-encoding", "zstd")
+                .body(Body::from(zstd_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "valid small zstd frames must not be rejected by the zstd window cap"
+    );
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn compressed_request_returns_413_when_decoded_body_exceeds_limit_before_auth_routes() {
+    let mut config = test_config();
+    config.max_request_body_bytes = 1024;
+    let gateway = test_gateway_with_config(MockUpstream::default(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let zstd_body = zstd::encode_all(&vec![b'a'; 4096][..], 3).expect("zstd encode");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/not-a-real-route")
+                .header("content-encoding", "zstd")
+                .body(Body::from(zstd_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 /// An unsupported `Content-Encoding` surfaces 415 (not a misleading 400 JSON
@@ -3033,6 +3386,42 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
 }
 
 #[tokio::test]
+async fn mesh_only_models_endpoint_does_not_poll_legacy_primary() {
+    let temp = std::env::temp_dir().join(format!(
+        "llmconduit-mesh-models-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&temp).expect("create tempdir");
+    let mut config = test_config();
+    config.upstream_base_url = "http://127.0.0.1:9/v1".parse().expect("url");
+    config.mesh.controller.enabled = true;
+    config.mesh.controller.bind_addr = "127.0.0.1:0".parse().expect("socket addr");
+    config.mesh.controller.identity_path = Some(temp.join("controller.key"));
+    config.mesh.controller.state_path = Some(temp.join("mesh.db"));
+
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("json body"),
+        json!({"object": "list", "data": []})
+    );
+    std::fs::remove_dir_all(temp).expect("remove tempdir");
+}
+
+#[tokio::test]
 async fn fallback_models_endpoint_without_provider_model_override_passes_list_through() {
     let primary = MockServer::start().await;
     let fallback = MockServer::start().await;
@@ -3113,6 +3502,7 @@ async fn proxies_models_endpoint_with_etag() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3146,6 +3536,8 @@ async fn proxies_models_endpoint_with_etag() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3191,6 +3583,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
@@ -3224,6 +3617,8 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3275,6 +3670,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3308,6 +3704,8 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3362,6 +3760,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3395,6 +3794,8 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3454,6 +3855,7 @@ async fn proxies_completions_endpoint_passthrough() {
         .await;
 
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
@@ -3487,6 +3889,8 @@ async fn proxies_completions_endpoint_passthrough() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -4185,6 +4589,8 @@ async fn response_completed_includes_usage_from_upstream() {
                     prompt_tokens: 100,
                     completion_tokens: 25,
                     total_tokens: 125,
+                    cost: None,
+                    cost_details: None,
                     reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
@@ -4459,6 +4865,8 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
                     prompt_tokens: 200,
                     completion_tokens: 30,
                     total_tokens: 230,
+                    cost: None,
+                    cost_details: None,
                     reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
@@ -4477,6 +4885,8 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
                     prompt_tokens: 350,
                     completion_tokens: 20,
                     total_tokens: 370,
+                    cost: None,
+                    cost_details: None,
                     reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
@@ -4593,26 +5003,28 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
     assert_eq!(requests.len(), 1);
     let messages = &requests[0].messages;
 
-    // M4: assistant with content does NOT merge with tool call — separate messages
-    let content_msg = messages
+    // Text and tool calls emitted in one Responses turn must remain one Chat
+    // assistant message. Splitting them creates consecutive assistant roles and
+    // changes the prompt seen by chat-template backends.
+    let assistant = messages
         .iter()
         .find(|m| m.role == "assistant" && m.content.is_some())
-        .expect("assistant message with content");
+        .expect("combined assistant message");
     assert_eq!(
-        content_msg.content,
+        assistant.content,
         Some(serde_json::Value::String(
             "I'll search the codebase.".to_string()
         ))
     );
-    assert!(content_msg.reasoning_content.is_some());
-    assert!(content_msg.tool_calls.is_none());
-
-    let tool_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
-        .expect("assistant message with tool_calls");
-    assert!(tool_msg.content.is_none());
-    assert_eq!(tool_msg.tool_calls.as_ref().unwrap().len(), 1);
+    assert!(assistant.reasoning_content.is_some());
+    assert_eq!(assistant.tool_calls.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -5769,6 +6181,7 @@ fn d13_env(allow_mutations: bool) -> llmconduit::dashboard_auth::DashboardEnv {
         public_origin: Some("https://dash.example.com".to_string()),
         allow_insecure: false,
         allow_mutations,
+        ..Default::default()
     }
 }
 
@@ -5915,7 +6328,20 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/metrics",
         "/dashboard/api/topology",
         "/dashboard/api/catalog",
+        "/dashboard/api/chat",
         "/dashboard/api/snapshot",
+        "/dashboard/api/history/requests",
+        "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/requests/api_x/body",
+        "/dashboard/api/history/sessions",
+        "/dashboard/api/history/sessions/s_x",
+        "/dashboard/api/history/throughput",
+        "/dashboard/api/history/activity",
+        "/dashboard/api/me",
+        "/dashboard/api/users",
+        "/dashboard/api/keys",
+        "/dashboard/api/history/usage",
+        "/dashboard/api/history/metrics",
     ] {
         let response = app
             .clone()
@@ -5972,6 +6398,23 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
         );
         d13_assert_no_store(&response);
     }
+    // The read-only durable-history routes register under the same gate, but
+    // explicitly report that this legacy builder attached no SQL store.
+    for uri in [
+        "/dashboard/api/history/requests",
+        "/dashboard/api/history/requests/api_x",
+        "/dashboard/api/history/requests/api_x/body",
+        "/dashboard/api/history/sessions",
+        "/dashboard/api/history/sessions/s_x",
+        "/dashboard/api/history/throughput",
+        "/dashboard/api/history/activity",
+        "/dashboard/api/history/usage",
+        "/dashboard/api/history/metrics",
+    ] {
+        let response = d13_get(&app, uri).await;
+        assert_eq!(response.status().as_u16(), 503, "{uri} store disabled");
+        d13_assert_no_store(&response);
+    }
 }
 
 #[tokio::test]
@@ -6006,6 +6449,882 @@ async fn d13_api_requires_session_when_token_configured() {
     let authed = d13_authed_get(&app, &auth, "/dashboard/api/metrics").await;
     assert_eq!(authed.status().as_u16(), 200);
     d13_assert_no_store(&authed);
+
+    // Session authentication runs before the history handler's disabled-store
+    // response, so the endpoint cannot reveal even availability to anonymous
+    // callers.
+    let history_unauthed = d13_get(&app, "/dashboard/api/history/requests").await;
+    assert_eq!(history_unauthed.status().as_u16(), 401);
+    d13_assert_no_store(&history_unauthed);
+    let history_authed = d13_authed_get(&app, &auth, "/dashboard/api/history/requests").await;
+    assert_eq!(history_authed.status().as_u16(), 503);
+    d13_assert_no_store(&history_authed);
+}
+
+#[tokio::test]
+async fn persistent_history_body_route_reassembles_full_bodies_per_hop() {
+    use llmconduit::content_store::{PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, split_value};
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestRow, SqlStore};
+    use llmconduit::flow_persistence::{PayloadSection, body_write};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "body-call".to_string(),
+            response_id: None,
+            conversation_id: None,
+            virtual_key_id: None,
+            client_protocol: PROTOCOL_RESPONSES.to_string(),
+            client_model: "public-model".to_string(),
+            alias: None,
+            backend: None,
+            resolved_model: None,
+            status: "running".to_string(),
+            created_at_ms: 1,
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .expect("persist request");
+    let inbound = serde_json::json!({
+        "model": "public-model",
+        "instructions": "be brief",
+        "tools": [{"type": "function", "name": "read_file", "parameters": {"$ref": "#/defs/x"}}],
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "message", "role": "user", "content": "hi"}
+        ],
+        "api_key": "sk-never"
+    });
+    let split = split_value(PROTOCOL_RESPONSES, inbound.clone(), true).unwrap();
+    PersistenceWriter::store_body(
+        store.as_ref(),
+        body_write(
+            "body-call",
+            PayloadSection::InboundRequest,
+            5,
+            100,
+            split,
+            false,
+            None,
+        ),
+    )
+    .await
+    .expect("store inbound body");
+    let upstream = serde_json::json!({
+        "model": "served-model",
+        "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    });
+    let split = split_value(PROTOCOL_CHAT_COMPLETIONS, upstream.clone(), true).unwrap();
+    PersistenceWriter::store_body(
+        store.as_ref(),
+        body_write(
+            "body-call",
+            PayloadSection::UpstreamRequest,
+            6,
+            100,
+            split,
+            false,
+            None,
+        ),
+    )
+    .await
+    .expect("store upstream body");
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    // Default hop is the inbound body; secrets are redacted, everything else is whole.
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body",
+    )
+    .await;
+    let status = response.status();
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+    let mut expected = inbound.clone();
+    expected["api_key"] = serde_json::json!("[redacted]");
+    assert_eq!(body, expected);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body?hop=upstream_out",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(d13_json(response).await, upstream);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/requests/body-call/body?hop=nope",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let response =
+        d13_authed_get(&app, &auth, "/dashboard/api/history/requests/missing/body").await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // The event list still shows the skeleton, with the item count in its envelope.
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/requests/body-call").await;
+    let detail = d13_json(response).await;
+    let envelope: serde_json::Value =
+        serde_json::from_str(detail["events"][0]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope["items"], 4);
+    assert!(
+        envelope["content"]
+            .as_str()
+            .unwrap()
+            .contains("$llmconduit_blob")
+    );
+}
+
+#[tokio::test]
+async fn persistent_history_throughput_route_buckets_requests_and_validates_input() {
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestFinish, RequestRow, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "tp-1".to_string(),
+            client_protocol: "responses".to_string(),
+            client_model: "public-model".to_string(),
+            status: "running".to_string(),
+            created_at_ms: 1_000,
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .unwrap();
+    PersistenceWriter::finish_request(
+        store.as_ref(),
+        "tp-1",
+        RequestFinish {
+            status: "completed".to_string(),
+            completed_at_ms: 3_000,
+            first_token_at_ms: Some(1_500),
+            input_tokens: Some(900),
+            output_tokens: Some(150),
+            cached_tokens: Some(600),
+            backend: Some("vllm-a".to_string()),
+            resolved_model: Some("served-model".to_string()),
+            ..RequestFinish::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/throughput?since_ms=0&bucket_secs=60",
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(body["bucket_ms"], 60_000);
+    assert_eq!(body["truncated"], false);
+    let bucket = &body["buckets"][0];
+    assert_eq!(bucket["bucket_ms"], 0);
+    assert_eq!(bucket["model"], "served-model");
+    assert_eq!(bucket["backend"], "vllm-a");
+    assert_eq!(bucket["requests"], 1);
+    assert_eq!(bucket["completed"], 1);
+    assert_eq!(bucket["input_tokens"], 900);
+    assert_eq!(bucket["cached_tokens"], 600);
+    assert_eq!(bucket["ttft_ms_sum"], 500);
+    assert_eq!(bucket["prefill_tokens"], 900);
+    assert_eq!(bucket["decode_ms_sum"], 1_500);
+    assert_eq!(bucket["decode_tokens"], 150);
+
+    for bad in [
+        "/dashboard/api/history/throughput?bucket_secs=0",
+        "/dashboard/api/history/throughput?bucket_secs=100000",
+        "/dashboard/api/history/throughput?since_ms=-5",
+    ] {
+        let response = d13_authed_get(&app, &auth, bad).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+}
+
+/// Cookie pair from a login response: (session cookie value, csrf cookie value).
+fn login_cookies(headers: &axum::http::HeaderMap) -> (String, String) {
+    let cookies = set_cookie_values(headers);
+    let value = |name: &str| {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(name))
+            .map(|c| {
+                c.split(';')
+                    .next()
+                    .unwrap()
+                    .split_once('=')
+                    .unwrap()
+                    .1
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("{name} cookie set"))
+    };
+    (value("llmconduit_session="), value("llmconduit_csrf="))
+}
+
+async fn accounts_request(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    session: &str,
+    csrf: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri).header(
+        axum::http::header::COOKIE,
+        match csrf {
+            Some(csrf) => format!("llmconduit_session={session}; llmconduit_csrf={csrf}"),
+            None => format!("llmconduit_session={session}"),
+        },
+    );
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    let body = match body {
+        Some(json) => {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn dashboard_rejects_unknown_body_fields_and_query_params() {
+    // The dashboard surface is strict: an unknown JSON field or query parameter
+    // is a 400 that names the field, never silently ignored (a misspelled
+    // filter must not quietly return the unfiltered result).
+    use llmconduit::control_plane_store::{PersistenceStore, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("store"),
+    );
+    let admin_hash = llmconduit::accounts::hash_password("admin-password-1").unwrap();
+    let admin = PersistenceStore::create_user(store.as_ref(), "admin", &admin_hash, true, "test")
+        .await
+        .unwrap();
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store.clone());
+    gateway.set_users_configured(true);
+    let app = d13_router(Arc::new(gateway));
+
+    async fn error_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+    async fn login(app: &axum::Router, body: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dashboard/login")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // Login body with a stray field: 400 naming it, not a 401 "invalid credentials".
+    let response = login(
+        &app,
+        r#"{"username":"admin","password":"admin-password-1","extra":true}"#,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let text = error_text(response).await;
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `extra`"),
+        "{text}"
+    );
+
+    let response = login(
+        &app,
+        r#"{"username":"admin","password":"admin-password-1"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let (session, csrf) = login_cookies(response.headers());
+
+    // JSON bodies on the accounts API.
+    for (method, uri, body, field) in [
+        (
+            "POST",
+            "/dashboard/api/keys".to_string(),
+            json!({"label": "k", "labell": "typo"}),
+            "labell",
+        ),
+        (
+            "POST",
+            "/dashboard/api/users".to_string(),
+            json!({"username": "u2", "password": "password-2", "is_admin": false, "role": "x"}),
+            "role",
+        ),
+        (
+            "PATCH",
+            format!("/dashboard/api/users/{}", admin.id),
+            json!({"is_admin": true, "admin": true}),
+            "admin",
+        ),
+    ] {
+        let response =
+            accounts_request(&app, method, &uri, &session, Some(&csrf), Some(body)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{method} {uri}"
+        );
+        let text = error_text(response).await;
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("unknown field `{field}`")),
+            "{method} {uri}: {text}"
+        );
+    }
+
+    // Query strings across the dashboard, history and accounts routes.
+    for (uri, field) in [
+        ("/dashboard/api/keys?user=all", "user"),
+        ("/dashboard/api/flows?state=open", "state"),
+        ("/dashboard/api/snapshot?at_ms=1", "at_ms"),
+        ("/dashboard/api/history/requests?since=1", "since"),
+        ("/dashboard/api/history/throughput?bucket=60", "bucket"),
+        ("/dashboard/api/history/sessions?root=true", "root"),
+    ] {
+        let response = accounts_request(&app, "GET", uri, &session, None, None).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+        let text = error_text(response).await;
+        assert!(
+            text.contains(&format!("unknown field `{field}`")),
+            "{uri}: {text}"
+        );
+    }
+
+    // The known spellings still work.
+    let response = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/keys?user_id=all",
+        &session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let response = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/flows?limit=5",
+        &session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn accounts_password_login_keys_live_reload_and_role_gating() {
+    use llmconduit::control_plane_store::{PersistenceStore, SqlStore};
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("store"),
+    );
+    let admin_hash = llmconduit::accounts::hash_password("admin-password-1").unwrap();
+    let admin = PersistenceStore::create_user(store.as_ref(), "admin", &admin_hash, true, "test")
+        .await
+        .unwrap();
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store.clone());
+    gateway.set_users_configured(true);
+    let app = d13_router(Arc::new(gateway));
+
+    // With users configured (and a real token, non-loopback) the shared token no longer logs in.
+    let token_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"d13-token"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(token_login.status().as_u16(), 401);
+
+    // Wrong password → 401; right password → session with the embedded user.
+    let bad = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"username":"admin","password":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 401);
+    let ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"admin-password-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    let (session, csrf) = login_cookies(ok.headers());
+
+    let me = accounts_request(&app, "GET", "/dashboard/api/me", &session, None, None).await;
+    assert_eq!(me.status().as_u16(), 200);
+    let me = d13_json(me).await;
+    assert_eq!(me["user"]["username"], "admin");
+    assert_eq!(me["is_admin"], true);
+    assert_eq!(me["auth_mode"], "users");
+    assert_eq!(me["accounts_enabled"], true);
+
+    // Before any key exists the /v1 routes are open.
+    let models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // (The mock upstream's model listing itself answers 500; only the auth gate says 401.)
+    assert_ne!(models.status().as_u16(), 401, "no keys yet: /v1 is open");
+
+    // Creating a key needs CSRF; with it the plaintext is returned once and the
+    // live registry now enforces keys on /v1 without a restart.
+    let denied = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/keys",
+        &session,
+        None,
+        Some(serde_json::json!({"label": "laptop"})),
+    )
+    .await;
+    assert_eq!(denied.status().as_u16(), 403);
+    let created = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/keys",
+        &session,
+        Some(&csrf),
+        Some(serde_json::json!({"label": "laptop", "allowed_models": ["glm-5.1"]})),
+    )
+    .await;
+    assert_eq!(created.status().as_u16(), 201);
+    let created = d13_json(created).await;
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("llmc_"));
+    let key_id = created["key"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["key"]["user_id"], admin.id);
+    assert_eq!(created["key"]["allowed_models"][0], "glm-5.1");
+    assert_eq!(created["registered_keys"], 1);
+
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401, "keys now enforced");
+    let with_key = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(with_key.status().as_u16(), 401, "new key accepted live");
+
+    // Listing shows the key without any secret material.
+    let keys = accounts_request(&app, "GET", "/dashboard/api/keys", &session, None, None).await;
+    let keys = d13_json(keys).await;
+    assert_eq!(keys["keys"].as_array().unwrap().len(), 1);
+    assert!(!keys.to_string().contains(&secret));
+
+    // Admin creates a non-admin user; that user sees only their own keys and cannot manage users.
+    let created_user = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/users",
+        &session,
+        Some(&csrf),
+        Some(
+            serde_json::json!({"username": "dev", "password": "dev-password-1", "is_admin": false}),
+        ),
+    )
+    .await;
+    assert_eq!(created_user.status().as_u16(), 201);
+    let dev_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"dev","password":"dev-password-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dev_login.status().as_u16(), 200);
+    let (dev_session, dev_csrf) = login_cookies(dev_login.headers());
+    let forbidden = accounts_request(
+        &app,
+        "GET",
+        "/dashboard/api/users",
+        &dev_session,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(forbidden.status().as_u16(), 403);
+    let dev_keys =
+        accounts_request(&app, "GET", "/dashboard/api/keys", &dev_session, None, None).await;
+    assert_eq!(
+        d13_json(dev_keys).await["keys"].as_array().unwrap().len(),
+        0
+    );
+    let not_yours = accounts_request(
+        &app,
+        "DELETE",
+        &format!("/dashboard/api/keys/{key_id}"),
+        &dev_session,
+        Some(&dev_csrf),
+        None,
+    )
+    .await;
+    assert_eq!(not_yours.status().as_u16(), 403);
+
+    // The admin revokes the key: it stops working immediately and /v1 stays enforced
+    // by the (now empty) SQL set only if YAML keys exist — here none, so it reopens.
+    let revoked = accounts_request(
+        &app,
+        "DELETE",
+        &format!("/dashboard/api/keys/{key_id}"),
+        &session,
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status().as_u16(), 200);
+    let after = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // No keys left ⇒ the registry is open again (require:false); the revoked key is not "wrong",
+    // there is simply nothing to check. The point is it no longer identifies anyone.
+    assert_ne!(after.status().as_u16(), 401);
+    let listed = d13_json(
+        accounts_request(
+            &app,
+            "GET",
+            "/dashboard/api/keys?user_id=all",
+            &session,
+            None,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn persistent_history_session_routes_list_tree_and_requests() {
+    use llmconduit::control_plane_store::{PersistenceWriter, RequestRow, SqlStore};
+    use llmconduit::sessions::SessionRow;
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    let node = |id: &str, parent: Option<&str>, seen: i64| SessionRow {
+        id: id.to_string(),
+        parent_id: parent.map(str::to_string),
+        kind: "declared".to_string(),
+        harness: "claude-code".to_string(),
+        harness_version: Some("2.1.0".to_string()),
+        external_id: Some(format!("ext-{id}")),
+        session_kind: None,
+        client_label: Some("key-abc".to_string()),
+        virtual_key_id: None,
+        user_id: None,
+        depth: i64::from(parent.is_some()),
+        root_request_id: None,
+        spawned_by_request_id: None,
+        first_seen_ms: seen,
+        last_seen_ms: seen,
+        request_count: 1,
+    };
+    PersistenceWriter::upsert_session(store.as_ref(), node("root", None, 1_000))
+        .await
+        .unwrap();
+    PersistenceWriter::upsert_session(store.as_ref(), node("child", Some("root"), 2_000))
+        .await
+        .unwrap();
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "req-in-child".to_string(),
+            client_protocol: "anthropic_messages".to_string(),
+            client_model: "m".to_string(),
+            status: "running".to_string(),
+            created_at_ms: 2_000,
+            session_id: Some("child".to_string()),
+            divergence_kind: Some("new_chain".to_string()),
+            cache_bust: Some(false),
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions?since_ms=0").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(
+        body["sessions"].as_array().unwrap().len(),
+        1,
+        "roots only by default"
+    );
+    assert_eq!(body["sessions"][0]["id"], "root");
+    assert_eq!(body["truncated"], false);
+
+    let response = d13_authed_get(
+        &app,
+        &auth,
+        "/dashboard/api/history/sessions?since_ms=0&roots=false",
+    )
+    .await;
+    let body = d13_json(response).await;
+    assert_eq!(body["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(body["sessions"][0]["id"], "child", "most recent first");
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/child").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = d13_json(response).await;
+    assert_eq!(body["session"]["id"], "child");
+    assert_eq!(body["session"]["parent_id"], "root");
+    assert_eq!(body["ancestors"][0]["id"], "root");
+    assert_eq!(body["children"].as_array().unwrap().len(), 0);
+    assert_eq!(body["requests"][0]["id"], "req-in-child");
+    assert_eq!(body["requests"][0]["divergence_kind"], "new_chain");
+    assert_eq!(body["requests"][0]["cache_bust"], false);
+    assert_eq!(body["requests_truncated"], false);
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/root").await;
+    let body = d13_json(response).await;
+    assert_eq!(body["children"][0]["id"], "child");
+    assert!(body["ancestors"].as_array().unwrap().is_empty());
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions/nope").await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/sessions?since_ms=-1").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn persistent_history_route_reads_sql_without_exposing_key_material() {
+    use llmconduit::control_plane_store::{
+        PersistenceStore, PersistenceWriter, RequestRow, SqlStore,
+    };
+
+    let store = Arc::new(
+        SqlStore::connect_sqlite("sqlite::memory:")
+            .await
+            .expect("history store"),
+    );
+    PersistenceWriter::begin_request(
+        store.as_ref(),
+        RequestRow {
+            id: "history-call".to_string(),
+            response_id: None,
+            conversation_id: Some("conversation".to_string()),
+            virtual_key_id: Some("key-id".to_string()),
+            client_protocol: "responses".to_string(),
+            client_model: "public-model".to_string(),
+            alias: Some("public-model".to_string()),
+            backend: None,
+            resolved_model: None,
+            status: "running".to_string(),
+            created_at_ms: 1,
+            ..RequestRow::default()
+        },
+    )
+    .await
+    .expect("persist request");
+    PersistenceStore::put_api_key(
+        store.as_ref(),
+        "key-id",
+        "sk-never-return-this",
+        Some("test"),
+        None,
+        &[],
+        "test",
+    )
+    .await
+    .expect("persist key hash");
+
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .expect("sole gateway reference")
+        .with_persistence_store(store);
+    let app = d13_router(Arc::new(gateway));
+
+    let response = d13_authed_get(&app, &auth, "/dashboard/api/history/requests?limit=10").await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    d13_assert_no_store(&response);
+    let body = d13_json(response).await;
+    assert_eq!(body["requests"][0]["id"], "history-call");
+    let encoded = body.to_string();
+    assert!(!encoded.contains("sk-never-return-this"));
+    assert!(!encoded.contains("sha256:"));
 }
 
 #[tokio::test]
@@ -6027,6 +7346,7 @@ async fn d13_extractor_rejection_carries_no_store_and_security_headers() {
     for uri in [
         "/dashboard/api/snapshot?at=not-a-number",
         "/dashboard/api/flows?page=not-a-number",
+        "/dashboard/api/history/requests?limit=not-a-number",
     ] {
         let response = app
             .clone()
@@ -6180,6 +7500,211 @@ async fn d13_catalog_is_a_bare_array_no_cursor() {
         serde_json::json!(0),
         "don't-lie-with-zeros: a missing window must NOT collapse to 0"
     );
+}
+
+#[tokio::test]
+async fn dashboard_chat_requires_session_and_csrf_but_not_the_admin_mutation_gate() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-dashboard", "gateway ready")),
+            Ok(length_finish_chunk("chat-dashboard")),
+        ])
+        .await;
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-dashboard-admin", "admin ready")),
+            Ok(length_finish_chunk("chat-dashboard-admin")),
+        ])
+        .await;
+    upstream.set_supported_models(["model-a", "model-b"]).await;
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let client_auth = llmconduit::client_auth::ClientAuth::from_specs(
+        true,
+        [llmconduit::client_auth::VirtualKeySpec {
+            id: "operator-key".to_string(),
+            label: Some("operator".to_string()),
+            owner_id: Some("user-operator".to_string()),
+            secret_hash: llmconduit::client_auth::hash_secret("operator-secret"),
+            allowed_models: vec!["model-a".to_string()],
+        }],
+    )
+    .expect("client auth");
+    let gateway = Arc::try_unwrap(d13_gateway(Arc::new(upstream), Arc::clone(&auth)))
+        .ok()
+        .expect("sole gateway reference")
+        .with_client_auth(client_auth);
+    let app = d13_router(Arc::new(gateway));
+    let request_body = serde_json::to_vec(&json!({
+        "model": "model-a",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    }))
+    .unwrap();
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/chat")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status().as_u16(), 401);
+    d13_assert_no_store(&unauthenticated);
+
+    let (session, _) = auth.issue_session();
+    let missing_csrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/chat")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status().as_u16(), 403);
+
+    let missing_csrf_patch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dashboard/api/configured-providers/cfg_missing")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"auto_discover":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf_patch.status().as_u16(), 403);
+    d13_assert_no_store(&missing_csrf);
+
+    let csrf = auth.issue_csrf_token();
+    let (non_admin_session, _) = auth.issue_session_for(&llmconduit::accounts::SessionUser {
+        id: "user-operator".to_string(),
+        username: "operator".to_string(),
+        is_admin: false,
+    });
+    let scoped_catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/catalog")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={non_admin_session}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped_catalog.status().as_u16(), 200);
+    assert_eq!(
+        d13_json(scoped_catalog).await,
+        json!([{"id": "model-a"}]),
+        "the dropdown catalog only exposes models available to the account"
+    );
+    let non_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/chat")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={non_admin_session}; llmconduit_csrf={csrf}"),
+                )
+                .header(llmconduit::dashboard_auth::CSRF_HEADER, &csrf)
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_admin.status().as_u16(), 200);
+    d13_assert_no_store(&non_admin);
+    let body = axum::body::to_bytes(non_admin.into_body(), 1024 * 1024)
+        .await
+        .expect("read account-scoped chat stream");
+    assert!(
+        String::from_utf8_lossy(&body).contains("gateway ready"),
+        "an account may chat with a model granted by one of its keys"
+    );
+
+    let forbidden_body = serde_json::to_vec(&json!({
+        "model": "model-b",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": true
+    }))
+    .unwrap();
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/chat")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={non_admin_session}; llmconduit_csrf={csrf}"),
+                )
+                .header(llmconduit::dashboard_auth::CSRF_HEADER, &csrf)
+                .body(Body::from(forbidden_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status().as_u16(), 403);
+    d13_assert_no_store(&forbidden);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/chat")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}; llmconduit_csrf={csrf}"),
+                )
+                .header(llmconduit::dashboard_auth::CSRF_HEADER, &csrf)
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    d13_assert_no_store(&response);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read chat stream");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    assert!(text.contains("admin ready"), "{text}");
+    assert!(text.contains("\"finish_reason\":\"length\""), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
 }
 
 #[test]
@@ -7195,6 +8720,1278 @@ fn login_token_is_never_logged() {
     );
 }
 
+static AUTH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+fn scoped_authz(
+    endpoints: &[&str],
+    models: &[&str],
+) -> (llmconduit::authz::AuthzService, String, std::path::PathBuf) {
+    let (service, key, path, _) = scoped_authz_with_bootstrap(endpoints, models);
+    (service, key, path)
+}
+
+fn scoped_authz_with_bootstrap(
+    endpoints: &[&str],
+    models: &[&str],
+) -> (
+    llmconduit::authz::AuthzService,
+    String,
+    std::path::PathBuf,
+    String,
+) {
+    let _guard = AUTH_ENV_LOCK.lock().expect("auth env lock");
+    let path = std::env::temp_dir().join(format!(
+        "llmconduit-http-auth-test-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+    let old_pepper = std::env::var_os("LLMCONDUIT_AUTH_PEPPER");
+    let old_bootstrap = std::env::var_os("LLMCONDUIT_AUTH_BOOTSTRAP_KEY");
+    // SAFETY: this integration-test binary serializes mutation of these two
+    // process-local variables, restores both before releasing the lock, and no
+    // production code mutates the environment.
+    unsafe {
+        std::env::set_var("LLMCONDUIT_AUTH_PEPPER", "http-test-pepper-never-log");
+        std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", &bootstrap);
+    }
+    let service = llmconduit::authz::AuthzService::from_config(&llmconduit::config::AuthConfig {
+        mode: llmconduit::config::AuthMode::Enforce,
+        store_path: path.clone(),
+    })
+    .expect("create enforced auth service");
+    // SAFETY: see the serialized environment mutation above.
+    unsafe {
+        match old_pepper {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_PEPPER", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_PEPPER"),
+        }
+        match old_bootstrap {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY"),
+        }
+    }
+    let created = service
+        .create_key(
+            "HTTP integration test",
+            "scoped key",
+            &endpoints
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            &models
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("create scoped key");
+    (
+        service,
+        created.raw_key.expect("raw key returned exactly once"),
+        path,
+        bootstrap,
+    )
+}
+
+async fn delegated_dashboard_cookie(
+    service: &llmconduit::authz::AuthzService,
+    dashboard_auth: &llmconduit::dashboard_auth::DashboardAuth,
+    bootstrap: &str,
+) -> (String, String) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {bootstrap}")).unwrap(),
+    );
+    let context = service
+        .authenticate(&headers)
+        .expect("authz backend available")
+        .expect("bootstrap context");
+    let csrf = dashboard_auth.issue_csrf_token();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(csrf.as_bytes());
+    let actor = service
+        .create_delegated_session(
+            &context,
+            digest.as_slice(),
+            chrono::Utc::now().timestamp() + 300,
+        )
+        .await
+        .expect("delegated dashboard session");
+    let session_id = match actor {
+        llmconduit::dashboard_access::ManagementActor::Delegated { session_id, .. } => session_id,
+        llmconduit::dashboard_access::ManagementActor::Bootstrap => {
+            panic!("delegated session returned bootstrap actor")
+        }
+    };
+    (
+        dashboard_auth
+            .issue_delegated_session(&session_id, chrono::Utc::now().timestamp() as u64 + 300),
+        csrf,
+    )
+}
+
+fn remove_auth_store(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
+async fn await_single_auth_usage(store_path: &std::path::Path) -> (String, Option<i64>, i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT status, total_tokens, (SELECT COUNT(*) FROM auth_usage_events)
+                 FROM auth_usage_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal auth usage persisted in bounded time")
+}
+
+#[tokio::test]
+async fn dashboard_access_routes_are_live_permissioned_and_csrf_gated() {
+    let (authz, delegated_key, store_path) = scoped_authz(&["*"], &["*"]);
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status().as_u16(), 401);
+    assert_eq!(
+        unauthenticated
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let (session, _) = dashboard_auth.issue_session();
+    let csrf = dashboard_auth.issue_csrf_token();
+    let summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/summary")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status().as_u16(), 200);
+    let summary_body = d13_json(summary).await;
+    assert_eq!(summary_body["actor"]["kind"], "bootstrap");
+    assert!(summary_body["counts"]["api_keys"].as_u64().unwrap() >= 2);
+
+    let delegated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/auth/api-keys")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {delegated_key}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delegated.status().as_u16(), 403);
+
+    let missing_csrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/auth/api-keys/key_bootstrap/revoke")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status().as_u16(), 403);
+
+    let invalid_patch_body = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dashboard/api/configured-providers/cfg_missing")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={session}; llmconduit_csrf={csrf}"),
+                )
+                .header("x-csrf-token", &csrf)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"auto_discover":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_patch_body.status().as_u16(), 400);
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn delegated_dashboard_sessions_cannot_enter_legacy_dashboard_apis() {
+    let (authz, _delegated_key, store_path, bootstrap) =
+        scoped_authz_with_bootstrap(&["*"], &["*"]);
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let (session, csrf) = delegated_dashboard_cookie(&authz, &dashboard_auth, &bootstrap).await;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+    let cookie = format!("llmconduit_session={session}; llmconduit_csrf={csrf}");
+
+    let catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/catalog")
+                .header(axum::http::header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.status().as_u16(), 200);
+
+    for (method, uri, body) in [
+        ("GET", "/dashboard/api/me", Body::empty()),
+        ("GET", "/dashboard/api/flows", Body::empty()),
+        ("GET", "/dashboard/api/users", Body::empty()),
+        ("GET", "/dashboard/api/providers", Body::empty()),
+        ("GET", "/dashboard/api/configured-providers", Body::empty()),
+        (
+            "POST",
+            "/dashboard/api/configured-providers",
+            Body::from(r#"{"name":"x","base_url":"http://127.0.0.1:9999","api_key":"k"}"#),
+        ),
+        (
+            "PATCH",
+            "/dashboard/api/configured-providers/cfg_missing",
+            Body::from(r#"{"auto_discover":false}"#),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            403,
+            "{method} {uri} rejected delegated legacy access"
+        );
+    }
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn delegated_dashboard_session_is_not_legacy_accounts_admin() {
+    let store_path = std::env::temp_dir().join(format!(
+        "llmconduit-delegated-accounts-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let bootstrap = format!("llmc_{}", uuid::Uuid::new_v4().simple());
+    let _guard = AUTH_ENV_LOCK.lock().expect("auth env lock");
+    let old_pepper = std::env::var_os("LLMCONDUIT_AUTH_PEPPER");
+    let old_bootstrap = std::env::var_os("LLMCONDUIT_AUTH_BOOTSTRAP_KEY");
+    // SAFETY: this integration-test binary serializes mutation of these two
+    // process-local variables, restores both below, and no production code
+    // mutates the environment.
+    unsafe {
+        std::env::set_var("LLMCONDUIT_AUTH_PEPPER", "delegated-accounts-test-pepper");
+        std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", &bootstrap);
+    }
+    let authz = llmconduit::authz::AuthzService::from_config(&llmconduit::config::AuthConfig {
+        mode: llmconduit::config::AuthMode::Enforce,
+        store_path: store_path.clone(),
+    })
+    .expect("authz service");
+    // SAFETY: see the serialized environment mutation above.
+    unsafe {
+        match old_pepper {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_PEPPER", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_PEPPER"),
+        }
+        match old_bootstrap {
+            Some(value) => std::env::set_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY", value),
+            None => std::env::remove_var("LLMCONDUIT_AUTH_BOOTSTRAP_KEY"),
+        }
+    }
+    drop(_guard);
+    let mut auth_headers = axum::http::HeaderMap::new();
+    auth_headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {bootstrap}")).unwrap(),
+    );
+    let context = authz
+        .authenticate(&auth_headers)
+        .expect("bootstrap authenticates")
+        .expect("bootstrap context");
+    let csrf = "delegated-csrf-token";
+    let csrf_digest = <sha2::Sha256 as sha2::Digest>::digest(csrf.as_bytes());
+    let exp = chrono::Utc::now().timestamp().max(0) as u64 + 300;
+    let actor = authz
+        .create_delegated_session(
+            &context,
+            csrf_digest.as_slice(),
+            i64::try_from(exp).unwrap_or(i64::MAX),
+        )
+        .await
+        .expect("create delegated session");
+    let session_id = match actor {
+        llmconduit::dashboard_access::ManagementActor::Delegated { session_id, .. } => session_id,
+        llmconduit::dashboard_access::ManagementActor::Bootstrap => {
+            panic!("delegated session returned bootstrap actor")
+        }
+    };
+    let env = d13_env(true);
+    let dashboard_auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "127.0.0.1:8765".parse().unwrap(),
+        &env,
+    )
+    .expect("dashboard auth builds")
+    .auth;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&dashboard_auth)))
+            .with_authz(authz),
+    );
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+
+    let session = dashboard_auth.issue_delegated_session(&session_id, exp);
+
+    let list = accounts_request(&app, "GET", "/dashboard/api/users", &session, None, None).await;
+    assert_eq!(list.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let create = accounts_request(
+        &app,
+        "POST",
+        "/dashboard/api/users",
+        &session,
+        Some(csrf),
+        Some(json!({
+            "username": "delegated-created-admin",
+            "password": "password-2",
+            "is_admin": true
+        })),
+    )
+    .await;
+    assert_eq!(create.status(), axum::http::StatusCode::FORBIDDEN);
+
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_attribution_reaches_durable_activity() {
+    use llmconduit::control_plane_store::{
+        PersistenceQueue, PersistenceStore, PersistenceWriter, SqlStore,
+    };
+    use std::num::NonZeroUsize;
+
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+    );
+    let identity = authz.authenticate(&headers).unwrap().unwrap();
+    let store = Arc::new(SqlStore::connect_sqlite("sqlite::memory:").await.unwrap());
+    let writer: Arc<dyn PersistenceWriter> = store.clone();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-activity", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let gateway = Arc::try_unwrap(gateway)
+        .ok()
+        .unwrap()
+        .with_persistence_queue(PersistenceQueue::spawn(
+            writer,
+            NonZeroUsize::new(64).unwrap(),
+        ))
+        .with_persistence_store(store.clone());
+    let app = llmconduit::build_app_from_gateway(Arc::new(gateway));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let buckets = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let buckets = store.activity_series(0, 60_000, 10).await.unwrap();
+            if !buckets.is_empty() {
+                break buckets;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("durable activity written");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(
+        buckets[0].user_id.as_deref(),
+        Some(identity.principal_id.as_str())
+    );
+    assert_eq!(
+        buckets[0].virtual_key_id.as_deref(),
+        Some(identity.key_id.as_str())
+    );
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_rejects_missing_invalid_and_wrong_endpoint_before_dispatch() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let chat_body = json!({
+        "model": "public-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string();
+
+    for authorization in [None, Some("Bearer llmc_invalid_but_long_enough_1234567890")] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(chat_body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer realm=\"llmconduit\"")
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "public-model", "input": "hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_rejects_responses_websocket_before_upgrade() {
+    let (authz, _raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/responses")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_allows_scoped_responses_websocket() {
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-auth-ws", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let authorization = format!("Bearer {raw_key}");
+    let (mut stream, server) =
+        responses_ws_connect_with_authorization(app, Some(&authorization)).await;
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.model = "public-model".into();
+    ws_write_text_frame(
+        &mut stream,
+        &serde_json::to_string(&request).expect("serialize request"),
+    )
+    .await;
+
+    let mut terminal = false;
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut stream).await {
+            Some((0x1, payload)) => {
+                let event: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("event frame is JSON");
+                terminal |= event["type"] == "response.completed";
+            }
+            Some((0x8, _)) | None => break,
+            Some(_) => {}
+        }
+    }
+    drop(stream);
+    server.abort();
+
+    assert!(terminal, "authorized WebSocket turn must complete");
+    assert_eq!(upstream.requests().await.len(), 1);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_blocks_completions_and_count_tokens_endpoint_bypasses() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "public-model", "prompt": "hello"}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "public-model", "messages": []}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {raw_key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+    assert!(upstream.requests().await.is_empty());
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_allows_scoped_legacy_completions() {
+    let (authz, raw_key, store_path) = scoped_authz(&["completions"], &["public-*"]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(header("authorization", "Bearer upstream-secret"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "hello",
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl-auth",
+            "object": "text_completion",
+            "model": "public-model",
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "total_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 2}
+            },
+            "choices": [{"text": "allowed", "index": 0, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+    config.upstream_api_key = Some("upstream-secret".into());
+    config.price_table.insert(
+        "public-model".to_string(),
+        llmconduit::config::ModelPrice::new(2.0, 6.0, 0.5),
+    );
+    let upstream = llmconduit::upstream::ReqwestUpstreamClient::new(
+        reqwest::Client::new(),
+        config.upstream_base_url.clone(),
+        config.upstream_api_key.clone(),
+        None,
+        config.flatten_content,
+        config.min_completion_tokens,
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(16),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::disabled(),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "prompt": "hello",
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let usage = wait_for_auth_usage(&store_path).await;
+    assert_eq!(usage.0, "completions");
+    assert_eq!(usage.1, "completed");
+    assert_eq!(usage.2, Some(7));
+    assert_eq!(usage.3, Some(3));
+    assert_eq!(usage.4, Some(10));
+    assert_eq!(usage.5, Some(2));
+    assert_eq!(usage.6, None);
+    assert_eq!(usage.7, 1);
+    remove_auth_store(&store_path);
+}
+
+async fn wait_for_auth_usage(
+    store_path: &std::path::Path,
+) -> (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT endpoint,status,prompt_tokens,completion_tokens,total_tokens,cached_tokens,reasoning_tokens,
+                        (SELECT COUNT(*) FROM auth_usage_events)
+                 FROM auth_usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal usage persisted in bounded time")
+}
+
+#[tokio::test]
+async fn legacy_completions_stream_error_and_cancel_account_once() {
+    let (authz, raw_key, store_path) = scoped_authz(&["completions"], &["public-*"]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "stream",
+            "stream": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "data: {\"model\":\"public-model\",\"choices\":[{\"text\":\"ok\"}]}\n\n\
+                     data: {\"model\":\"public-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n\
+                     data: [DONE]\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "error",
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream failed"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_json(json!({
+            "model": "public-model",
+            "prompt": "cancel",
+            "stream": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "data: {\"choices\":[{\"text\":\"pending\"}]}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+    let upstream = llmconduit::upstream::ReqwestUpstreamClient::new(
+        reqwest::Client::new(),
+        config.upstream_base_url.clone(),
+        None,
+        None,
+        config.flatten_content,
+        config.min_completion_tokens,
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(16),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::disabled(),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let request = |prompt: &'static str, stream: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", format!("Bearer {raw_key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"public-model","prompt":prompt,"stream":stream}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let streamed = app.clone().oneshot(request("stream", true)).await.unwrap();
+    assert_eq!(streamed.status(), axum::http::StatusCode::OK);
+    let _ = axum::body::to_bytes(streamed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failed = app.clone().oneshot(request("error", false)).await.unwrap();
+    assert_eq!(
+        failed.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let _ = axum::body::to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cancelled = app.oneshot(request("cancel", true)).await.unwrap();
+    assert_eq!(cancelled.status(), axum::http::StatusCode::OK);
+    drop(cancelled);
+
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(&store_path).expect("open auth store");
+            let rows = connection
+                .prepare("SELECT status,total_tokens FROM auth_usage_events ORDER BY status")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            if rows.len() == 3 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all terminal outcomes persisted in bounded time");
+    assert_eq!(
+        rows,
+        vec![
+            ("cancelled".to_string(), None),
+            ("completed".to_string(), Some(6)),
+            ("failed".to_string(), None),
+        ]
+    );
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_applies_model_scope_and_allows_scoped_chat() {
+    let (authz, raw_key, store_path) = scoped_authz(&["chat"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["public-model"]).await;
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-auth", "allowed")),
+            Ok(usage_chunk("chat-auth", 12, 5, 17, Some(3), Some(2))),
+        ])
+        .await;
+    let mut config = test_config();
+    config.price_table.insert(
+        "public-model".to_string(),
+        llmconduit::config::ModelPrice::new(2.0, 6.0, 0.5),
+    );
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        config,
+        None,
+        authz,
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "secret-model",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("x-api-key", &raw_key)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+    assert_eq!(upstream.requests().await.len(), 1);
+    let usage_row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let connection = rusqlite::Connection::open(&store_path).expect("open auth store");
+            let row = connection.query_row(
+                "SELECT endpoint, status, prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens,
+                        cost_nano_usd, cost_confidence,
+                        (SELECT COUNT(*) FROM auth_usage_events)
+                 FROM auth_usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            );
+            if let Ok(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal usage persisted in bounded time");
+    assert_eq!(
+        usage_row,
+        (
+            "chat".to_string(),
+            "completed".to_string(),
+            12,
+            5,
+            17,
+            3,
+            2,
+            49_500_000,
+            "confident".to_string(),
+            1,
+        )
+    );
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_allows_scoped_anthropic_messages() {
+    let (authz, raw_key, store_path) = scoped_authz(&["messages"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-auth-messages", "allowed"))])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", &raw_key)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "public-model",
+                        "max_tokens": 64,
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(upstream.requests().await.len(), 1);
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn authenticated_cancel_and_pre_spawn_error_each_record_usage_once() {
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-api-key", raw_key.parse().unwrap());
+    let context = authz.authenticate(&headers).unwrap().unwrap();
+    let upstream = ChunkThenPendingUpstream::new(vec![
+        content_chunk("chat-auth-cancel", "partial"),
+        usage_chunk("chat-auth-cancel", 10, 4, 14, None, None),
+    ]);
+    let stream_polled = upstream.stream_polled.notified();
+    let stream_dropped = upstream.stream_dropped.notified();
+    let base = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let gateway = Arc::new(base.as_ref().clone().with_authz(authz));
+    let api_call_id = d3_open_flow(&gateway);
+    let mut request = base_request(vec![user_message("cancel")]);
+    request.model = "public-model".into();
+    let authorization = context
+        .authorization_scope(
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            &request.model,
+        )
+        .unwrap();
+    let mut stream = gateway
+        .clone()
+        .stream_responses_authorized_with_context(
+            request,
+            Some(api_call_id),
+            authorization,
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            Some(context),
+        )
+        .await
+        .unwrap();
+    let _ = stream.next().await;
+    let _ = stream.next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked after partial usage");
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("cancel dropped upstream stream");
+    assert_eq!(
+        await_single_auth_usage(&store_path).await,
+        ("cancelled".into(), Some(14), 1)
+    );
+    remove_auth_store(&store_path);
+
+    let (authz, raw_key, store_path) = scoped_authz(&["responses"], &["public-*"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-api-key", raw_key.parse().unwrap());
+    let context = authz.authenticate(&headers).unwrap().unwrap();
+    let base = test_gateway_with_flow_store_upstream(Arc::new(MockUpstream::default()));
+    let gateway = Arc::new(base.as_ref().clone().with_authz(authz));
+    let api_call_id = d3_open_flow(&gateway);
+    let mut request = base_request(vec![user_message("fail")]);
+    request.model = "public-model".into();
+    request.previous_response_id = Some("unsupported".into());
+    let authorization = context
+        .authorization_scope(
+            llmconduit::upstream::InferenceEndpoint::Responses,
+            &request.model,
+        )
+        .unwrap();
+    assert!(
+        gateway
+            .stream_responses_authorized_with_context(
+                request,
+                Some(api_call_id),
+                authorization,
+                llmconduit::upstream::InferenceEndpoint::Responses,
+                Some(context),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        await_single_auth_usage(&store_path).await,
+        ("failed".into(), None, 1)
+    );
+    remove_auth_store(&store_path);
+}
+
+#[tokio::test]
+async fn enforced_auth_filters_model_catalog_for_the_authenticated_key() {
+    let (authz, raw_key, store_path) = scoped_authz(&["models"], &["public-*"]);
+    let upstream = MockUpstream::default();
+    upstream
+        .set_supported_models(["public-one", "secret-one", "public-two"])
+        .await;
+    let gateway = test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        MockSearch::default(),
+        test_config(),
+        None,
+        authz,
+    );
+    let response = llmconduit::build_app_from_gateway(gateway)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        response.headers().get(axum::http::header::ETAG).is_none(),
+        "principal-filtered catalogs must not reuse the upstream ETag"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "unexpected models response: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let ids = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["public-one", "public-two"]);
+    remove_auth_store(&store_path);
+}
+
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
     test_gateway_with_config(upstream, search, test_config())
 }
@@ -7221,6 +10018,22 @@ fn test_gateway_with_config_and_raw_output(
     config: Config,
     raw_output: Option<RawOutput>,
 ) -> Arc<Gateway> {
+    test_gateway_with_config_raw_output_and_authz(
+        upstream,
+        search,
+        config,
+        raw_output,
+        llmconduit::authz::AuthzService::default(),
+    )
+}
+
+fn test_gateway_with_config_raw_output_and_authz(
+    upstream: MockUpstream,
+    search: MockSearch,
+    config: Config,
+    raw_output: Option<RawOutput>,
+    authz: llmconduit::authz::AuthzService,
+) -> Arc<Gateway> {
     // Build the leaf finalization policies from the test config so the mock's
     // leaf-mirror applies the SAME profile/family/effort kwargs the production
     // leaf would (T1 moved profile resolution from the engine to the leaf).
@@ -7235,21 +10048,25 @@ fn test_gateway_with_config_and_raw_output(
         llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
     );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
-    Arc::new(Gateway::new(
-        config,
-        ReplayStore::new(1000),
-        Arc::new(upstream),
-        Arc::new(search),
-        vision,
-        image_cache,
-        MonitorHub::new(128),
-        raw_output,
-        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
-    ))
+    Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            Arc::new(upstream),
+            Arc::new(search),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            raw_output,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_authz(authz),
+    )
 }
 
 fn test_config() -> Config {
     Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
@@ -7283,6 +10100,8 @@ fn test_config() -> Config {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     }
 }
 
@@ -7486,6 +10305,8 @@ fn usage_chunk(
                 .try_into()
                 .expect("completion_tokens fits in i64"),
             total_tokens: total_tokens.try_into().expect("total_tokens fits in i64"),
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: cached_tokens.map(|cached_tokens| PromptTokensDetails {
                 cached_tokens: cached_tokens as i64,
@@ -7754,7 +10575,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "second"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -7857,7 +10678,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "first"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -7978,7 +10799,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -8098,7 +10919,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback alias"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -8232,7 +11053,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                             "delta": {
                                 "content": "fallback ok"
                             },
-                            "finish_reason": null
+                            "finish_reason": "stop"
                         }
                     ],
                     "usage": null
@@ -8370,6 +11191,111 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             body["chat_template_kwargs"]["model_default"].is_null(),
             "request-alias profile kwargs must not apply to a failover target (T1)"
         );
+    }
+}
+
+#[tokio::test]
+async fn clean_done_without_finish_reason_completes_chat_and_responses() {
+    // Exercise the real HTTP parser, canonical engine, and Pi-facing converter.
+    // A provider's missing finish metadata must not turn a fully framed reply
+    // into an error, or prevent a complete tool call from reaching the client.
+    for (tool_call, malformed) in [(false, false), (true, false), (true, true)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "glm-5.1"}]
+            })))
+            .mount(&server)
+            .await;
+        let arguments = if malformed {
+            "{\"path\":"
+        } else {
+            "{\"path\":\"README.md\"}"
+        };
+        let delta = if tool_call {
+            json!({"tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                "function": {"name": "read_file", "arguments": arguments}}]})
+        } else {
+            json!({"content": "complete answer"})
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_completion_sse_body(&[json!({
+                        "id": "chat-1", "choices": [{"index": 0, "delta": delta}]
+                    })])),
+            )
+            .mount(&server)
+            .await;
+        let mut config = test_config();
+        config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+        let (app, _) = llmconduit::build_app_with_gateway(config);
+        for route in ["/v1/chat/completions", "/v1/responses"] {
+            let body = if route.ends_with("completions") {
+                json!({"model": "glm-5.1", "stream": true,
+                    "messages": [{"role": "user", "content": "read the file"}],
+                    "tools": [{"type": "function", "function": {"name": "read_file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]})
+            } else {
+                json!({"model": "glm-5.1", "stream": true, "store": false,
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read the file"}]}],
+                    "tools": [{"type": "function", "name": "read_file", "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]})
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(status.as_u16(), 200, "{route}: {text}");
+            if malformed {
+                assert!(text.contains("\"error\":"), "{text}");
+                assert!(!text.contains("event: response.completed"), "{text}");
+                assert!(!text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+                continue;
+            }
+            assert!(!text.contains("response.failed"), "{text}");
+            assert!(!text.contains("\"error\":"), "{text}");
+            assert!(
+                text.contains(if tool_call {
+                    "read_file"
+                } else {
+                    "complete answer"
+                }),
+                "{text}"
+            );
+            if route.ends_with("completions") {
+                let finish = if tool_call { "tool_calls" } else { "stop" };
+                assert!(
+                    text.contains(&format!("\"finish_reason\":\"{finish}\"")),
+                    "{text}"
+                );
+                assert!(text.contains("data: [DONE]"), "{text}");
+            } else {
+                assert!(text.contains("event: response.completed"), "{text}");
+                if !tool_call {
+                    assert!(
+                        text.contains("\"terminal_reason\":\"other\""),
+                        "missing metadata must remain unknown: {text}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -10357,6 +13283,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
     let upstream = PendingChunkUpstream::new();
     let stream_polled = upstream.stream_polled.notified();
     let config = Config {
+        provider_metrics_targets: Vec::new(),
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
@@ -10390,6 +13317,8 @@ async fn cancels_mid_stream_when_client_disconnects() {
         image_cache_ttl_secs: 300,
         unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
+        auth: Default::default(),
+        mesh: llmconduit::config::MeshConfig::default(),
     };
     // The image agent is off here, so the vision client is inert; a real
     // `ReqwestVisionClient` that is never called satisfies the constructor
@@ -11393,6 +14322,68 @@ async fn root_endpoint_returns_ok() {
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn root_redirects_browsers_to_the_dashboard_when_enabled() {
+    // A person opening the bare host in a browser should land on the
+    // dashboard, not on the JSON status probe. API clients (no `text/html`
+    // Accept) and dashboard-less deployments keep the JSON status.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 303);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/dashboard")
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["status"], "ok");
+
+    // Without the dashboard there is nowhere to redirect: JSON for everyone.
+    let response = llmconduit::build_app(test_config())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("accept", "text/html")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
 }
 
 #[tokio::test]
@@ -12510,7 +15501,9 @@ impl UpstreamClient for RepairRoundPendingUpstream {
         }
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+    async fn list_models(
+        &self,
+    ) -> Result<llmconduit::upstream::UpstreamModelsResponse, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
@@ -12928,4 +15921,112 @@ async fn f1b_mid_stream_disconnect_marks_served_partial() {
         artifact["sections"]["served_response"]["partial"], true,
         "a mid-stream disconnect marks served_response partial: {artifact}"
     );
+}
+
+#[tokio::test]
+async fn affinity_reaches_every_http_protocol_without_debug_or_persistence() {
+    let upstream = MockUpstream::default();
+    for _ in 0..6 {
+        upstream
+            .push_response(vec![Ok(content_chunk("chat-affinity", "ok"))])
+            .await;
+    }
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    assert!(!gateway.persistence_enabled());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let cases = [
+        (
+            "/v1/responses",
+            json!({"model":"glm-5.1","input":"hello","store":false}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"glm-5.1","prompt_cache_key":"conversation-a","messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"glm-5.1","max_tokens":10,"messages":[{"role":"user","content":"hello"}]}),
+        ),
+    ];
+    for (path, body) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-llm-session-id", "conversation-a")
+                    .header("authorization", "Bearer first-caller")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    for (key, session) in [
+        ("first-caller", "conversation-b"),
+        ("second-caller", "conversation-a"),
+        ("first-caller", ""),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .header("x-llm-session-id", session)
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(axum::body::Body::from(
+                        json!({"model":"glm-5.1","input":"hello","store":false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    let identities = upstream.affinities.lock().await;
+    assert_eq!(identities.len(), 6);
+    assert!(identities[0].is_some());
+    assert_eq!(identities[0], identities[1]);
+    assert_eq!(identities[0], identities[2]);
+    assert_ne!(identities[0], identities[3]);
+    assert_ne!(identities[0], identities[4]);
+    assert!(identities[5].is_none());
+    assert!(!identities[0].as_ref().unwrap().0.contains("conversation-a"));
+    assert!(
+        !upstream.requests().await[1]
+            .extra_body
+            .contains_key("prompt_cache_key")
+    );
+}
+
+#[tokio::test]
+async fn affinity_reaches_responses_websocket_envelope_without_observability() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-affinity-ws", "ok"))])
+        .await;
+    let app =
+        llmconduit::build_app_from_gateway(test_gateway(upstream.clone(), MockSearch::default()));
+    let (mut socket, server) = responses_ws_connect(app).await;
+    let frame = json!({"type":"response.create","response":{"model":"glm-5.1","input":"hello","store":false,"prompt_cache_key":"stable-ws-session"}});
+    ws_write_text_frame(&mut socket, &frame.to_string()).await;
+    for _ in 0..64 {
+        match ws_try_read_frame(&mut socket).await {
+            Some((0x8, _)) | None => break,
+            _ => {}
+        }
+    }
+    server.abort();
+    assert!(upstream.affinities.lock().await[0].is_some());
 }

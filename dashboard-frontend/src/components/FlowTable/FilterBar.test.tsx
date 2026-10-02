@@ -40,20 +40,20 @@ describe('FilterBar — active filter is always visible + clearable (D12 R5 MED)
     // NOT among the derived options. It must still appear as an active chip.
     const { container, onChange } = renderBar({
       models: ['gpt-4o'],
-      filters: { status: null, model: 'claude-x', upstream: null, client: null },
+      filters: { ...EMPTY_FILTERS, status: null, model: 'claude-x', upstream: null, client: null },
     });
     const chip = within(container).getByText('claude-x');
     expect(chip).toBeTruthy();
     expect(chip.getAttribute('aria-pressed')).toBe('true');
     // Clicking it toggles the filter OFF (clears that facet).
     fireEvent.click(chip);
-    expect(onChange).toHaveBeenCalledWith({ status: null, model: null, upstream: null, client: null });
+    expect(onChange).toHaveBeenCalledWith({ ...EMPTY_FILTERS, status: null, model: null, upstream: null, client: null });
   });
 
   it('renders an active chip for a SELECTED upstream that matches NO row in view', () => {
     const { container } = renderBar({
       upstreams: ['vllm-a'],
-      filters: { status: null, model: null, upstream: 'idle-provider', client: null },
+      filters: { ...EMPTY_FILTERS, status: null, model: null, upstream: 'idle-provider', client: null },
     });
     const chip = within(container).getByText('idle-provider');
     expect(chip.getAttribute('aria-pressed')).toBe('true');
@@ -63,7 +63,7 @@ describe('FilterBar — active filter is always visible + clearable (D12 R5 MED)
     const { container } = renderBar({
       models: [],
       upstreams: [],
-      filters: { status: null, model: 'claude-x', upstream: null, client: null },
+      filters: { ...EMPTY_FILTERS, status: null, model: 'claude-x', upstream: null, client: null },
       total: 0,
       shown: 0,
     });
@@ -74,7 +74,7 @@ describe('FilterBar — active filter is always visible + clearable (D12 R5 MED)
   it('does not duplicate a selected value that is ALSO in the derived options', () => {
     const { container } = renderBar({
       models: ['gpt-4o', 'claude-x'],
-      filters: { status: null, model: 'claude-x', upstream: null, client: null },
+      filters: { ...EMPTY_FILTERS, status: null, model: 'claude-x', upstream: null, client: null },
     });
     const labels = groupChips(container, 'model').map((b) => b.textContent);
     expect(labels.filter((l) => l === 'claude-x')).toHaveLength(1);
@@ -82,7 +82,7 @@ describe('FilterBar — active filter is always visible + clearable (D12 R5 MED)
 
   it('exposes a `clear` control when any facet is active that resets ALL facets', () => {
     const { container, onChange } = renderBar({
-      filters: { status: 'open', model: 'gpt-4o', upstream: 'vllm-a', client: null },
+      filters: { ...EMPTY_FILTERS, status: 'open', model: 'gpt-4o', upstream: 'vllm-a', client: null },
     });
     const clear = within(container).getByTestId('flow-filter-clear');
     fireEvent.click(clear);
@@ -117,7 +117,7 @@ describe('FilterBar — client facet is bounded (gap 15 review MEDIUM: high card
     // filter, so it MUST still render as an active, toggle-off-able chip.
     const { container, onChange } = renderBar({
       clients: many,
-      filters: { status: null, model: null, upstream: null, client: 'client-49' },
+      filters: { ...EMPTY_FILTERS, status: null, model: null, upstream: null, client: 'client-49' },
     });
     // The client chip wraps its label in a truncate span, so resolve the enclosing button for aria.
     const chip = within(container).getByText('client-49').closest('button')!;
@@ -126,13 +126,13 @@ describe('FilterBar — client facet is bounded (gap 15 review MEDIUM: high card
     expect(groupChips(container, 'client').length).toBeLessThanOrEqual(8);
     // Clicking it toggles the client facet OFF.
     fireEvent.click(chip);
-    expect(onChange).toHaveBeenCalledWith({ status: null, model: null, upstream: null, client: null });
+    expect(onChange).toHaveBeenCalledWith({ ...EMPTY_FILTERS, status: null, model: null, upstream: null, client: null });
   });
 
   it('an active client value that IS NOT in the option list at all still shows (cross-link to an aged-out client)', () => {
     const { container } = renderBar({
       clients: ['client-00', 'client-01'],
-      filters: { status: null, model: null, upstream: null, client: 'ghost-client' },
+      filters: { ...EMPTY_FILTERS, status: null, model: null, upstream: null, client: 'ghost-client' },
     });
     expect(within(container).getByText('ghost-client').closest('button')!.getAttribute('aria-pressed')).toBe('true');
   });
@@ -144,7 +144,7 @@ describe('FilterBar — client facet is bounded (gap 15 review MEDIUM: high card
     const longLabel = `python-httpx/${'x'.repeat(4096)}`;
     const { container } = renderBar({
       clients: [longLabel, 'client-00'],
-      filters: { status: null, model: null, upstream: null, client: longLabel },
+      filters: { ...EMPTY_FILTERS, status: null, model: null, upstream: null, client: longLabel },
     });
     const chip = within(container).getByText(longLabel).closest('button')!;
     // The label is wrapped in the bounded truncate span (not rendered bare in the button).

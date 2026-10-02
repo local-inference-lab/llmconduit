@@ -97,6 +97,7 @@ export function FilterBar({
   models,
   upstreams,
   clients,
+  harnesses = [],
   total,
   shown,
   onChange,
@@ -106,6 +107,8 @@ export function FilterBar({
   upstreams: string[];
   /** Gap 15 — distinct `client_label`s in view, for the per-client filter chips. */
   clients: string[];
+  /** Sessions — distinct detected harnesses in view. */
+  harnesses?: string[];
   total: number;
   shown: number;
   onChange: (next: FlowFilters) => void;
@@ -122,8 +125,10 @@ export function FilterBar({
   // when it falls outside the top-N — never silently drop the user's current filter.
   const clientOptions = capWithSelected(clients, filters.client, CLIENT_CHIP_CAP);
   const clientsHidden = Math.max(0, clients.filter((c) => c !== filters.client).length - clientOptions.filter((c) => c !== filters.client).length);
+  const harnessOptions = withSelected(harnesses, filters.harness);
   const anyActive =
-    filters.status !== null || filters.model !== null || filters.upstream !== null || filters.client !== null;
+    filters.status !== null || filters.model !== null || filters.upstream !== null || filters.client !== null ||
+    filters.harness !== null || filters.session !== null || filters.cacheBust !== null;
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-panel px-3 py-2" data-testid="flow-filter-bar">
@@ -175,6 +180,30 @@ export function FilterBar({
               +{clientsHidden} more
             </span>
           )}
+        </FilterGroup>
+      )}
+      {/* Sessions: the harness facet (bounded — a handful of profiles) + the cache-bust toggle. The
+          session facet is set only by the Sessions view cross-link; it renders as an active chip so it
+          is visible + toggle-off-able, never an invisible filter. */}
+      {harnessOptions.length > 0 && (
+        <FilterGroup label="harness">
+          {harnessOptions.map((h) => (
+            <Chip key={h} active={filters.harness === h} onClick={() => toggle('harness', h)}>
+              {h}
+            </Chip>
+          ))}
+        </FilterGroup>
+      )}
+      <FilterGroup label="cache">
+        <Chip active={filters.cacheBust === true} onClick={() => toggle('cacheBust', true)} title="only flows whose prefix diverged from their chain predecessor">
+          busts
+        </Chip>
+      </FilterGroup>
+      {filters.session && (
+        <FilterGroup label="session">
+          <Chip active onClick={() => toggle('session', filters.session)} truncateLabel title={filters.session}>
+            {filters.session}
+          </Chip>
         </FilterGroup>
       )}
       {/* Single-click escape hatch: always available while any facet is active, so even an

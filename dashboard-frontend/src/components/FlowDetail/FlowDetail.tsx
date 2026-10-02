@@ -41,9 +41,11 @@ import { DeltasPanel } from './DeltasPanel';
 import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
 import { useFlowDetail, type KillState } from './useFlowDetail';
+import { useChainDiff } from './useChainDiff';
+import { divergenceLabel } from '../../views/sessions/sessionsModel';
 import { cn } from '../../lib/cn';
 
-type Tab = 'headers' | 'timeline' | 'error';
+type Tab = 'headers' | 'timeline' | 'error' | 'chain';
 
 export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose: () => void }) {
   const { detail, frozenDetail, liveFlow, status, seeking, seekMonitorSeq, seekAtMs, mutationsEnabled, kill, killState } =
@@ -91,6 +93,10 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 
   const sync = useScrollSync(3);
   const isActive = status === 'open';
+  // Sessions: the chain comparison (this flow's FULL inbound body vs its predecessor's, from the
+  // durable content store). Fetched only while the Chain tab is open.
+  const chain = useChainDiff(apiCallId, liveFlow?.chain_parent_request_id, tab === 'chain');
+  const chainSync = useScrollSync(2);
 
   // Cost + its confidence tag are derived TOGETHER as a PAIR from the SAME source (gap 07 review
   // round 3): the displayed dollar value and the `estimated`/`unavailable` provenance tag MUST never
@@ -244,7 +250,31 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 
       <SearchBar value={query} onChange={setQuery} />
 
-      {/* 3 scroll-synced panes */}
+      {/* Chain tab: the two-pane chain diff REPLACES the transformation panes (same footprint). */}
+      {tab === 'chain' ? (
+        <div className="grid min-h-0 flex-1 grid-cols-2 divide-x divide-line" data-testid="chain-pane-row">
+          <JsonPane
+            label="P · predecessor"
+            value={chain.previous}
+            diff={chain.diff}
+            side="left"
+            query={query}
+            emptyLabel={chain.predecessorId ? (chain.loading ? 'loading…' : 'predecessor body not stored') : 'no predecessor (chain start)'}
+            scrollRef={chainSync.refFor(0)}
+            onScroll={chainSync.bind(0)}
+          />
+          <JsonPane
+            label="T · this request"
+            value={chain.current}
+            diff={chain.diff}
+            side="right"
+            query={query}
+            emptyLabel={chain.loading ? 'loading…' : 'body not stored (durable history off)'}
+            scrollRef={chainSync.refFor(1)}
+            onScroll={chainSync.bind(1)}
+          />
+        </div>
+      ) : (
       <div className="grid min-h-0 flex-1 grid-cols-3 divide-x divide-line" data-testid="pane-row">
         <JsonPane
           label="A · inbound"
@@ -277,12 +307,14 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           onScroll={sync.bind(2)}
         />
       </div>
+      )}
 
       {/* tabs */}
       <div className="flex shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2 py-1" role="tablist">
         <TabButton id="headers" active={tab} onClick={setTab}>Headers</TabButton>
         <TabButton id="timeline" active={tab} onClick={setTab}>Timeline</TabButton>
         <TabButton id="error" active={tab} onClick={setTab}>Error</TabButton>
+        <TabButton id="chain" active={tab} onClick={setTab}>Chain</TabButton>
       </div>
       <div className="max-h-44 min-h-[3rem] shrink-0 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
         {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut metadata
@@ -290,6 +322,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
         {tab === 'timeline' && <Timeline events={join.events} />}
         {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
+        {tab === 'chain' && <ChainTab flow={liveFlow} predecessorId={chain.predecessorId} error={chain.error} />}
       </div>
 
       {/* deltas sub-panel */}
@@ -586,6 +619,39 @@ function TabButton({ id, active, onClick, children }: { id: Tab; active: Tab; on
     >
       {children}
     </button>
+  );
+}
+
+/**
+ * Sessions — the Chain tab's summary strip: harness, session node, the divergence classification
+ * (with its cache-bust verdict) and the predecessor id. The panes above show the structural diff.
+ */
+function ChainTab({ flow, predecessorId, error }: { flow: FlowSummary | null; predecessorId: string | null; error: string | null }) {
+  const lineage = divergenceLabel(flow?.divergence_kind);
+  const known = !!flow?.divergence_kind;
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 text-xs" data-testid="chain-tab" data-cache-bust={flow?.cache_bust === true ? 'true' : 'false'}>
+      <span className="text-text-muted">harness</span>
+      <span className="font-mono" data-testid="chain-harness">{flow?.harness ?? '—'}</span>
+      <span className="text-text-muted">session</span>
+      <span className="truncate font-mono" data-testid="chain-session" title={flow?.session_id ?? undefined}>{flow?.session_id ?? '—'}</span>
+      <span className="text-text-muted">lineage</span>
+      <span
+        className={cn('rounded-sm px-1 text-[9px] uppercase tracking-wide', lineage.bust ? 'bg-status-cooling/15 text-status-cooling' : 'bg-line/40 text-text-muted')}
+        data-testid="chain-lineage"
+        data-kind={flow?.divergence_kind ?? undefined}
+        title={lineage.title}
+      >
+        {known ? (lineage.bust ? `cache bust · ${lineage.label}` : lineage.label) : '—'}
+      </span>
+      <span className="text-text-muted">predecessor</span>
+      <span className="font-mono" data-testid="chain-predecessor">{predecessorId ?? '—'}</span>
+      {error && (
+        <span className="text-status-down" data-testid="chain-error" title={error}>
+          {error.includes('503') ? 'durable history disabled' : 'body fetch failed'}
+        </span>
+      )}
+    </div>
   );
 }
 

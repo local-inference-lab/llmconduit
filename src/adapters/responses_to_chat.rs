@@ -209,6 +209,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 ..
             } => append_tool_call(
                 &mut messages,
+                baseline_len,
                 call_id.clone(),
                 name.clone(),
                 parse_json_string(arguments)?,
@@ -221,6 +222,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 ..
             } => append_tool_call(
                 &mut messages,
+                baseline_len,
                 call_id.clone(),
                 name.clone(),
                 json!({ "input": input }),
@@ -239,6 +241,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 }
                 append_tool_call(
                     &mut messages,
+                    baseline_len,
                     call_id
                         .clone()
                         .unwrap_or_else(|| "tool_search_missing_call_id".to_string()),
@@ -266,6 +269,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 };
                 append_tool_call(
                     &mut messages,
+                    baseline_len,
                     call_id,
                     "local_shell".to_string(),
                     arguments,
@@ -315,6 +319,7 @@ pub fn lower_request_with_image_agent_and_roles(
                     .unwrap_or_else(|| format!("web_search_missing_replay_{}", messages.len()));
                 append_tool_call(
                     &mut messages,
+                    baseline_len,
                     call_id.clone(),
                     "web_search".to_string(),
                     web_search_arguments(action),
@@ -888,14 +893,17 @@ fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResul
 
 fn append_tool_call(
     messages: &mut Vec<ChatMessage>,
+    baseline_len: usize,
     call_id: String,
     name: String,
     arguments: Value,
     pending_reasoning: Option<PendingReasoning>,
 ) {
+    let can_merge_with_tail = messages.len() > baseline_len;
     if let Some(last) = messages.last_mut()
+        && can_merge_with_tail
         && last.role == "assistant"
-        && (last.tool_calls.is_some() || last.content.is_none())
+        && last.tool_call_id.is_none()
     {
         let index = last.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
         let tool_call = ChatToolCall {
@@ -1895,6 +1903,7 @@ mod tests {
         for i in 0..3 {
             append_tool_call(
                 &mut messages,
+                0,
                 format!("call_{i}"),
                 format!("fn_{i}"),
                 json!({}),
@@ -1910,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_tool_call_no_merge_into_content_message() {
+    fn test_append_tool_call_merges_into_content_message() {
         let mut messages = vec![ChatMessage {
             role: "assistant".to_string(),
             content: Some(Value::String("some text".to_string())),
@@ -1922,19 +1931,57 @@ mod tests {
         }];
         append_tool_call(
             &mut messages,
+            0,
             "call_1".to_string(),
             "fn_1".to_string(),
             json!({}),
             None,
         );
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].content,
             Some(Value::String("some text".to_string()))
         );
-        assert!(messages[0].tool_calls.is_none());
-        assert!(messages[1].tool_calls.is_some());
-        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
+        assert_eq!(messages[0].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(messages[0].tool_calls.as_ref().unwrap()[0].index, Some(0));
+    }
+
+    #[test]
+    fn test_lower_request_does_not_merge_tool_call_into_baseline_assistant() {
+        let baseline = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(Value::String("baseline text".to_string())),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        }];
+        let baseline_bytes = serde_json::to_vec(&baseline[0]).unwrap();
+
+        let mut req = base_test_request();
+        req.input.push(ResponseItem::FunctionCall {
+            id: Some("fc_1".to_string()),
+            name: "fn_1".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call_1".to_string(),
+        });
+
+        let lowered = lower_request(&req, baseline).unwrap();
+
+        assert_eq!(lowered.messages.len(), 2);
+        assert_eq!(
+            serde_json::to_vec(&lowered.messages[0]).unwrap(),
+            baseline_bytes
+        );
+        assert!(lowered.messages[0].tool_calls.is_none());
+        assert!(lowered.messages[1].content.is_none());
+        assert_eq!(lowered.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            lowered.messages[1].tool_calls.as_ref().unwrap()[0].id,
+            Some("call_1".to_string())
+        );
     }
 
     // --- M2 test ---

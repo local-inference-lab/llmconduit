@@ -133,6 +133,17 @@ type UnknownToolCounterKey = (String, String, UnknownToolOutcome);
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
+    /// Client-facing `/v1/*` virtual-key authentication. This is deliberately
+    /// separate from env-only dashboard session authentication.
+    client_auth: crate::client_auth::ClientAuth,
+    /// Inbound header used to group durable request rows into conversations.
+    /// This is request attribution only; it is not forwarded upstream.
+    conversation_id_header: String,
+    /// Exact operational alias -> primary profile mapping. Alias dispatch stays
+    /// in the upstream routing stack; this map prevents pre-normalization from
+    /// collapsing the alias and selects its request-level profile policy.
+    operational_alias_profiles: BTreeMap<String, String>,
+    operational_unknown_model_policy: crate::control_plane::UnknownModelPolicy,
     replay_store: ReplayStore,
     upstream: Arc<dyn UpstreamClient>,
     search: Arc<dyn SearchClient>,
@@ -150,6 +161,10 @@ pub struct Gateway {
     /// case the auth-gated routes are simply not registered. NEVER built from
     /// the persisted `Config` (secrets are read from the environment).
     dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
+    /// Inference API-key authorization. Disabled by default for tests and
+    /// legacy configurations; the DI root attaches the validated enforce-mode
+    /// service before the router is built.
+    authz: Arc<crate::authz::AuthzService>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// D4 published topology health: the latest versioned
     /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
@@ -166,6 +181,13 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// Optional provider-level cache observability. This registry contains only
+    /// aggregate operator-configured scrape results and is never used for
+    /// per-request/key accounting.
+    provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
+    /// Optional local Fleet control-plane client for dashboard GPU switching.
+    /// Built from env-only URL/token settings and never persisted in Config.
+    fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>,
     /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
     /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
     /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
@@ -174,6 +196,38 @@ pub struct Gateway {
     /// keyed only on `config.turn_capture_dir` (spec Design overview #1 --
     /// its own instrumentation gate, independent of the debug UI).
     turn_capture: crate::turn_capture::TurnCapture,
+    /// Bounded, nonblocking terminal/event writer used by the inference hot path.
+    /// `None` keeps persistence at zero overhead. Kept separate from the read/admin
+    /// store so an inference request can never await a database operation.
+    persistence_queue: Option<crate::control_plane_store::PersistenceQueue>,
+    /// Whether persisted request items keep image/data URIs (content store).
+    persistence_keep_media: bool,
+    /// Harness/session detection, run once per instrumented request.
+    harness_detector: Arc<crate::harness::HarnessDetector>,
+    /// Probed image support per backend model (see `crate::vision_probe`).
+    native_vision_cache: crate::vision_probe::NativeVisionCache,
+    /// Session tree + lineage index (see `crate::sessions`).
+    session_linker: Arc<crate::sessions::SessionLinker>,
+    /// Live active-session hub for the dashboard (see `crate::session_hub`).
+    /// `SessionHub::disabled()` when `--with-debug-ui` is off — every op a
+    /// no-op, mirroring the FlowStore/monitor gating.
+    session_hub: crate::session_hub::SessionHub,
+    /// YAML-configured keys + the configured `require` flag, kept so the live
+    /// registry can be rebuilt as YAML ∪ SQL (see `crate::accounts`).
+    yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
+    client_auth_required: bool,
+    /// Whether at least one user account exists (drives the login mode).
+    users_configured: Arc<std::sync::atomic::AtomicBool>,
+    /// Durable store handle for admin/history reads only. Inference writes use
+    /// `persistence_queue` above; request execution never awaits this trait object.
+    persistence_store: Option<Arc<dyn crate::control_plane_store::PersistenceStore>>,
+    /// Optional mesh controller admin handle. Present only when the controller is
+    /// enabled; dashboard handlers use it for enrollment/node/model lifecycle.
+    mesh_admin: Option<Arc<crate::mesh::controller::MeshAdmin>>,
+    /// Dashboard-managed OpenAI-compatible providers. Present only when a SQL
+    /// persistence store is configured; secrets stay in the store and this
+    /// handle exposes only redacted metadata to dashboard handlers.
+    managed_providers: Option<Arc<crate::managed_providers::ManagedProviderRegistry>>,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -208,6 +262,16 @@ pub struct Gateway {
 pub struct SseEvent {
     pub event: String,
     pub data: Value,
+}
+
+fn inference_endpoint_name(endpoint: crate::upstream::InferenceEndpoint) -> &'static str {
+    match endpoint {
+        crate::upstream::InferenceEndpoint::Responses => "responses",
+        crate::upstream::InferenceEndpoint::ChatCompletions => "chat",
+        crate::upstream::InferenceEndpoint::Messages => "messages",
+        crate::upstream::InferenceEndpoint::CountTokens => "count_tokens",
+        crate::upstream::InferenceEndpoint::Completions => "completions",
+    }
 }
 
 #[derive(Clone)]
@@ -487,7 +551,7 @@ fn estimate_input_tokens(
     // count (and thus the estimate) is stable. The G3 test oracle (T9) builds
     // an INDEPENDENT normalization of the recorded request — it does not call
     // this fn — so estimator-vs-oracle drift surfaces as a test failure.
-    let bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+    let bytes = crate::replay::serialized_len(&request).unwrap_or(0);
     // ceil(bytes / 4): ~4 bytes per token is the standard coarse approximation.
     bytes.div_ceil(4) as i64
 }
@@ -666,6 +730,12 @@ fn merge_json_value_prefer_source(destination: &mut Value, source: &Value) {
 /// provider is cooling (the task then just waits for the next 1 s tick). A
 /// deadline already at/behind now yields `Duration::ZERO` (wake immediately), so
 /// the elapsed window is observed on the very next recompute.
+fn provider_health_fingerprint(health: &[ProviderHealth]) -> Vec<u8> {
+    // Serialization of plain owned data cannot fail; an empty fingerprint on the
+    // impossible error path only causes one extra publish.
+    serde_json::to_vec(health).unwrap_or_default()
+}
+
 fn next_cooldown_wake(health: &[ProviderHealth]) -> Option<std::time::Duration> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -676,6 +746,23 @@ fn next_cooldown_wake(health: &[ProviderHealth]) -> Option<std::time::Duration> 
         .filter_map(|provider| provider.cooling_until_ms)
         .map(|until_ms| std::time::Duration::from_millis(until_ms.saturating_sub(now_ms)))
         .min()
+}
+
+/// Native-vision decision for one final backend model: an explicit profile
+/// `native_vision` wins; else what the vision probe established for that model
+/// id; else the name-based default (Kimi is the only family known by name).
+pub(crate) fn decide_native_vision(
+    profile_override: Option<bool>,
+    probed: Option<bool>,
+    candidate_model: &str,
+) -> bool {
+    if let Some(native) = profile_override {
+        return native;
+    }
+    if let Some(native) = probed {
+        return native;
+    }
+    candidate_model.to_ascii_lowercase().contains("kimi")
 }
 
 impl Gateway {
@@ -702,6 +789,11 @@ impl Gateway {
         };
         Self {
             config,
+            client_auth: crate::client_auth::ClientAuth::open(),
+            conversation_id_header: crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER
+                .to_string(),
+            operational_alias_profiles: BTreeMap::new(),
+            operational_unknown_model_policy: crate::control_plane::UnknownModelPolicy::Passthrough,
             replay_store,
             upstream,
             search,
@@ -712,19 +804,118 @@ impl Gateway {
             flow_store,
             abort_hub,
             dashboard_auth: None,
+            authz: Arc::new(crate::authz::AuthzService::default()),
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
+            provider_metrics: crate::provider_metrics::ProviderMetricsRegistry::default(),
+            fleet: None,
             // F1: disabled by default (zero overhead); the DI root attaches an
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
+            persistence_queue: None,
+            persistence_keep_media: true,
+            harness_detector: Arc::new(crate::harness::HarnessDetector::builtin()),
+            native_vision_cache: crate::vision_probe::NativeVisionCache::default(),
+            session_linker: Arc::new(crate::sessions::SessionLinker::new(true)),
+            session_hub: crate::session_hub::SessionHub::disabled(),
+            yaml_key_specs: Vec::new(),
+            client_auth_required: false,
+            users_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persistence_store: None,
+            mesh_admin: None,
+            managed_providers: None,
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
         }
+    }
+
+    /// Attach the hot-swappable virtual-key registry used by client-facing
+    /// `/v1/*` routes. Existing embedders remain open by default.
+    pub fn with_client_auth(mut self, client_auth: crate::client_auth::ClientAuth) -> Self {
+        self.client_auth = client_auth;
+        self
+    }
+
+    pub fn client_auth(&self) -> &crate::client_auth::ClientAuth {
+        &self.client_auth
+    }
+
+    pub fn with_conversation_id_header(mut self, header: impl Into<String>) -> Self {
+        let header = header.into();
+        let header = header.trim();
+        self.conversation_id_header = if header.is_empty() {
+            crate::control_plane::DEFAULT_CONVERSATION_ID_HEADER.to_string()
+        } else {
+            header.to_string()
+        };
+        self
+    }
+
+    pub fn conversation_id_header(&self) -> &str {
+        &self.conversation_id_header
+    }
+
+    pub fn with_operational_models(
+        mut self,
+        aliases: impl IntoIterator<Item = (String, String)>,
+        unknown_model_policy: crate::control_plane::UnknownModelPolicy,
+    ) -> Self {
+        self.operational_alias_profiles = aliases.into_iter().collect();
+        self.operational_unknown_model_policy = unknown_model_policy;
+        self.upstream.set_reject_unknown_models(
+            unknown_model_policy == crate::control_plane::UnknownModelPolicy::Reject,
+        );
+        self
+    }
+
+    pub fn validate_operational_model(&self, model: &str) -> Result<(), &'static str> {
+        if self.operational_unknown_model_policy != crate::control_plane::UnknownModelPolicy::Reject
+            || self
+                .operational_alias_profiles
+                .keys()
+                .any(|alias| alias.eq_ignore_ascii_case(model.trim()))
+            || self
+                .config
+                .model_profiles
+                .keys()
+                .any(|profile| profile.eq_ignore_ascii_case(model.trim()))
+            || self.config.matches_model_route(model)
+        {
+            Ok(())
+        } else {
+            Err("requested model is not configured")
+        }
+    }
+
+    /// Canonical configured alias for a case-insensitive client model match.
+    pub fn operational_alias<'a>(&'a self, model: &str) -> Option<&'a str> {
+        self.operational_alias_profiles
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(model.trim()))
+            .map(String::as_str)
+    }
+
+    fn operational_profile_for<'a>(&'a self, model: &'a str) -> &'a str {
+        self.operational_alias_profiles
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(model.trim()))
+            .map_or(model, |(_, profile)| profile.as_str())
+    }
+
+    pub fn roles_for_request(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<&crate::config::RolesConfig> {
+        self.config.resolve_roles_config_for_resolved_model(
+            self.operational_profile_for(request_model),
+            resolved_model,
+        )
     }
 
     /// E1: record one unknown-tool-call outcome into the bounded always-on
@@ -779,6 +970,27 @@ impl Gateway {
         &self.metrics
     }
 
+    pub fn with_provider_metrics(
+        mut self,
+        provider_metrics: crate::provider_metrics::ProviderMetricsRegistry,
+    ) -> Self {
+        self.provider_metrics = provider_metrics;
+        self
+    }
+
+    pub fn provider_metrics(&self) -> crate::provider_metrics::ProviderMetricsRegistry {
+        self.provider_metrics.clone()
+    }
+
+    pub fn with_fleet(mut self, fleet: Option<Arc<crate::dashboard_fleet::FleetClient>>) -> Self {
+        self.fleet = fleet;
+        self
+    }
+
+    pub fn fleet(&self) -> Option<Arc<crate::dashboard_fleet::FleetClient>> {
+        self.fleet.clone()
+    }
+
     /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in
     /// the DI root from `config.turn_capture_dir`). Consuming builder so it threads
     /// through the `Gateway::new(...)` → `Arc::new` construction WITHOUT widening the
@@ -794,6 +1006,141 @@ impl Gateway {
     /// no-op (no thread, no alloc, no fs). Independent of the debug UI.
     pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
         &self.turn_capture
+    }
+
+    /// Attach the bounded hot-path persistence writer. The queue's `try_*`
+    /// methods are the only persistence operations inference code may call.
+    pub fn with_persistence_queue(
+        mut self,
+        queue: crate::control_plane_store::PersistenceQueue,
+    ) -> Self {
+        self.persistence_queue = Some(queue);
+        self
+    }
+
+    pub fn persistence_queue(&self) -> Option<&crate::control_plane_store::PersistenceQueue> {
+        self.persistence_queue.as_ref()
+    }
+
+    pub fn persistence_enabled(&self) -> bool {
+        self.persistence_queue.is_some()
+    }
+
+    /// Whether image/data URIs survive into persisted request items.
+    pub fn with_persistence_keep_media(mut self, keep_media: bool) -> Self {
+        self.persistence_keep_media = keep_media;
+        self
+    }
+
+    pub fn persistence_keep_media(&self) -> bool {
+        self.persistence_keep_media
+    }
+
+    pub fn with_harness_detector(mut self, detector: Arc<crate::harness::HarnessDetector>) -> Self {
+        self.harness_detector = detector;
+        self
+    }
+
+    pub fn harness_detector(&self) -> &Arc<crate::harness::HarnessDetector> {
+        &self.harness_detector
+    }
+
+    /// The probed native-vision cache; the background prober writes into the
+    /// same shared handle.
+    pub fn native_vision_cache(&self) -> &crate::vision_probe::NativeVisionCache {
+        &self.native_vision_cache
+    }
+
+    pub fn with_session_linker(mut self, linker: Arc<crate::sessions::SessionLinker>) -> Self {
+        self.session_linker = linker;
+        self
+    }
+
+    pub fn session_linker(&self) -> &Arc<crate::sessions::SessionLinker> {
+        &self.session_linker
+    }
+
+    /// Attach the enabled [`SessionHub`](crate::session_hub::SessionHub) (built
+    /// in the `--with-debug-ui` DI branch). Mirrors `with_metrics`.
+    pub fn with_session_hub(mut self, hub: crate::session_hub::SessionHub) -> Self {
+        self.session_hub = hub;
+        self
+    }
+
+    /// Access the live-session hub. `is_enabled()` is `false` when the debug
+    /// UI is off, in which case every hub op is a no-op.
+    pub fn session_hub(&self) -> &crate::session_hub::SessionHub {
+        &self.session_hub
+    }
+
+    pub fn with_key_registry_source(
+        mut self,
+        yaml_key_specs: Vec<crate::client_auth::VirtualKeySpec>,
+        client_auth_required: bool,
+    ) -> Self {
+        self.yaml_key_specs = yaml_key_specs;
+        self.client_auth_required = client_auth_required;
+        self
+    }
+
+    pub fn yaml_key_specs(&self) -> &[crate::client_auth::VirtualKeySpec] {
+        &self.yaml_key_specs
+    }
+
+    pub fn client_auth_required(&self) -> bool {
+        self.client_auth_required
+    }
+
+    pub fn users_configured(&self) -> bool {
+        self.users_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_users_configured(&self, configured: bool) {
+        self.users_configured
+            .store(configured, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Attach the read/admin persistence handle. It is intentionally distinct
+    /// from the nonblocking writer queue and is never awaited by inference.
+    pub fn with_persistence_store(
+        mut self,
+        store: Arc<dyn crate::control_plane_store::PersistenceStore>,
+    ) -> Self {
+        self.persistence_store = Some(store);
+        self
+    }
+
+    pub(crate) fn with_mesh_admin(
+        mut self,
+        mesh_admin: Option<Arc<crate::mesh::controller::MeshAdmin>>,
+    ) -> Self {
+        self.mesh_admin = mesh_admin;
+        self
+    }
+
+    pub(crate) fn mesh_admin(&self) -> Option<Arc<crate::mesh::controller::MeshAdmin>> {
+        self.mesh_admin.clone()
+    }
+
+    pub(crate) fn with_managed_providers(
+        mut self,
+        managed_providers: Option<Arc<crate::managed_providers::ManagedProviderRegistry>>,
+    ) -> Self {
+        self.managed_providers = managed_providers;
+        self
+    }
+
+    pub fn managed_providers(
+        &self,
+    ) -> Option<Arc<crate::managed_providers::ManagedProviderRegistry>> {
+        self.managed_providers.clone()
+    }
+
+    pub fn persistence_store(
+        &self,
+    ) -> Option<Arc<dyn crate::control_plane_store::PersistenceStore>> {
+        self.persistence_store.clone()
     }
 
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3
@@ -833,19 +1180,89 @@ impl Gateway {
         // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
         // snapshot can never split the count and the tokens across two different 1 s
         // slots.
-        self.metrics.record_terminal(
+        self.metrics.record_terminal_with_phases(
             status,
             inputs.model_served.as_deref(),
             &inputs.endpoint,
             inputs.upstream.as_deref(),
             elapsed_ms,
             inputs.usage,
+            inputs.prefill_ms,
+            inputs.decode_ms,
             // Gap 12: the evict-safe per-attempt trace (spec 03) feeds the per-provider
             // latency/error rings off the SAME terminal payload as `usage` — NOT a
             // re-read of the evictable FlowStore record, so a failed primary on a flow
             // whose record was pruned/evicted before finalize is still counted.
             &inputs.attempts,
         );
+    }
+
+    /// Schedule durable per-key terminal accounting off the async runtime.
+    /// `auth_request_id` is the idempotency key, so a defensive duplicate
+    /// finalize attempt cannot double-charge the request.
+    fn record_authenticated_usage(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        serving: &crate::upstream::ServingToken,
+    ) {
+        let (route, provider) = serving.snapshot();
+        let (served_model, usage) = serving.metrics_snapshot();
+        self.record_authenticated_usage_values(
+            context,
+            api_call_id,
+            endpoint,
+            requested_model,
+            status,
+            served_model,
+            provider,
+            route,
+            usage,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_authenticated_usage_values(
+        &self,
+        context: Option<crate::authz::AuthContext>,
+        api_call_id: Option<String>,
+        endpoint: crate::upstream::InferenceEndpoint,
+        requested_model: String,
+        status: &'static str,
+        served_model: Option<String>,
+        provider: Option<String>,
+        route: Option<String>,
+        usage: Option<crate::dashboard_flow::FlowUsage>,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        let charge = usage.and_then(|usage| {
+            let price = served_model
+                .as_deref()
+                .and_then(|model| self.price_for(model))?;
+            let rates = crate::usage_accounting::UsageRates::from_model_price(price)?;
+            crate::usage_accounting::charge_for_usage(usage, rates)
+        });
+        let event = crate::usage_accounting::UsageEvent {
+            auth_request_id: context.auth_request_id.clone(),
+            api_call_id,
+            key_id: context.key_id.clone(),
+            principal_id: context.principal_id.clone(),
+            endpoint: inference_endpoint_name(endpoint).to_string(),
+            requested_model: Some(requested_model),
+            served_model,
+            provider,
+            route,
+            status: status.to_string(),
+            usage,
+            charge,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        context.record_usage(event);
     }
 
     /// Attach the D7 dashboard auth context (built from the environment in the
@@ -865,6 +1282,19 @@ impl Gateway {
     /// refused registration.
     pub fn dashboard_auth(&self) -> Option<Arc<crate::dashboard_auth::DashboardAuth>> {
         self.dashboard_auth.clone()
+    }
+
+    pub fn with_authz(mut self, authz: crate::authz::AuthzService) -> Self {
+        self.authz = Arc::new(authz);
+        self
+    }
+
+    pub fn authz(&self) -> &crate::authz::AuthzService {
+        &self.authz
+    }
+
+    pub fn authz_arc(&self) -> Arc<crate::authz::AuthzService> {
+        Arc::clone(&self.authz)
     }
 
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the
@@ -903,14 +1333,20 @@ impl Gateway {
     /// A thin pass-through to [`Config::price_for`] so the dashboard REST handlers
     /// + the flow-cost roll-up resolve prices without reaching into `config()`.
     pub fn price_for(&self, model: &str) -> Option<crate::config::ModelPrice> {
-        self.config.price_for(model)
+        self.config
+            .price_for(model)
+            .or_else(|| self.authz.effective_price(model))
     }
 
     /// D13: the whole per-model price table (`/dashboard/api/topology` returns it,
     /// the Sankey colors edges from it). A borrow of the `Config`-owned map; empty
     /// when none is configured (contract-valid — an empty `price_table` validates).
-    pub fn price_table(&self) -> &std::collections::HashMap<String, crate::config::ModelPrice> {
-        &self.config.price_table
+    pub fn price_table(&self) -> std::collections::HashMap<String, crate::config::ModelPrice> {
+        let mut prices = self.authz.effective_price_table();
+        // Persisted/YAML operator configuration is the final authority. Imported
+        // averages and dashboard-written values only fill otherwise-unpriced models.
+        prices.extend(self.config.price_table.clone());
+        prices
     }
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
@@ -967,7 +1403,9 @@ impl Gateway {
         // Publish an initial snapshot immediately so a consumer that reads before
         // the first tick still sees the current health (version 1), not the empty
         // default.
-        publisher.publish(upstream.provider_health());
+        let initial = upstream.provider_health();
+        let mut last_published = provider_health_fingerprint(&initial);
+        publisher.publish(initial);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -977,7 +1415,17 @@ impl Gateway {
                 // than the next 1 s tick, so an idle cooling→Healthy flip is
                 // published right at the deadline (not up to a second late).
                 let next_deadline = next_cooldown_wake(&health);
-                publisher.publish(health);
+                // Publish only a CHANGED vector. An unchanged republish bumped the
+                // topology version every second, so every dashboard viewer was
+                // re-sent an identical topology frame and every 5 s snapshot cut
+                // retained a fresh copy of it, on a box with no traffic at all.
+                // Compared by serialized form so a field added to
+                // `ProviderHealth` can never be silently ignored.
+                let fingerprint = provider_health_fingerprint(&health);
+                if fingerprint != last_published {
+                    last_published = fingerprint;
+                    publisher.publish(health);
+                }
                 match next_deadline {
                     Some(wake) if wake < std::time::Duration::from_secs(1) => {
                         // A tiny epsilon past the deadline so the recomputed status
@@ -1001,8 +1449,32 @@ impl Gateway {
     /// `native_vision` override attaches ONLY when the request genuinely maps to
     /// the served backend (G4 round-8 #1).
     pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
-        let configured_model = self.config.resolve_upstream_model(request_model);
+        // Operational aliases own their provider/model rewrite in the routing
+        // layer. Preserve the canonical alias until that layer sees it; applying
+        // the top-level `upstream_model` remap first would erase the alias and
+        // silently dispatch the request through the ordinary primary provider.
+        // Non-operational models retain the existing profile -> global -> request
+        // resolution order unchanged.
+        let configured_model = self
+            .operational_alias(request_model)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.resolve_upstream_model(request_model));
         self.normalize_upstream_model(&configured_model).await
+    }
+
+    pub async fn checked_resolve_request_model(
+        &self,
+        request_model: &str,
+    ) -> AppResult<(String, bool)> {
+        let resolved = self.resolve_request_model(request_model).await;
+        if self.operational_unknown_model_policy == crate::control_plane::UnknownModelPolicy::Reject
+            && !resolved.1
+        {
+            return Err(AppError::not_found(
+                "requested model is not currently routable",
+            ));
+        }
+        Ok(resolved)
     }
 
     pub fn subscribe_monitor(
@@ -1047,13 +1519,15 @@ impl Gateway {
         event: SseEvent,
         abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
-        let raw_event = event.clone();
+        // Only `--raw` needs the event after it is sent; cloning the JSON tree for
+        // every delta otherwise doubled the per-token allocation work.
+        let raw_event = self.raw_output.as_ref().map(|_| event.clone());
         tokio::select! {
             biased;
             _ = abort_token.cancelled() => return Err(AppError::cancelled()),
             result = tx.send(event) => result.map_err(|_| AppError::cancelled())?,
         }
-        if let Some(raw_output) = &self.raw_output {
+        if let (Some(raw_output), Some(raw_event)) = (&self.raw_output, raw_event) {
             raw_output
                 .write_sse_event(&raw_event)
                 .map_err(|err| AppError::internal(format!("failed to write raw output: {err}")))?;
@@ -1156,9 +1630,9 @@ impl Gateway {
     /// Public entry point: stream a canonical Responses request. Thin wrapper that
     /// delegates to [`stream_responses_with_api_call_id`](Self::stream_responses_with_api_call_id)
     /// with no `api_call_id`, so existing callers (tests, non-instrumented paths)
-    /// keep this exact signature. The HTTP handlers pass the `api_call_id` from the
-    /// request extension via the `_with_api_call_id` variant so the engine can
-    /// `flow_store.link(response_id, api_call_id)` (D1).
+    /// keep this exact signature. Direct callers may use `_with_api_call_id` for
+    /// dashboard telemetry; durable persistence is armed only by HTTP's explicit
+    /// crate-private capture capability after its begin + inbound-event seam.
     pub async fn stream_responses(
         self: Arc<Self>,
         request: ResponsesRequest,
@@ -1171,11 +1645,124 @@ impl Gateway {
         request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture(request, api_call_id, None)
+            .await
+    }
+
+    pub(crate) async fn stream_responses_with_capture(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            persistence_capture,
+            crate::upstream::AuthorizationScope::unrestricted(),
+            crate::upstream::InferenceEndpoint::Responses,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Stream a canonical request while retaining the ingress authorization
+    /// scope through every tool-loop turn and backend rebuild. HTTP ingress uses
+    /// this entry point after authentication; internal and legacy callers keep
+    /// the unrestricted wrapper above.
+    pub async fn stream_responses_authorized(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            None,
+            authorization,
+            endpoint,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Authenticated HTTP ingress additionally supplies the identity used for
+    /// exactly-once terminal usage accounting. Keeping the context separate
+    /// from the candidate predicate ensures the raw credential is never retained.
+    pub async fn stream_responses_authorized_with_context(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        auth_context: Option<crate::authz::AuthContext>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_capture_authorized_context(
+            request,
+            api_call_id,
+            None,
+            authorization,
+            endpoint,
+            auth_context,
+            None,
+        )
+        .await
+    }
+
+    // Each capability has an independent gate; keep identity separate from
+    // payload retention so sticky routing also works without diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_responses_with_capture_authorized_context(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        auth_context: Option<crate::authz::AuthContext>,
+        affinity: Option<crate::upstream::RequestAffinity>,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
         // `{route, provider}` on it, and the guard reads that pair at finalize.
         let serving_token = Arc::new(crate::upstream::ServingToken::default());
+        // Durable persistence has its OWN request-scoped terminal guard. An explicit
+        // `PersistenceCapture` is the capability proving HTTP already enqueued Begin
+        // and fixed-seq inbound event 1. Never synthesize it from an arbitrary
+        // `api_call_id`: direct engine/dashboard callers must not create orphan event
+        // or terminal rows. Persistence-only production still works because HTTP
+        // passes this capability independently of the debug FlowStore.
+        let persistence_guard = api_call_id
+            .as_ref()
+            .zip(self.persistence_queue.as_ref())
+            .zip(persistence_capture)
+            .map(|((id, queue), capture)| {
+                debug_assert_eq!(capture.api_call_id(), id);
+                crate::flow_persistence::PersistenceTerminalGuard::new(
+                    queue.clone(),
+                    id.clone(),
+                    Arc::clone(&serving_token),
+                    capture,
+                )
+                .with_session_hub_when_enabled(&self.session_hub)
+            });
+        let persistence_phases = persistence_guard
+            .as_ref()
+            .map(crate::flow_persistence::PersistenceTerminalGuard::phases);
+        let persistence_capture = persistence_guard
+            .as_ref()
+            .map(crate::flow_persistence::PersistenceTerminalGuard::capture);
+        // Mint the response id before any fallible pre-spawn work so even a
+        // validation/lowering failure can durably join it to the HTTP api_call_id.
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        if let Some(guard) = &persistence_guard {
+            guard.set_response_id(&response_id);
+        }
         // D3 L1: claim the flow record (`OpenL0 → ClaimedL1`) BEFORE any pre-spawn
         // early return. A lowering/budget failure below finalizes the record
         // explicitly `Failed` (via `finalize_pre_spawn_err`) so it carries the right
@@ -1223,20 +1810,14 @@ impl Gateway {
         // model the leaf records as `model_served`. Stamped onto the record via
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
-        let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
+        let (resolved_model, request_genuine) =
+            self.checked_resolve_request_model(&request.model).await?;
         // F1c: stamp the resolved/served model onto the capture outcome metadata now
         // that resolution has settled (absent for a turn that fails before here).
         if let Some(guard) = &capture_guard {
             guard.set_model_served(&resolved_model);
         }
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
-
-        // D1/E2b: minted here rather than just before the `tokio::spawn` below
-        // (its only prior use) so the E2b residual-image-degrade monitor
-        // emission further down can key off the SAME id every other event for
-        // this turn uses. Pure reordering: nothing between here and the spawn
-        // reads or depends on this value.
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
 
         // G4/E2b: the resolved-backend native-vision decision, computed ONCE
         // and shared between G4 gating (`activate_image_agent`, which used to
@@ -1266,10 +1847,11 @@ impl Gateway {
         // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
         // finalize-then-return on the `?` paths without duplicating the guard plumbing.
         let finalize_pre_spawn_err = |err: AppError| -> AppError {
+            let error_detail = err.to_string();
             if let Some(guard) = &telemetry_guard {
                 guard.finalize(
                     crate::dashboard_flow::FlowStatus::Failed,
-                    Some(err.to_string()),
+                    Some(error_detail.clone()),
                 );
                 // D5: record the terminal into the metrics rings at the SAME seam as
                 // the finalize (co-located so a pre-spawn failure is counted exactly
@@ -1282,14 +1864,29 @@ impl Gateway {
                     guard.elapsed().as_millis(),
                 );
             }
+            if let Some(guard) = &persistence_guard {
+                guard.finalize(
+                    crate::flow_persistence::PersistenceOutcome::Failed,
+                    Some(err.code.as_deref().unwrap_or("gateway_error")),
+                    Some(&err.client_message),
+                );
+            }
             // F1c: a pre-spawn failure (bad request / lowering / budget) is always
             // `failed`. Record it on the capture guard so the artifact carries the
             // terminal reason; the served side is the error body the handler returns
             // (teed by the HTTP layer), so the both-`done` barrier still resolves and
             // writes a `status:"failed"` artifact — never a hang (AC-7). Idempotent.
             if let Some(guard) = &capture_guard {
-                guard.finalize("failed", Some(&err.to_string()));
+                guard.finalize("failed", Some(&error_detail));
             }
+            self.record_authenticated_usage(
+                auth_context.clone(),
+                api_call_id.clone(),
+                endpoint,
+                model_requested.clone(),
+                "failed",
+                &serving_token,
+            );
             err
         };
 
@@ -1350,8 +1947,16 @@ impl Gateway {
             .find_replay_baseline(&request)
             .await
             .map_err(&finalize_pre_spawn_err)?;
+        let replay_prefix_len = baseline_record
+            .as_ref()
+            .map(|record| record.internal_messages.len())
+            .unwrap_or(0);
+        // Clone only the unreplayed input, rather than copying every inline
+        // image into a full request clone and immediately discarding that copy.
+        let input = std::mem::take(&mut request.input);
         let mut tail_request = request.clone();
-        tail_request.input = request.input[prefix_len..].to_vec();
+        tail_request.input = input[prefix_len..].to_vec();
+        request.input = input;
         if self.config.brave_api_key.is_none() {
             let original_tool_count = tail_request.tools.len();
             tail_request
@@ -1381,12 +1986,18 @@ impl Gateway {
         // was threaded (the public wrapper / non-instrumented paths). Done after the
         // pre-spawn `?` paths above could have early-returned, but BEFORE lowering so
         // it reflects exactly what the engine hands to `lower_request_with_image_agent`.
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_normalization_done();
+        }
         if self.flow_store().is_enabled()
             && let Some(api_call_id) = api_call_id.as_deref()
         {
             let normalized = crate::dashboard_flow::capture_body_from_value(&request);
-            self.flow_store()
-                .set_normalized(api_call_id, Some(model_requested), Some(normalized));
+            self.flow_store().set_normalized(
+                api_call_id,
+                Some(model_requested.clone()),
+                Some(normalized),
+            );
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid
@@ -1397,19 +2008,17 @@ impl Gateway {
         // a side-effect-free read, so computing them here is safe. Pass the image
         // agent flag so an injected/caller `analyzeImage` tool lowers as the
         // server-side ImageAnalysis kind (run by the gateway) on active turns.
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
+        let roles = self.roles_for_request(&request.model, &resolved_model);
         let lowered = lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
-                .as_ref()
-                .map(|record| record.internal_messages.clone())
+                .map(|record| record.internal_messages)
                 .unwrap_or_default(),
             vision_session.is_some(),
             roles,
         )
         .map_err(&finalize_pre_spawn_err)?;
+        drop(tail_request);
 
         // G3 pre-flight context budgeting (T9: candidate-set seam). Estimate
         // over the LOWERED upstream payload (`lowered.messages`/`tools`/scalars)
@@ -1457,7 +2066,7 @@ impl Gateway {
         // could not be resolved) and whose egress never reads the field
         // (Chat/Responses egress convert/strip it away -- see
         // `http.rs::responses_wire_event_data`, CR1.1). We cannot skip the
-        // compute for that combination: `stream_responses_with_api_call_id` is
+        // compute for that combination: `stream_responses_with_capture` is
         // the single funnel for all three egress surfaces (Anthropic/Chat/
         // Responses) and has no visibility into which one the caller
         // (`http.rs`, one layer up) will use to drain the returned stream --
@@ -1504,15 +2113,19 @@ impl Gateway {
         if let Some(api_call_id) = api_call_id.as_deref() {
             self.flow_store().stamp_routing_decision(api_call_id);
         }
-        // Chat-message length of the replayed prefix (the baseline handed to
-        // lowering above). Threaded into `run_turn` so its pre-send adjacency
-        // merge is tail-scoped and never rewrites the cache-stable prefix.
-        let replay_prefix_len = baseline_record
-            .as_ref()
-            .map(|record| record.internal_messages.len())
-            .unwrap_or(0);
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_routing_decision();
+        }
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
+        let accounting_context = auth_context.clone();
+        let capture_payloads = auth_context
+            .as_ref()
+            .map(crate::authz::AuthContext::capture_payloads)
+            .unwrap_or(true);
+        let accounting_api_call_id = api_call_id.clone();
+        let accounting_requested_model = model_requested.clone();
+        let accounting_serving_token = Arc::clone(&serving_token);
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(
@@ -1536,6 +2149,16 @@ impl Gateway {
                     // read by the guard at finalize) threaded onto every per-turn
                     // `BackendChatRequest`.
                     serving_token,
+                    // Durable timing is request-owned and survives a disabled/evicted
+                    // dashboard FlowStore. `None` when persistence is off.
+                    persistence_phases,
+                    // Bounded four-hop state shared with the concrete upstream
+                    // leaves. It is independent of disk turn capture.
+                    persistence_capture,
+                    capture_payloads,
+                    authorization,
+                    endpoint,
+                    affinity,
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
@@ -1569,6 +2192,20 @@ impl Gateway {
                 ),
                 Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
             };
+            let accounting_status = match status {
+                crate::dashboard_flow::FlowStatus::Completed => "completed",
+                crate::dashboard_flow::FlowStatus::Cancelled => "cancelled",
+                crate::dashboard_flow::FlowStatus::Failed => "failed",
+                crate::dashboard_flow::FlowStatus::Open => "failed",
+            };
+            gateway.record_authenticated_usage(
+                accounting_context,
+                accounting_api_call_id,
+                endpoint,
+                accounting_requested_model,
+                accounting_status,
+                &accounting_serving_token,
+            );
             if let Some(guard) = &telemetry_guard {
                 guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
@@ -1577,6 +2214,53 @@ impl Gateway {
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+            }
+            // Durable terminal persistence shares this single typed-result choke
+            // point but does not depend on the dashboard guard. The request-owned
+            // guard atomically claims finalization, snapshots the ServingToken
+            // (usage + ordered attempts + wire TTFB), and calls only `try_finish`.
+            // Thus persistence-only production works with FlowStore disabled and
+            // cannot block or duplicate a terminal update.
+            if let Some(guard) = &persistence_guard {
+                match &result {
+                    Ok(TurnCompletion::Completed) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Completed,
+                            Some("response.completed"),
+                            None,
+                        );
+                    }
+                    Ok(TurnCompletion::Incomplete) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Incomplete,
+                            Some("response.incomplete"),
+                            None,
+                        );
+                    }
+                    Err(err) if err.is_cancelled() => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Cancelled,
+                            Some("client_disconnected"),
+                            Some(&err.client_message),
+                        );
+                    }
+                    Err(err) => {
+                        guard.finalize(
+                            crate::flow_persistence::PersistenceOutcome::Failed,
+                            Some(err.code.as_deref().unwrap_or("gateway_error")),
+                            Some(&err.client_message),
+                        );
+                    }
+                }
+            }
+            // Publish the successful terminal status only AFTER the authoritative
+            // FlowStore record has finalized. Dashboard WS enrichment resolves this
+            // monitor event back to the record; emitting inside `run_turn` raced the
+            // finalize above and could permanently publish a stale `open` status.
+            if status == crate::dashboard_flow::FlowStatus::Completed {
+                gateway
+                    .monitor
+                    .emit(response_id.clone(), MonitorEventKind::Completed);
             }
             // F1c: report the SAME engine terminal to the capture guard (status +
             // reason come from the engine seam ONLY, never the served tee). Idempotent
@@ -1632,10 +2316,10 @@ impl Gateway {
         mut request: ResponsesRequest,
         resolved_model: &str,
     ) -> ResponsesRequest {
-        let Some(prefix) = self
-            .config
-            .resolve_system_prompt_prefix_for_resolved_model(&request.model, resolved_model)
-        else {
+        let Some(prefix) = self.config.resolve_system_prompt_prefix_for_resolved_model(
+            self.operational_profile_for(&request.model),
+            resolved_model,
+        ) else {
             return request;
         };
         request.instructions = if request.instructions.is_empty() {
@@ -1781,10 +2465,11 @@ impl Gateway {
     /// name sniff (Kimi). The request model's profile is NOT consulted (round-3
     /// #2). Unknown ⇒ not native.
     fn candidate_is_native_vision(&self, candidate_model: &str) -> bool {
-        if let Some(native) = self.config.profile_native_vision(candidate_model) {
-            return native;
-        }
-        candidate_model.to_ascii_lowercase().contains("kimi")
+        decide_native_vision(
+            self.config.profile_native_vision(candidate_model),
+            self.native_vision_cache.lookup(candidate_model),
+            candidate_model,
+        )
     }
 
     async fn find_replay_baseline(
@@ -1809,7 +2494,7 @@ impl Gateway {
     async fn run_turn(
         &self,
         response_id: String,
-        request: ResponsesRequest,
+        mut request: ResponsesRequest,
         mut current_messages: Vec<ChatMessage>,
         // Length of the replayed prefix carried over from a prior turn. Role
         // shaping + adjacency merges apply ONLY to the tail
@@ -1822,7 +2507,7 @@ impl Gateway {
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
         // C3: the pre-spawn G3 estimate (`estimate_input_tokens`) for THIS turn's
-        // lowered payload, computed once by the caller (`stream_responses_with_api_call_id`).
+        // lowered payload, computed once by the caller (`stream_responses_with_capture`).
         // Stamped onto `response.created` (`created_event`, below) so the Anthropic
         // streaming converter can seed a non-zero `message_start.usage.input_tokens`
         // instead of a hardcoded `0` — see that fn's doc comment for why the REAL
@@ -1839,13 +2524,26 @@ impl Gateway {
         // fires at the RequestStarted seam below.
         api_call_id: Option<String>,
         // D2/D3: the flow's shared serving token (allocated once in
-        // `stream_responses_with_api_call_id`, tagged by routing/failover) threaded
+        // `stream_responses_with_capture`, tagged by routing/failover) threaded
         // onto every per-turn `BackendChatRequest`. The D3 L1 telemetry guard stays
         // in the spawn closure (the single finalize choke point) rather than here, so
         // the terminal status is classified from `run_turn`'s typed `Result`
         // (cancelled vs failed vs completed) and the guard's `Drop` still covers a
         // panic inside this function (it unwinds through the closure).
         serving_token: Arc<crate::upstream::ServingToken>,
+        // Request-owned durable phase clock. Independent of the bounded dashboard
+        // FlowStore so persistence-only production records true client TTFT.
+        persistence_phases: Option<crate::flow_persistence::PersistencePhaseClock>,
+        persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+        // Per-key payload-retention policy. Metadata telemetry remains active when
+        // false, but no request or response body may enter an observability sink.
+        capture_payloads: bool,
+        // Request-local authorization is immutable and reused for every turn in
+        // the server-tool loop. Provider/route selection still occurs downstream,
+        // where candidates are checked before dispatch or capacity mutation.
+        authorization: crate::upstream::AuthorizationScope,
+        endpoint: crate::upstream::InferenceEndpoint,
+        affinity: Option<crate::upstream::RequestAffinity>,
         tx: mpsc::Sender<SseEvent>,
         // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
         // under `api_call_id`). COMPOSED with — never a replacement for — every existing
@@ -2148,7 +2846,7 @@ impl Gateway {
         self.send_event(&tx, in_progress_event(&response_id), &abort_token)
             .await?;
 
-        let mut public_history = request.input.clone();
+        let mut public_history = std::mem::take(&mut request.input);
         let mut response_output = Vec::new();
         let mut event_state = ResponseEventState::default();
 
@@ -2194,7 +2892,7 @@ impl Gateway {
             .and_then(Value::as_object)
             .cloned();
         // D2: the FRESH per-flow serving token is now allocated in
-        // `stream_responses_with_api_call_id` (so the D3 L1 guard built pre-spawn
+        // `stream_responses_with_capture` (so the D3 L1 guard built pre-spawn
         // shares the SAME `Arc`) and threaded in. The routing layer fills `route`,
         // the failover layer fills `provider`; because it is per-flow, concurrent
         // flows never overwrite each other's `{route, provider}` (the rev2
@@ -2243,9 +2941,7 @@ impl Gateway {
         // initial lowering used (`resolve_roles_config_for_resolved_model`,
         // pre-spawn). Drives the pre-send adjacency merge + repair-note shaping
         // below. `None` for a model with no `roles` profile (legacy passthrough).
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &upstream_model);
+        let roles = self.roles_for_request(&request.model, &upstream_model);
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2253,6 +2949,7 @@ impl Gateway {
                 return Err(AppError::cancelled());
             }
             upstream_request_index += 1;
+            accumulated_usage.record_upstream_turn_started();
             // Idempotent, tail-scoped role-adjacency normalization before EVERY
             // upstream send: fold any repair-injected same-role run (e.g. a
             // rewritten `developer` note) into its neighbor. Scoped to the tail
@@ -2301,10 +2998,14 @@ impl Gateway {
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
             )
+            .with_authorization(authorization.clone(), endpoint)
+            .with_affinity(affinity.clone())
             .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
-            .with_capture(capture.clone());
+            .with_capture(capture.clone())
+            .with_persistence_capture(persistence_capture.clone())
+            .with_payload_capture(capture_payloads);
             let stream_result = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
@@ -2408,7 +3109,13 @@ impl Gateway {
                 }
             });
             let mut stream = stream_result?;
-            let mut state = StreamState::default();
+            // Tool-call repairs are per BACKEND MODEL (the model the provider
+            // actually answers as), the same lookup the vision gate uses.
+            let mut state = StreamState::with_tool_call_repairs(
+                self.config
+                    .profile_tool_call_repairs(&upstream_model)
+                    .to_vec(),
+            );
             let mut turn_usage: Option<ChunkUsage> = None;
             // D3: the flow's cumulative usage BEFORE this turn. OpenAI usage chunks
             // are cumulative WITHIN a turn, so the record's running total is
@@ -2441,7 +3148,8 @@ impl Gateway {
                     // production hot path — no `api_call_id` threaded AND the monitor
                     // disabled — keeping `MonitorHub::disabled()` truly zero-overhead.
                     // Borrow `usage` here; it is MOVED into `turn_usage` below.
-                    if api_call_id.is_some() || self.monitor.is_enabled() {
+                    if api_call_id.is_some() || self.monitor.is_enabled() || self.authz.is_enabled()
+                    {
                         // `total` is the flow's running cumulative (turn_base + this
                         // cumulative chunk), NOT an increment — so a multi-chunk turn
                         // does not double-count and a midstream cancel keeps this LAST
@@ -2454,6 +3162,11 @@ impl Gateway {
                             // final usage into the metrics layer even if the FlowStore
                             // record is pruned/evicted before finalize. Same dashboard-only
                             // path as `record_usage`, so the disabled path stays zero-cost.
+                            serving_token.set_usage(total);
+                        } else if self.authz.is_enabled() {
+                            // Auth accounting is independent of the debug UI. Keep
+                            // the cumulative total on the shared terminal token even
+                            // when no FlowStore/api_call_id exists.
                             serving_token.set_usage(total);
                         }
                         // D3: emit the usage event to the monitor hub. The `/debug/ws`
@@ -2528,7 +3241,12 @@ impl Gateway {
                             // on an `api_call_id` so the production hot path (no dashboard)
                             // skips even the disabled-store early-return's call overhead.
                             if let Some(api_call_id) = &api_call_id {
-                                self.flow_store().stamp_first_content_delta(api_call_id);
+                                let stamped =
+                                    self.flow_store().stamp_first_content_delta(api_call_id);
+                                serving_token.stamp_first_content_delta(stamped);
+                            }
+                            if let Some(phases) = &persistence_phases {
+                                phases.stamp_first_content_delta();
                             }
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
@@ -3001,9 +3719,12 @@ impl Gateway {
         // hot path skips the call. The `?`s above mean we only reach here on a clean
         // emit, which is exactly the semantics we want.
         if let Some(api_call_id) = &api_call_id {
-            self.flow_store().stamp_stream_end(api_call_id);
+            let stamped = self.flow_store().stamp_stream_end(api_call_id);
+            serving_token.stamp_stream_end(stamped);
         }
-        self.monitor.emit(response_id, MonitorEventKind::Completed);
+        if let Some(phases) = &persistence_phases {
+            phases.stamp_stream_end();
+        }
         // F1c (finding #3): carry the terminal shape to the seam so the capture
         // artifact records `incomplete` for a max-token truncation. `is_incomplete`
         // was already derived above from the upstream `finish_reason` (the same bit
@@ -3062,7 +3783,12 @@ impl Gateway {
             }
             return (exact, true);
         }
-        if self.config.matches_model_route(model) {
+        if self.config.matches_model_route(model)
+            || self
+                .operational_alias_profiles
+                .keys()
+                .any(|alias| alias.eq_ignore_ascii_case(model.trim()))
+        {
             // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
             // the route match + upstream-model rewrite. A route match is genuine.
             return (model.to_string(), true);
@@ -3076,6 +3802,11 @@ impl Gateway {
                 );
             }
             return (canonical, true);
+        }
+        if let Some(registry) = &self.managed_providers
+            && registry.disabled_model_blocks_default(model).await
+        {
+            return (model.to_string(), true);
         }
         // No exact id, ad-hoc route, or canonical-key match: fall back to the
         // first catalog model (claude-relay parity). A NON-BLANK requested model
@@ -3138,7 +3869,7 @@ impl Gateway {
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < self.upstream.model_catalog_cache_ttl()
         {
             return Ok(cached.catalog.clone());
         }
@@ -4406,12 +5137,39 @@ mod tests {
     use crate::models::chat::ChunkUsage;
 
     #[test]
+    fn native_vision_decision_prefers_profile_then_probe_then_name() {
+        // Explicit profile override wins over everything.
+        assert!(!super::decide_native_vision(
+            Some(false),
+            Some(true),
+            "kimi-vl"
+        ));
+        assert!(super::decide_native_vision(
+            Some(true),
+            Some(false),
+            "text-model"
+        ));
+        // Probe result decides when no override is configured.
+        assert!(super::decide_native_vision(
+            None,
+            Some(true),
+            "GLM-5.3-Flash-NVFP4"
+        ));
+        assert!(!super::decide_native_vision(None, Some(false), "kimi-k2"));
+        // Nothing known: the name-based default.
+        assert!(super::decide_native_vision(None, None, "kimi-k2"));
+        assert!(!super::decide_native_vision(None, None, "GLM-5.2-NVFP4"));
+    }
+
+    #[test]
     fn accumulated_usage_cached_tokens() {
         let mut usage = AccumulatedUsage::default();
         usage.add(ChunkUsage {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: Some(crate::models::chat::PromptTokensDetails {
                 cached_tokens: 50,
@@ -4430,6 +5188,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: None,
             prompt_tokens_details: None,
             completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
@@ -4448,6 +5208,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: Some(30),
             prompt_tokens_details: None,
             completion_tokens_details: None,
@@ -4464,6 +5226,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            cost: None,
+            cost_details: None,
             reasoning_tokens: Some(10),
             prompt_tokens_details: None,
             completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
@@ -4472,6 +5236,101 @@ mod tests {
         });
         let result = usage.into_response_usage().unwrap();
         assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_sums_complete_openrouter_costs() {
+        let mut usage = AccumulatedUsage::default();
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cost: Some(0.01),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.008 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 200,
+            completion_tokens: 30,
+            total_tokens: 230,
+            cost: Some(0.02),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.015 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.cost, Some(0.03));
+        assert_eq!(result.cost_source.as_deref(), Some("openrouter"));
+        assert_eq!(
+            result.cost_details.unwrap()["upstream_requests"]
+                .as_array()
+                .expect("aggregated cost details")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn accumulated_usage_omits_partial_or_invalid_provider_cost() {
+        let mut missing_round = AccumulatedUsage::default();
+        missing_round.record_upstream_turn_started();
+        missing_round.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cost: Some(0.01),
+            cost_details: None,
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        missing_round.record_upstream_turn_started();
+        let result = missing_round.into_response_usage().unwrap();
+        assert_eq!(result.cost, None);
+        assert_eq!(result.cost_source, None);
+
+        let mut invalid = AccumulatedUsage::default();
+        invalid.record_upstream_turn_started();
+        invalid.add(ChunkUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost: Some(f64::NAN),
+            cost_details: None,
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        let result = invalid.into_response_usage().unwrap();
+        assert_eq!(result.cost, None);
+        assert_eq!(result.cost_source, None);
+    }
+
+    #[test]
+    fn accumulated_usage_preserves_explicit_zero_cost() {
+        let mut usage = AccumulatedUsage::default();
+        usage.record_upstream_turn_started();
+        usage.add(ChunkUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost: Some(0.0),
+            cost_details: Some(serde_json::json!({ "upstream_inference_cost": 0.0 })),
+            reasoning_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.cost, Some(0.0));
+        assert_eq!(result.cost_source.as_deref(), Some("openrouter"));
     }
 
     #[test]
@@ -4833,6 +5692,10 @@ struct AccumulatedUsage {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+    provider_cost: f64,
+    upstream_turns: usize,
+    provider_cost_turns: usize,
+    provider_cost_details: Vec<serde_json::Value>,
     /// Cache-read prompt tokens, or `None` until a chunk REPORTS a cached breakdown
     /// (gap 07): an upstream that never sends `prompt_tokens_details` leaves this
     /// `None` (UNAVAILABLE), distinct from a reported `Some(0)`. Once any chunk
@@ -4855,10 +5718,21 @@ fn accumulate_optional(slot: &mut Option<i64>, reported: Option<i64>) {
 }
 
 impl AccumulatedUsage {
+    fn record_upstream_turn_started(&mut self) {
+        self.upstream_turns += 1;
+    }
+
     fn add(&mut self, usage: ChunkUsage) {
         self.input_tokens += usage.prompt_tokens;
         self.output_tokens += usage.completion_tokens;
         self.total_tokens += usage.total_tokens;
+        if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+            self.provider_cost += cost;
+            self.provider_cost_turns += 1;
+            if let Some(details) = usage.cost_details {
+                self.provider_cost_details.push(details);
+            }
+        }
         accumulate_optional(
             &mut self.cached_input_tokens,
             usage.prompt_tokens_details.map(|d| d.cached_tokens),
@@ -4886,13 +5760,27 @@ impl AccumulatedUsage {
     }
 
     fn into_response_usage(self) -> Option<ResponseUsage> {
-        if self.total_tokens == 0 {
+        let has_complete_provider_cost =
+            self.upstream_turns > 0 && self.provider_cost_turns == self.upstream_turns;
+        if self.total_tokens == 0 && !has_complete_provider_cost {
             return None;
         }
+        let cost_details = if has_complete_provider_cost {
+            match self.provider_cost_details.as_slice() {
+                [] => None,
+                [details] => Some(details.clone()),
+                details => Some(serde_json::json!({ "upstream_requests": details })),
+            }
+        } else {
+            None
+        };
         Some(ResponseUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
+            cost: has_complete_provider_cost.then_some(self.provider_cost),
+            cost_source: has_complete_provider_cost.then_some("openrouter".to_string()),
+            cost_details,
             // The CLIENT-facing canonical `ResponseUsage` keeps its integer-only shape
             // (gap 07's UNAVAILABLE distinction is a dashboard concern, not a client
             // contract change): an unreported cached/reasoning class projects to `0` here.

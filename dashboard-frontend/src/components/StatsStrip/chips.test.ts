@@ -10,9 +10,12 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
     samples,
     usage_samples: samples,
+    prefill_samples: samples,
+    decode_samples: samples,
     priced_samples: samples,
     cost_confidence: 'estimated',
     ...over,
@@ -26,13 +29,24 @@ describe('chips', () => {
   });
 
   it('formats values (rate/ms/pct/tokens/money)', () => {
-    const chips = deriveChips(win({ reqs_per_sec: 4.2, p95: 920, error_pct: 1.1, tokens_per_sec: 1500, cost_per_min: 0.21 }), null);
+    const chips = deriveChips(win({ reqs_per_sec: 4.2, p95: 920, error_pct: 1.1, prefill_tokens_per_sec: 1500, decode_tokens_per_sec: 142.35, cost_per_min: 0.21 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
     expect(byKey.reqs_per_sec).toBe('4.2');
     expect(byKey.p95).toBe('920');
     expect(byKey.error_pct).toBe('1.1');
-    expect(byKey.tokens_per_sec).toBe('1.5k'); // fmtTokens compaction
+    expect(byKey.prefill_tokens_per_sec).toBe('1.5k');
+    expect(byKey.decode_tokens_per_sec).toBe('142.35');
     expect(byKey.cost_per_min).toBe('0.21');
+  });
+
+  it('caps tok/s at two decimal places without padding trailing zeroes', () => {
+    const precise = deriveChips(win({ decode_tokens_per_sec: 142.345 }), null)
+      .find((c) => c.key === 'decode_tokens_per_sec')!;
+    const compact = deriveChips(win({ prefill_tokens_per_sec: 1_500.123 }), null)
+      .find((c) => c.key === 'prefill_tokens_per_sec')!;
+
+    expect(precise.value).toBe('142.35');
+    expect(compact.value).toBe('1.5k');
   });
 
   it('renders "—" for every chip when there is no sample', () => {
@@ -75,7 +89,8 @@ describe('chips', () => {
     expect(byKey.p50).toBe('—');
     expect(byKey.p95).toBe('—');
     expect(byKey.p99).toBe('—');
-    expect(byKey.tokens_per_sec).toBe('—');
+    expect(byKey.prefill_tokens_per_sec).toBe('—');
+    expect(byKey.decode_tokens_per_sec).toBe('—');
     expect(byKey.cost_per_min).toBe('—');
     // req/s + active_streams are NOT sample-derived → they show real values.
     expect(byKey.reqs_per_sec).toBe('2.5');
@@ -105,23 +120,25 @@ describe('chips', () => {
   });
 
   // Gap 01 finding 3 — per-metric availability denominators diverge.
-  it('renders tok/s + $/min as "—" when usage was not reported, even though latency IS measured', () => {
+  it('renders phase tok/s + $/min as "—" without phase/usage samples, even though latency IS measured', () => {
     // samples 12 (latency measured) but usage_samples 0 (no flow reported tokens) and so
     // priced_samples 0 too. Latency/err% are real; tok/s + $/min are unmeasurable → "—".
-    const chips = deriveChips(win({ samples: 12, usage_samples: 0, priced_samples: 0, p50: 200, tokens_per_sec: 0, cost_per_min: 0 }), null);
+    const chips = deriveChips(win({ samples: 12, usage_samples: 0, prefill_samples: 0, decode_samples: 0, priced_samples: 0, p50: 200, prefill_tokens_per_sec: 0, decode_tokens_per_sec: 0, cost_per_min: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
     expect(byKey.p50).toBe('200'); // latency measured (samples > 0)
     expect(byKey.error_pct).toBe('1.1');
-    expect(byKey.tokens_per_sec).toBe('—'); // no usage sample → unmeasurable
+    expect(byKey.prefill_tokens_per_sec).toBe('—');
+    expect(byKey.decode_tokens_per_sec).toBe('—');
     expect(byKey.cost_per_min).toBe('—'); // no priced usage sample → unmeasurable
   });
 
-  it('renders $/min as "—" when usage WAS reported but on an unpriced model (tok/s stays numeric)', () => {
+  it('renders $/min as "—" for an unpriced model while phase speeds stay numeric', () => {
     // usage_samples 8 (tok/s measurable) but priced_samples 0 (only unpriced models) →
     // $/min is unmeasurable ("—"), distinct from a genuine $0.00. tok/s renders normally.
-    const chips = deriveChips(win({ samples: 8, usage_samples: 8, priced_samples: 0, tokens_per_sec: 142, cost_per_min: 0 }), null);
+    const chips = deriveChips(win({ samples: 8, usage_samples: 8, prefill_samples: 8, decode_samples: 8, priced_samples: 0, cost_per_min: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
-    expect(byKey.tokens_per_sec).toBe('142'); // usage present → measurable
+    expect(byKey.prefill_tokens_per_sec).toBe('10k');
+    expect(byKey.decode_tokens_per_sec).toBe('78.34');
     expect(byKey.cost_per_min).toBe('—'); // no priced sample → unavailable, not $0.00
   });
 
@@ -135,7 +152,8 @@ describe('chips', () => {
     expect(byKey.p50).toBe('derived');
     expect(byKey.p95).toBe('derived');
     expect(byKey.p99).toBe('derived');
-    expect(byKey.tokens_per_sec).toBe('derived');
+    expect(byKey.prefill_tokens_per_sec).toBe('derived');
+    expect(byKey.decode_tokens_per_sec).toBe('derived');
     expect(byKey.cost_per_min).toBe('estimated'); // priced → estimated, surfaced as such
   });
 
@@ -147,14 +165,16 @@ describe('chips', () => {
     expect(byKey.active_streams).toBe('measured');
     expect(byKey.error_pct).toBe('unavailable');
     expect(byKey.p50).toBe('unavailable');
-    expect(byKey.tokens_per_sec).toBe('unavailable');
+    expect(byKey.prefill_tokens_per_sec).toBe('unavailable');
+    expect(byKey.decode_tokens_per_sec).toBe('unavailable');
     expect(byKey.cost_per_min).toBe('unavailable');
   });
 
   it('tags cost as unavailable but tok/s as derived when only pricing is missing', () => {
     const chips = deriveChips(win({ samples: 8, usage_samples: 8, priced_samples: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.quality]));
-    expect(byKey.tokens_per_sec).toBe('derived'); // usage present
+    expect(byKey.prefill_tokens_per_sec).toBe('derived');
+    expect(byKey.decode_tokens_per_sec).toBe('derived');
     expect(byKey.cost_per_min).toBe('unavailable'); // unpriced → not an estimate, a gap
   });
 
@@ -194,7 +214,7 @@ describe('chips', () => {
 
   it('the $/min cost_confidence override does NOT affect the tok/s chip (only the cost chip)', () => {
     // tok/s keeps its intrinsic `derived` tier even when the window cost is confident.
-    const toks = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'tokens_per_sec')!;
+    const toks = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'decode_tokens_per_sec')!;
     expect(toks.quality).toBe('derived');
   });
 });

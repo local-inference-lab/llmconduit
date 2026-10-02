@@ -77,9 +77,19 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
       expect(row?.cost).toBe(0.42);
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_live');
-    // …while the live status still WINS over the REST row.
-    expect(row?.status).toBe('open');
+    // A terminal REST status closes a stale live-open row.
+    expect(row?.status).toBe('completed');
     expect(row?.terminal_reason).toBe('response.completed');
+  });
+
+  it('never lets a stale REST open row resurrect a terminal live row', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_terminal', status: 'open' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_terminal', status: 'completed' })]);
+
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.rows.find((r) => r.api_call_id === 'api_terminal')?.status).toBe('completed');
   });
 
   it('a live cost is NOT overwritten by the REST roll-up (live wins when present)', async () => {
@@ -128,8 +138,7 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     const row = result.current.rows.find((r) => r.api_call_id === 'api_cc');
     // The confidence tag is backfilled with the cost (no longer stuck at `unavailable`)…
     expect(row?.cost_confidence).toBe('estimated');
-    // …while the live 'open' status still wins.
-    expect(row?.status).toBe('open');
+    expect(row?.status).toBe('completed');
   });
 
   // The confidence tag is PAIRED with the cost source: when the LIVE row authored a real cost, its
@@ -202,8 +211,8 @@ describe('useFlowRows — a WS-created row backfills REST-authoritative fields (
     expect(row?.elapsed_ms).toBe(5_000);
     expect(row?.cost).toBe(0.5);
     expect(row?.terminal_reason).toBe('response.completed');
-    // …while the LIVE status + usage still win over the completed REST row.
-    expect(row?.status).toBe('open');
+    // Terminal status is monotonic; the REST completion closes a stale WS-open row.
+    expect(row?.status).toBe('completed');
     expect(row?.usage?.prompt).toBe(11);
     // The store itself is untouched (merge is view-only).
     expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
@@ -255,8 +264,7 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     expect(row?.finalize_ms).toBe(1_700_000_001_100);
     expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
     expect(row?.attempts).toEqual([SERVED]);
-    // …while the LIVE 'open' status still wins over the completed REST row.
-    expect(row?.status).toBe('open');
+    expect(row?.status).toBe('completed');
   });
 
   it('a live spine value WINS over the REST projection (live-first)', async () => {
@@ -289,7 +297,7 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_att');
     expect(row?.attempts).toEqual([SERVED]); // REST trace surfaced, not the empty live []
-    expect(row?.status).toBe('open'); // live status still wins
+    expect(row?.status).toBe('completed');
   });
 
   it('a NON-EMPTY live attempts[] WINS over the REST projection (live-first)', async () => {
@@ -391,5 +399,51 @@ describe('useFlowRows — time-travel seek shows ONLY the frozen snapshot (findi
     // Leave seek → live: the REST query enables, fires, and its rows re-join the merge.
     act(() => dashboardStore.getState().setConnection('live'));
     await waitFor(() => expect(result.current.rows.some((r) => r.api_call_id === 'api_future')).toBe(true));
+  });
+});
+
+
+describe('useFlowRows — session facts merge (live-first, REST-backfilled)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('backfills harness/session/lineage from the REST row onto a live row that lacks them', async () => {
+    seedFlows([makeFlow({ api_call_id: 'api_s1', status: 'open' })]);
+    stubFlowsFetch([
+      makeFlow({ api_call_id: 'api_s1', status: 'completed', harness: 'claude-code', harness_version: '2.1.205', session_id: 'sess_1', chain_parent_request_id: 'api_s0', divergence_kind: 'append', cache_bust: false }),
+    ]);
+    const { result } = renderRows();
+    await waitFor(() => expect(result.current.rows[0]?.harness).toBe('claude-code'));
+    const row = result.current.rows[0]!;
+    // Terminal state is monotonic across transports; REST backfills immutable session facts.
+    expect(row.status).toBe('completed');
+    expect(row.session_id).toBe('sess_1');
+    expect(row.chain_parent_request_id).toBe('api_s0');
+    expect(row.divergence_kind).toBe('append');
+    expect(row.cache_bust).toBe(false);
+    expect(result.current.harnesses).toEqual(['claude-code']);
+  });
+
+  it('the session and cacheBust facets filter the merged rows', async () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_s2', session_id: 'sess_a', cache_bust: true, divergence_kind: 'tools_changed' }),
+      makeFlow({ api_call_id: 'api_s3', session_id: 'sess_b', cache_bust: false, divergence_kind: 'append' }),
+      makeFlow({ api_call_id: 'api_s4' }),
+    ]);
+    const { queryClient } = getConnection();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    const { result, rerender } = renderHook(({ f }) => useFlowRows(f), { wrapper, initialProps: { f: EMPTY_FILTERS } });
+    expect(result.current.rows.length).toBe(3);
+    rerender({ f: { ...EMPTY_FILTERS, session: 'sess_a' } });
+    expect(result.current.rows.map((r) => r.api_call_id)).toEqual(['api_s2']);
+    rerender({ f: { ...EMPTY_FILTERS, cacheBust: true } });
+    expect(result.current.rows.map((r) => r.api_call_id)).toEqual(['api_s2']);
+    rerender({ f: { ...EMPTY_FILTERS, cacheBust: null } });
+    expect(result.current.rows.length).toBe(3);
   });
 });

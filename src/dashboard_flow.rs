@@ -45,6 +45,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio_util::sync::CancellationToken;
+use utoipa::ToSchema;
 
 /// Record cap: reuse the monitor's `REQUEST_EVENT_LIMIT` (512) so the dashboard
 /// store does not invent a second retention dial (D1 constraint).
@@ -201,12 +202,16 @@ impl Default for AbortHub {
 
 /// Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
 /// state. Serializes snake_case for the dashboard REST/WS surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowStatus {
+    /// Not yet terminal (the request is still in flight / streaming).
     Open,
+    /// Finished successfully.
     Completed,
+    /// Ended in an error.
     Failed,
+    /// Aborted before completion.
     Cancelled,
 }
 
@@ -223,10 +228,13 @@ pub enum FlowStatus {
 /// distinction is load-bearing for cost confidence: a `cached` charge against a
 /// model with no configured cache rate (or an unreported `cached`) is `estimated`,
 /// not `confident`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct FlowUsage {
+    /// Prompt (input) tokens.
     pub prompt: i64,
+    /// Completion (output) tokens.
     pub completion: i64,
+    /// Total tokens as reported by the upstream.
     pub total: i64,
     /// Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`
     /// when the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).
@@ -249,7 +257,7 @@ pub struct FlowUsage {
 /// `KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal
 /// source today (the proxy forwards keys, it does not authenticate a principal), so
 /// one is deliberately absent until such a seam exists (spec 04 / Codex review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSource {
     /// Derived from a non-reversible SHA-256 digest of the inbound API key (the raw
@@ -459,7 +467,7 @@ fn key_hash_label(raw_key: &str) -> String {
 /// Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so
 /// the body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI
 /// (spec 11) and the per-provider metrics aggregation (spec 12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
     /// This attempt produced the first chunk on the wire — it is the SERVING attempt.
@@ -474,7 +482,7 @@ pub enum AttemptStatus {
 /// is a fixed enum so the body-free summary can never become a backdoor for an
 /// unbounded/secret-bearing upstream error body. `error_class` is `None` on the served
 /// attempt (don't-lie-with-zeros for the success case). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptErrorClass {
     /// The upstream connection or request transport failed before any response.
@@ -498,7 +506,7 @@ pub enum AttemptErrorClass {
 /// to the next provider. Like [`AttemptErrorClass`], this is a fixed enum — never raw
 /// upstream text — so it is safe on the body-free summary. `None` on the served attempt
 /// (it did not fail over). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptFailoverReason {
     /// The provider failed before the first chunk and failover moved to the next.
@@ -524,7 +532,7 @@ pub enum AttemptFailoverReason {
 /// (never raw upstream text) on a failed attempt — they ride the body-free summary, so
 /// raw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`
 /// so a `None` field is absent on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 pub struct Attempt {
     /// The provider name this attempt dispatched to (the failover provider's name, the
     /// routing route's name, or the synthetic `"primary"` for a bare single upstream).
@@ -595,6 +603,10 @@ pub struct TerminalMetricsInputs {
     pub endpoint: String,
     pub upstream: Option<String>,
     pub usage: Option<FlowUsage>,
+    /// Measured first-upstream-byte → first-content duration.
+    pub prefill_ms: Option<u128>,
+    /// Measured first-content → clean-stream-end duration.
+    pub decode_ms: Option<u128>,
     /// Gap 03 — the per-attempt trace, read off the shared `ServingToken` at finalize
     /// alongside `usage`. Carried on the evict-safe terminal payload (NOT only the
     /// FlowStore record) so spec 12 can aggregate per-provider metrics without
@@ -637,8 +649,9 @@ pub struct CapturedHeaders(Vec<(String, String)>);
 
 /// Gap 05 — an upstream RESPONSE/ERROR body that has ALREADY been through the capped +
 /// redacting capture primitive, paired with whether the cap TRUNCATED it. The ONLY way
-/// to mint one is [`capture_response_body`], so (like [`CapturedBody`]) a caller cannot
-/// hand the store an unredacted / over-cap / slice-retaining body. Holds an
+/// to mint one is [`capture_response_body`] (or its transport-truncation-aware
+/// sibling [`capture_response_body_with_truncation`]), so (like [`CapturedBody`])
+/// a caller cannot hand the store an unredacted / over-cap / slice-retaining body. Holds an
 /// `Arc<[u8]>` ≤ `BODY_CAP` with secrets redacted; `truncated` records whether the raw
 /// body exceeded `BODY_CAP` (so the dashboard can flag a partial body honestly rather
 /// than presenting it as complete — don't-lie-with-zeros for bodies).
@@ -714,6 +727,9 @@ pub struct FlowRecord {
     /// Capped + redacted inbound request body. `None` once evicted by the
     /// summary-byte quota (the record then survives as a body-free summary).
     pub inbound_body: Option<Arc<[u8]>>,
+    /// Whether this key opted into retaining body payloads. Metadata mutations
+    /// continue regardless of this flag.
+    pub capture_payloads: bool,
     /// Capped + redacted canonical/normalized body (set by D2).
     pub normalized: Option<Arc<[u8]>>,
     /// Capped + redacted upstream chat body (set by D2).
@@ -783,6 +799,95 @@ pub struct FlowRecord {
     /// `UserAgent` fallback is visibly distinguishable from a key-hash / configured-id
     /// attribution downstream. `None` exactly when `client_label` is `None`.
     pub client_source: Option<ClientSource>,
+    /// Harness identity + session-tree linkage computed at the persistence seam
+    /// (see `crate::harness` / `crate::sessions`). Body-free scalar metadata;
+    /// every field absent when persistence is off.
+    pub session: FlowSessionFacts,
+}
+
+/// The per-flow harness/session facts projected onto every live surface
+/// (list row, snapshot summary, detail body, `flow_status` frame). Flattened
+/// onto the wire as sibling scalar fields, each `skip_serializing_if = None`,
+/// so an unknown fact is ABSENT, never a fabricated value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
+pub struct FlowSessionFacts {
+    /// Detected harness profile name (`claude-code`, `codex`, `pi-agent`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Detected harness version, when the harness reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
+    /// Gateway session node id (`sessions.id`) the flow was linked into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The chain predecessor's `api_call_id`, when the flow extends a chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_parent_request_id: Option<String>,
+    /// `append` | `instructions_changed` | `tools_changed` | `history_rewritten` | `new_chain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence_kind: Option<String>,
+    /// True when the divergence falls inside the predecessor's items (a
+    /// prefix-cache miss upstream). Absent when lineage was not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_bust: Option<bool>,
+    /// Owner of the virtual key that authenticated the request, when known.
+    /// Absent for open-mode requests and keys without an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The virtual key's stable database id (never the credential).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_key_id: Option<String>,
+}
+
+impl FlowSessionFacts {
+    /// Project the seam's detection + link results. Scalars are capped like
+    /// every other retained flow field.
+    pub fn from_parts(
+        identity: Option<&crate::harness::HarnessIdentity>,
+        link: Option<&crate::sessions::SessionLink>,
+    ) -> Self {
+        Self {
+            harness: identity.map(|identity| cap_scalar(identity.harness.clone())),
+            harness_version: identity
+                .and_then(|identity| identity.version.clone())
+                .map(cap_scalar),
+            session_id: link.map(|link| cap_scalar(link.session_id.clone())),
+            chain_parent_request_id: link
+                .and_then(|link| link.chain_parent_request_id.clone())
+                .map(cap_scalar),
+            divergence_kind: link.map(|link| link.lineage.kind.as_str().to_string()),
+            cache_bust: link.map(|link| link.lineage.cache_bust),
+            // Key attribution from the PRIMARY linked node's row (the newest
+            // upsert state the linker produced for this request).
+            user_id: link
+                .and_then(|link| {
+                    link.upserts
+                        .iter()
+                        .find(|row| row.id == link.session_id)
+                        .and_then(|row| row.user_id.clone())
+                })
+                .map(cap_scalar),
+            virtual_key_id: link
+                .and_then(|link| {
+                    link.upserts
+                        .iter()
+                        .find(|row| row.id == link.session_id)
+                        .and_then(|row| row.virtual_key_id.clone())
+                })
+                .map(cap_scalar),
+        }
+    }
+
+    fn summary_bytes(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_ref().map(|s| s.len()).unwrap_or(0);
+        opt(&self.harness)
+            + opt(&self.harness_version)
+            + opt(&self.session_id)
+            + opt(&self.chain_parent_request_id)
+            + opt(&self.divergence_kind)
+            + opt(&self.user_id)
+            + opt(&self.virtual_key_id)
+    }
 }
 
 /// Gap 02 — the per-phase timestamp bundle carried by every [`FlowRecord`] and
@@ -793,7 +898,7 @@ pub struct FlowRecord {
 /// OPTIONAL measured epoch-ms timestamp; `None` ⇒ the phase did not occur ⇒
 /// serialized absent (the `skip_serializing_if` below) so the don't-lie-with-zeros
 /// rule holds: a missing phase is NEVER coerced to `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 pub struct PhaseTimings {
     /// Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).
     /// Always `Some` once a record exists; the explicit phase value the waterfall
@@ -932,6 +1037,7 @@ impl FlowRecord {
             + opt(&self.model_served)
             + opt(&self.upstream_target)
             + opt(&self.terminal_reason)
+            + self.session.summary_bytes()
             + opt(&self.client_label)
             + attempts
     }
@@ -1005,6 +1111,19 @@ pub struct SnapshotFlowSummary {
     /// attribution. `None` (absent) exactly when `client_label` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_source: Option<ClientSource>,
+    /// Harness/session facts, flattened as sibling scalar fields (body-free).
+    #[serde(flatten)]
+    pub session: FlowSessionFacts,
+    /// Gap 07 — the flow's USD cost, `None` when the served model is unpriced or
+    /// there is no usage to bill (never a fabricated `0`).
+    pub cost: Option<f64>,
+    /// Gap 07 — the confidence tag that goes WITH `cost`. REQUIRED on every row:
+    /// the SPA's `isFlowSummary` rejects a row without it, and one rejected row
+    /// invalidates the whole snapshot, so the dashboard never leaves
+    /// `'connecting'`. The FlowStore has no price table, so `from_record` starts
+    /// it `Unavailable`; the socket layer prices it
+    /// (`dashboard_ws::price_snapshot_summaries`) before the snapshot goes out.
+    pub cost_confidence: crate::dashboard_api::CostConfidence,
 }
 
 impl SnapshotFlowSummary {
@@ -1034,7 +1153,80 @@ impl SnapshotFlowSummary {
             // hash prefix ever existed). `ClientSource` is `Copy`.
             client_label: record.client_label.clone(),
             client_source: record.client_source,
+            session: record.session.clone(),
+            // Priced by the socket layer, which owns the gateway's price table.
+            cost: None,
+            cost_confidence: crate::dashboard_api::CostConfidence::Unavailable,
         }
+    }
+}
+
+/// One body-free summary SHARED between snapshot cuts. A flow that did not mutate
+/// between two 5 s cuts is the SAME allocation in both (not a deep copy per cut), so
+/// a flow resident for the whole ring costs one summary, not up to 720. Derefs to the
+/// summary; serializes exactly like it (the wire shape is unchanged).
+#[derive(Debug, Clone)]
+pub struct SharedFlowSummary(Arc<SnapshotFlowSummary>);
+
+impl SharedFlowSummary {
+    /// Address of the shared allocation — the identity the snapshot ring uses to
+    /// charge each unique summary to its memory quota exactly once.
+    pub fn alloc_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl std::ops::Deref for SharedFlowSummary {
+    type Target = SnapshotFlowSummary;
+    fn deref(&self) -> &SnapshotFlowSummary {
+        &self.0
+    }
+}
+
+impl Serialize for SharedFlowSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (*self.0).serialize(serializer)
+    }
+}
+
+/// The immutable, shareable summary list of one snapshot cut. When the FlowStore
+/// did not mutate between two cuts (an idle box) both cuts hold the SAME list
+/// allocation, so an idle cut copies nothing. Derefs to a slice (`iter()`,
+/// `len()`, `for s in &cut.summaries` all work) and serializes as a JSON array.
+#[derive(Debug, Clone)]
+pub struct SnapshotSummaries(Arc<[SharedFlowSummary]>);
+
+impl SnapshotSummaries {
+    /// Address of the shared list allocation (see [`SharedFlowSummary::alloc_id`]).
+    pub fn alloc_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+}
+
+impl Default for SnapshotSummaries {
+    fn default() -> Self {
+        Self(Arc::from(Vec::new()))
+    }
+}
+
+impl std::ops::Deref for SnapshotSummaries {
+    type Target = [SharedFlowSummary];
+    fn deref(&self) -> &[SharedFlowSummary] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a SnapshotSummaries {
+    type Item = &'a SharedFlowSummary;
+    type IntoIter = std::slice::Iter<'a, SharedFlowSummary>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for SnapshotSummaries {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
     }
 }
 
@@ -1073,6 +1265,16 @@ struct DashboardFlowState {
     /// (AGENTS.md: per-domain `{domain, seq}` cursors). The D5 5 s snapshot reads it
     /// at the cut instant; D7/D13 frames carry it.
     seq: u64,
+    /// Snapshot-ring sharing: the last projected summary per live flow, tagged
+    /// with the `record_seq` it was projected at. Every summary-visible mutation
+    /// goes through `insert`/`update`, which stamp a fresh `record_seq`, so an
+    /// equal tag proves the summary is still exact and can be reused by the next
+    /// cut (body shedding changes no summary field and is correctly ignored).
+    summary_cache: HashMap<String, (u64, SharedFlowSummary)>,
+    /// The last cut's whole summary list, tagged with the `seq` it was built at:
+    /// an unchanged `seq` means no insert/update/remove happened, so the next cut
+    /// reuses the list allocation outright.
+    shared_list: Option<(u64, SnapshotSummaries)>,
 }
 
 /// Authoritative store of per-flow records + the capture seam. Mirrors the
@@ -1179,6 +1381,54 @@ impl DashboardFlowStore {
         inbound_body: Option<CapturedBody>,
         client: ClientAttribution,
     ) {
+        self.open_with_session(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            FlowSessionFacts::default(),
+        );
+    }
+
+    /// [`open`](Self::open) plus the harness/session facts computed at the
+    /// persistence seam (absent when persistence is off).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_session(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        session: FlowSessionFacts,
+    ) {
+        self.open_with_session_capture(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            session,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_session_capture(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        session: FlowSessionFacts,
+        capture_payloads: bool,
+    ) {
         if !self.enabled {
             return;
         }
@@ -1194,6 +1444,7 @@ impl DashboardFlowStore {
             uri: cap_scalar(uri),
             headers: headers.0,
             inbound_body: inbound_body.map(CapturedBody::into_arc),
+            capture_payloads,
             normalized: None,
             upstream_body: None,
             // Gap 05: the upstream RESPONSE/ERROR body is captured later (and only when
@@ -1227,6 +1478,7 @@ impl DashboardFlowStore {
             // (an unattributed flow renders `—` downstream, never a fabricated id).
             client_label: client.label.map(cap_scalar),
             client_source: client.source,
+            session,
         };
         let mut state = self.lock();
         state.prune_expired(now);
@@ -1290,7 +1542,7 @@ impl DashboardFlowStore {
             if model_served.is_some() {
                 record.model_served = model_served.clone();
             }
-            if upstream_body.is_some() {
+            if record.capture_payloads && upstream_body.is_some() {
                 record.upstream_body = upstream_body.clone();
             }
         });
@@ -1323,7 +1575,9 @@ impl DashboardFlowStore {
         let mut state = self.lock();
         state.prune_expired(now_ms());
         state.update(id, |record| {
-            record.upstream_response = Some(response.clone());
+            if record.capture_payloads {
+                record.upstream_response = Some(response.clone());
+            }
         });
         state.enforce_caps(self.summary_quota_bytes);
     }
@@ -1352,7 +1606,7 @@ impl DashboardFlowStore {
             if model_requested.is_some() {
                 record.model_requested = model_requested.clone();
             }
-            if normalized.is_some() {
+            if record.capture_payloads && normalized.is_some() {
                 record.normalized = normalized.clone();
             }
         });
@@ -1494,16 +1748,17 @@ impl DashboardFlowStore {
     /// cheap on the streaming hot path. This is a NEW phase-only mutation, so it bumps
     /// the record's `record_seq` exactly like the other mutators (the flow frame the
     /// dashboard later sends carries the freshly-stamped TTFT).
-    pub fn stamp_first_content_delta(&self, id: &str) {
-        if !self.enabled {
-            return;
-        }
+    pub fn stamp_first_content_delta(&self, id: &str) -> u128 {
         let now = now_ms();
+        if !self.enabled {
+            return now;
+        }
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
             record.phases.stamp_first_content_delta(now);
         });
+        now
     }
 
     /// Gap 02 — stamp the **stream end** phase: the engine reached the terminal
@@ -1513,16 +1768,17 @@ impl DashboardFlowStore {
     /// cannot re-stamp. `id` may be the `api_call_id` OR the `response_id`. No-op when
     /// disabled or unknown. Phase-only mutation (no body); bumps `record_seq` like the
     /// other mutators.
-    pub fn stamp_stream_end(&self, id: &str) {
-        if !self.enabled {
-            return;
-        }
+    pub fn stamp_stream_end(&self, id: &str) -> u128 {
         let now = now_ms();
+        if !self.enabled {
+            return now;
+        }
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
             record.phases.stamp_stream_end(now);
         });
+        now
     }
 
     /// Mint the D3 **L0 middleware guard** for a freshly `open`ed flow (the
@@ -1620,6 +1876,23 @@ impl DashboardFlowStore {
             .rev()
             .filter_map(|id| state.by_id.get(id).cloned())
             .collect()
+    }
+
+    /// Number of live records with `status == Open` (the dashboard's
+    /// `active_streams`). Counts in place under the lock — every viewer asks once
+    /// a second, and [`list`](Self::list) would clone every record handle into a
+    /// fresh `Vec` just to count it. `0` when disabled.
+    pub fn open_count(&self) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        state
+            .by_id
+            .values()
+            .filter(|record| record.status == FlowStatus::Open)
+            .count() as u64
     }
 
     /// Resolve a single record by `api_call_id` OR `response_id` (via the link
@@ -1733,22 +2006,24 @@ impl DashboardFlowStore {
     /// touches only Metrics + topology), so no deadlock is possible. Pruning happens
     /// once, before the summaries are built, so the seq already reflects any prune. When
     /// disabled, `f` runs with an empty guard + `(Vec::new(), 0)` and no lock is taken.
+    ///
+    /// The summaries are SHARED with earlier cuts wherever a flow did not mutate (and
+    /// the whole list is shared when nothing mutated), so a cut costs only the flows
+    /// that changed since the previous one.
     pub fn with_summaries_under_lock<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(FlowSnapshotGuard<'_>, Vec<SnapshotFlowSummary>, u64) -> R,
+        F: FnOnce(FlowSnapshotGuard<'_>, SnapshotSummaries, u64) -> R,
     {
         if !self.enabled {
-            return f(FlowSnapshotGuard { guard: None }, Vec::new(), 0);
+            return f(
+                FlowSnapshotGuard { guard: None },
+                SnapshotSummaries::default(),
+                0,
+            );
         }
         let mut state = self.lock();
         state.prune_expired(now_ms());
-        let summaries = state
-            .order
-            .iter()
-            .rev()
-            .filter_map(|id| state.by_id.get(id))
-            .map(|record| SnapshotFlowSummary::from_record(record))
-            .collect();
+        let summaries = state.shared_summaries();
         let seq = state.seq;
         // Hand the guard to `f` so it controls when the FlowStore lock is released
         // (after it has nested the metrics lock under this one).
@@ -1946,6 +2221,7 @@ impl TelemetryGuard {
             // `store.finalize`/`record_attempts` below, so the payload is independent of
             // whether the record still exists.
             let (attempts, first_upstream_byte_ms) = self.serving.attempts_snapshot();
+            let (first_content_delta_ms, stream_end_ms) = self.serving.phase_snapshot();
             *self
                 .terminal_metrics
                 .lock()
@@ -1955,6 +2231,12 @@ impl TelemetryGuard {
                     endpoint: self.endpoint.clone(),
                     upstream: serving.clone(),
                     usage,
+                    prefill_ms: first_upstream_byte_ms
+                        .zip(first_content_delta_ms)
+                        .map(|(start, end)| end.saturating_sub(start)),
+                    decode_ms: first_content_delta_ms
+                        .zip(stream_end_ms)
+                        .map(|(start, end)| end.saturating_sub(start)),
                     attempts: attempts.clone(),
                 });
             self.store
@@ -2004,6 +2286,36 @@ impl Drop for TelemetryGuard {
 }
 
 impl DashboardFlowState {
+    /// The newest-first body-free summary list for a snapshot cut, reusing every
+    /// allocation that is still exact (see `summary_cache` / `shared_list`).
+    fn shared_summaries(&mut self) -> SnapshotSummaries {
+        if let Some((built_at, list)) = &self.shared_list
+            && *built_at == self.seq
+        {
+            return list.clone();
+        }
+        let mut list = Vec::with_capacity(self.order.len());
+        for id in self.order.iter().rev() {
+            let Some(record) = self.by_id.get(id) else {
+                continue;
+            };
+            let summary = match self.summary_cache.get(id) {
+                Some((record_seq, cached)) if *record_seq == record.record_seq => cached.clone(),
+                _ => {
+                    let fresh =
+                        SharedFlowSummary(Arc::new(SnapshotFlowSummary::from_record(record)));
+                    self.summary_cache
+                        .insert(id.clone(), (record.record_seq, fresh.clone()));
+                    fresh
+                }
+            };
+            list.push(summary);
+        }
+        let list = SnapshotSummaries(Arc::from(list));
+        self.shared_list = Some((self.seq, list.clone()));
+        list
+    }
+
     /// Insert (or replace) a record, keeping `by_id` + `order` in lockstep and the
     /// `live_summary_bytes` total correct. Bumps the global `seq` and stamps the
     /// record's own `record_seq` with the post-bump value (D7b R2 finding 1), so the
@@ -2151,6 +2463,7 @@ impl DashboardFlowState {
                 self.link_index.remove(response_id);
             }
         }
+        self.summary_cache.remove(api_call_id);
         self.order.retain(|id| id != api_call_id);
         // Drop any dangling link-index entries that pointed at this id.
         self.link_index.retain(|_, owner| owner != api_call_id);
@@ -2180,7 +2493,17 @@ pub fn capture_body(raw: &[u8]) -> CapturedBody {
 /// independent of that marker, so an over-cap body is flagged truncated even when the
 /// stored bytes are the marker.
 pub fn capture_response_body(raw: &[u8]) -> CapturedResponseBody {
-    let truncated = raw.len() > BODY_CAP;
+    capture_response_body_with_truncation(raw, false)
+}
+
+/// Capture an already transport-capped upstream body while preserving the fact
+/// that bytes existed beyond `raw`. This keeps the dashboard's live-body
+/// metadata truthful even though the HTTP reader deliberately stopped early.
+pub fn capture_response_body_with_truncation(
+    raw: &[u8],
+    externally_truncated: bool,
+) -> CapturedResponseBody {
+    let truncated = externally_truncated || raw.len() > BODY_CAP;
     let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
     CapturedResponseBody {
         body: Arc::from(bytes.into_boxed_slice()),
@@ -2263,6 +2586,50 @@ mod tests {
         );
     }
 
+    fn shared_cut(store: &DashboardFlowStore) -> SnapshotSummaries {
+        store.with_summaries_under_lock(|_guard, summaries, _seq| summaries)
+    }
+
+    #[test]
+    fn shared_summaries_track_mutation_removal_and_body_shedding() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        open_simple(&store, "api_2");
+        let first = shared_cut(&store);
+        assert_eq!(
+            first
+                .iter()
+                .map(|s| s.api_call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["api_2", "api_1"],
+            "newest first, like snapshot_summaries"
+        );
+        // Shared projection is identical to the owned one.
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(store.snapshot_summaries()).unwrap()
+        );
+        assert_eq!(shared_cut(&store).alloc_id(), first.alloc_id());
+
+        store.set_upstream("api_1", Some("t".to_string()), None, None);
+        let second = shared_cut(&store);
+        assert_eq!(second[0].alloc_id(), first[0].alloc_id(), "api_2 reused");
+        assert_ne!(
+            second[1].alloc_id(),
+            first[1].alloc_id(),
+            "api_1 re-projected"
+        );
+        assert_eq!(second[1].upstream_target.as_deref(), Some("t"));
+
+        // TTL removal drops the flow AND its cache entry.
+        store.force_started_ms("api_2", 0);
+        store.prune_at(FLOW_TTL_MS + 100);
+        let third = shared_cut(&store);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].api_call_id, "api_1");
+        assert!(!store.lock().summary_cache.contains_key("api_2"));
+    }
+
     #[test]
     fn disabled_store_is_a_no_op() {
         let store = DashboardFlowStore::disabled();
@@ -2285,6 +2652,40 @@ mod tests {
         assert!(store.list().is_empty(), "disabled store records nothing");
         assert!(store.detail("api_1").is_none());
         assert!(store.snapshot_summaries().is_empty());
+    }
+
+    #[test]
+    fn metadata_only_flow_retains_identity_without_request_bodies() {
+        let store = DashboardFlowStore::new();
+        store.open_with_session_capture(
+            "api_metadata_only".into(),
+            "POST".into(),
+            "/v1/responses".into(),
+            no_headers(),
+            None,
+            ClientAttribution::none(),
+            FlowSessionFacts::default(),
+            false,
+        );
+        store.set_normalized(
+            "api_metadata_only",
+            Some("model-a".into()),
+            Some(cap(br#"{"input":"secret"}"#)),
+        );
+        store.set_upstream(
+            "api_metadata_only",
+            Some("provider-a".into()),
+            Some("model-a".into()),
+            Some(cap(br#"{"messages":["secret"]}"#)),
+        );
+
+        let record = store.detail("api_metadata_only").unwrap();
+        assert_eq!(record.model_requested.as_deref(), Some("model-a"));
+        assert_eq!(record.model_served.as_deref(), Some("model-a"));
+        assert_eq!(record.upstream_target.as_deref(), Some("provider-a"));
+        assert!(record.inbound_body.is_none());
+        assert!(record.normalized.is_none());
+        assert!(record.upstream_body.is_none());
     }
 
     #[test]
@@ -4130,6 +4531,29 @@ mod tests {
             captured.bytes.len() <= BODY_CAP,
             "retained bytes stay within the cap regardless of raw size"
         );
+    }
+
+    #[test]
+    fn upstream_response_external_transport_cap_is_flagged() {
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        let retained_prefix = br#"{"error":"provider body prefix"}"#;
+        assert!(retained_prefix.len() < BODY_CAP);
+        store.set_upstream_response(
+            "api_1",
+            Some(capture_response_body_with_truncation(retained_prefix, true)),
+        );
+
+        let record = store.detail("api_1").expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("externally capped body captured");
+        assert!(
+            captured.truncated,
+            "a transport-capped prefix must not be presented as a complete body"
+        );
+        assert!(captured.bytes.len() <= BODY_CAP);
     }
 
     #[test]

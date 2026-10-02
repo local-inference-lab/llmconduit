@@ -1,6 +1,12 @@
 /target
 .omx/
 .claude/
+.playwright-mcp/
+
+# Local root-level screenshots; nested project image assets remain trackable.
+/*.png
 
 # Local orchestration state.
 .ralph/
+.token
+.api-key

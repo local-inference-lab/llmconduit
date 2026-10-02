@@ -44,6 +44,16 @@ pub const DEBUG_CSP: &str = "default-src 'self'; script-src 'self'; connect-src 
 
 /// `GET /debug` — the debug UI shell. Carries the strict CSP + the standard
 /// security headers + `no-store` (transcripts must not be cached).
+#[utoipa::path(
+    get,
+    path = "/debug",
+    tag = "ui",
+    operation_id = "debug_index",
+    responses(
+        (status = 200, description = "The debug UI HTML shell (loads `/debug/app.js`, opens `/debug/ws`). Strict CSP (`script-src 'self'`), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `Cache-Control: no-store`.", content_type = "text/html", body = String),
+        (status = 401, description = "No valid session (`require_session`: missing/expired/invalid `llmconduit_session` cookie and no matching bearer token). Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn debug_index() -> Response {
     let mut response = (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -56,6 +66,16 @@ pub async fn debug_index() -> Response {
 
 /// `GET /debug/app.js` — the externalized client module. Same security headers
 /// so the JS is served under the same hardened policy.
+#[utoipa::path(
+    get,
+    path = "/debug/app.js",
+    tag = "ui",
+    operation_id = "debug_app_js",
+    responses(
+        (status = 200, description = "The debug UI client script, served verbatim. Same security headers as `/debug` (strict CSP, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `Cache-Control: no-store`).", content_type = "text/javascript", body = String),
+        (status = 401, description = "No valid session (`require_session`). Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn debug_app_js() -> Response {
     let mut response = (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
@@ -90,6 +110,18 @@ fn apply_debug_security_headers(headers: &mut HeaderMap) {
 /// enforce the WS `Origin` allow-list (CSWSH defense) and capture the cookie
 /// `exp` so the socket is closed when the session expires. A request that fails
 /// the cookie+Origin check is rejected with `401 no-store` BEFORE the upgrade.
+#[utoipa::path(
+    get,
+    path = "/debug/ws",
+    tag = "ui",
+    operation_id = "debug_ws",
+    responses(
+        (status = 101, description = "WebSocket upgrade accepted. The server first replays the retained monitor transcript, then streams live updates; every frame is one JSON text `DebugWsMessage`, `type`-tagged (snake_case): `hello` {protocol_version, history_limit, history_retention_ms}, `request_upsert` {request}, `segment_append` {response_id, segment}, `event_append` {response_id, event}, `request_status` {response_id, status, completed_at_ms, error}, `request_remove` {response_id, reason}, `usage` {response_id, prompt, completion, total, cached, reasoning}, `snapshot_done`. If the client falls behind the broadcast, the full retained snapshot is replayed again on the same socket. Server → client only. The socket is closed (plain Close frame) when the session cookie's `exp` passes; a dev-open listener never expires it."),
+        (status = 400, description = "Not a WebSocket upgrade: the `WebSocketUpgrade` extractor rejects a plain GET (missing `Connection: upgrade` / `Upgrade: websocket` / `Sec-WebSocket-Key`, or `Sec-WebSocket-Version` not `13`) BEFORE the handler runs, so this precedes the auth check. Plain text reason from axum.", content_type = "text/plain", body = String),
+        (status = 401, description = "The upgrade request failed the WS auth: no valid signed `llmconduit_session` cookie, or an `Origin` header not on the allow-list (the configured public origin, else same-origin as `Host` on loopback/insecure dev-open listeners). The bearer-token fallback is NOT honored here. Plain text `unauthorized`, `Cache-Control: no-store`.", content_type = "text/plain", body = String),
+        (status = 426, description = "The connection cannot be upgraded (e.g. HTTP/1.0); axum's `WebSocketUpgrade` rejection.", content_type = "text/plain", body = String),
+    )
+)]
 pub async fn debug_ws(
     State(gateway): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -146,6 +178,9 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         }
         ReplayOutcome::SendFailed => return,
     }
+    // Replay is complete; the live socket needs only last_sequence, not a
+    // private copy of every retained transcript payload.
+    drop(snapshot);
 
     loop {
         tokio::select! {

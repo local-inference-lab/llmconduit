@@ -11,9 +11,12 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21,
     samples,
     usage_samples: samples,
+    prefill_samples: samples,
+    decode_samples: samples,
     priced_samples: samples,
     cost_confidence: 'estimated',
     ...over,
@@ -25,9 +28,14 @@ function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m
   return {
     metrics_seq: seq,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142,
+    prefill_tokens_per_sec: m1.prefill_tokens_per_sec,
+    decode_tokens_per_sec: m1.decode_tokens_per_sec,
+    cost_per_min: 0.21,
     samples: m1.samples,
     usage_samples: m1.usage_samples,
+    prefill_samples: m1.prefill_samples,
+    decode_samples: m1.decode_samples,
     priced_samples: m1.priced_samples,
     cost_confidence: m1.cost_confidence,
     windows: { m1, m5: win(windows?.m5), h1: win(windows?.h1) },
@@ -51,7 +59,7 @@ afterEach(() => {
 describe('StatsStrip — chips', () => {
   it('renders every chip with a tabular-nums value', () => {
     const { getByTestId } = renderWithQuery(<StatsStrip />);
-    pushMetrics(metrics(1, {}, { m1: { reqs_per_sec: 7.5, tokens_per_sec: 1500 } }));
+    pushMetrics(metrics(1, {}, { m1: { reqs_per_sec: 7.5, prefill_tokens_per_sec: 1500 } }));
     for (const key of CHIP_METRICS) {
       const chip = getByTestId(`chip-${key}`);
       const value = within(chip).getByTestId('chip-value');
@@ -60,7 +68,7 @@ describe('StatsStrip — chips', () => {
     // The m1 window value surfaced (req/s chip shows 7.5).
     expect(within(getByTestId('chip-reqs_per_sec')).getByTestId('chip-value').textContent).toBe('7.5');
     // tokens compaction.
-    expect(within(getByTestId('chip-tokens_per_sec')).getByTestId('chip-value').textContent).toBe('1.5k');
+    expect(within(getByTestId('chip-prefill_tokens_per_sec')).getByTestId('chip-value').textContent).toBe('1.5k');
   });
 
   it('renders a sparkline per metric and updates from successive MetricTick frames', () => {
@@ -100,7 +108,8 @@ describe('StatsStrip — chips', () => {
     const val = (k: string) => within(getByTestId(`chip-${k}`)).getByTestId('chip-value').textContent;
     expect(val('p50')).toBe('—');
     expect(val('p95')).toBe('—');
-    expect(val('tokens_per_sec')).toBe('—');
+    expect(val('prefill_tokens_per_sec')).toBe('—');
+    expect(val('decode_tokens_per_sec')).toBe('—');
     expect(val('cost_per_min')).toBe('—');
     expect(val('error_pct')).toBe('—');
     // The genuinely-measured req/s + the live active count stay numeric.
@@ -116,17 +125,19 @@ describe('StatsStrip — chips', () => {
     expect(quality('reqs_per_sec')).toBe('measured');
     expect(quality('active_streams')).toBe('measured');
     expect(quality('p50')).toBe('derived');
-    expect(quality('tokens_per_sec')).toBe('derived');
+    expect(quality('prefill_tokens_per_sec')).toBe('derived');
+    expect(quality('decode_tokens_per_sec')).toBe('derived');
     expect(quality('cost_per_min')).toBe('estimated'); // priced → labelled estimated
   });
 
   it('flips a chip data-quality to "unavailable" when its metric is unmeasurable', () => {
     const { getByTestId } = renderWithQuery(<StatsStrip />);
     // No usage reported (usage/priced 0) though latency IS measured (samples 12).
-    pushMetrics(metrics(1, {}, { m1: { samples: 12, usage_samples: 0, priced_samples: 0 } }));
+    pushMetrics(metrics(1, {}, { m1: { samples: 12, usage_samples: 0, prefill_samples: 0, decode_samples: 0, priced_samples: 0 } }));
     const quality = (k: string) => getByTestId(`chip-${k}`).getAttribute('data-quality');
     expect(quality('p50')).toBe('derived'); // latency measured
-    expect(quality('tokens_per_sec')).toBe('unavailable'); // no usage → gap
+    expect(quality('prefill_tokens_per_sec')).toBe('unavailable');
+    expect(quality('decode_tokens_per_sec')).toBe('unavailable');
     expect(quality('cost_per_min')).toBe('unavailable'); // no priced usage → gap
     expect(quality('reqs_per_sec')).toBe('measured'); // never gated
   });

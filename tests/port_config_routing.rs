@@ -35,7 +35,7 @@ fn chat_sse_body(id: &str, content: &str) -> String {
         "choices": [{
             "index": 0,
             "delta": {"content": content},
-            "finish_reason": null
+            "finish_reason": "stop"
         }],
         "usage": null
     });

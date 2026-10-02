@@ -51,8 +51,8 @@ function Dashboard() {
       <NavTabs active={route} onLogout={onLogout} />
       {/* stats-strip slot */}
       <StatsStrip />
-      {/* scrubber slot */}
-      <Scrubber socket={socket} />
+      {/* Access is current authorization state, not a historical telemetry surface. */}
+      {route !== 'access' && route !== 'chat' && <Scrubber socket={socket} />}
       {/* view router */}
       <main className="flex flex-1 overflow-hidden">
         <ActiveView />

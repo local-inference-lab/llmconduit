@@ -70,6 +70,15 @@ export const COST_CONFIDENCES: readonly CostConfidence[] = ['confident', 'estima
 export type ClientSource = 'key_hash' | 'configured_header' | 'user_agent';
 export const CLIENT_SOURCES: readonly ClientSource[] = ['key_hash', 'configured_header', 'user_agent'];
 
+/**
+ * Sessions — how a request's items diverge from its chain predecessor (the Rust
+ * `sessions::DivergenceKind`). `append` = pure continuation; the three `*_changed`/`rewritten`
+ * kinds fall INSIDE the predecessor's items and bust an upstream prefix cache; `new_chain` =
+ * nothing in common (the start of a conversation).
+ */
+export type DivergenceKind = 'append' | 'instructions_changed' | 'tools_changed' | 'history_rewritten' | 'new_chain';
+export const DIVERGENCE_KINDS: readonly DivergenceKind[] = ['append', 'instructions_changed', 'tools_changed', 'history_rewritten', 'new_chain'];
+
 // ---------------------------------------------------------------------------
 // Gap 02 / 03 spine — per-phase timestamps + the per-attempt failover trace.
 // These mirror the Rust `PhaseTimings` (`#[serde(flatten)]`) + `Attempt` /
@@ -426,6 +435,8 @@ export interface MetricWindow {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /**
    * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
@@ -443,6 +454,10 @@ export interface MetricWindow {
    * is unmeasurable → it renders `—`, NEVER a fabricated `0`. A finite `u64`.
    */
   usage_samples: number;
+  /** Flows with prompt usage and a measured non-zero prefill phase. */
+  prefill_samples: number;
+  /** Flows with completion usage and a measured non-zero decode phase. */
+  decode_samples: number;
   /**
    * Count of usage-bearing terminal flows whose served model has a configured price
    * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no PRICED
@@ -468,11 +483,15 @@ export interface MetricTickPayload {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -511,6 +530,7 @@ export interface FlowStatusPayload extends PhaseTimings {
   upstream_target?: string | null;
   usage: Usage | null;
   started_ms: number;
+  finished_ms?: number | null;
   elapsed_ms?: number | null;
   /** Gap 03 — the per-attempt failover trace (optional; present once the backend projects it). */
   attempts?: Attempt[];
@@ -557,6 +577,16 @@ export interface TopologyUpdatePayload {
 }
 
 /**
+ * Sessions-domain push tick: the live-session hub announces which session ids
+ * changed. Carries NO body — the SPA refetches `/dashboard/api/sessions/active`
+ * (the same push-invalidates-REST pattern a metrics frame uses for topology).
+ */
+export interface SessionUpdatePayload {
+  type: 'session_update';
+  touched: string[];
+}
+
+/**
  * The full `DashboardPayload` union. Every arm carries a `type` discriminant; an
  * exhaustive switch over `type` is enforced at compile time via `assertNever`.
  */
@@ -565,14 +595,15 @@ export type DashboardPayload =
   | UsagePayload
   | MetricTickPayload
   | FlowStatusPayload
-  | TopologyUpdatePayload;
+  | TopologyUpdatePayload
+  | SessionUpdatePayload;
 
 // ---------------------------------------------------------------------------
 // DashboardFrame — the batched WS envelope (D7). ONE frame per `DebugUpdate`
 // for the Monitor domain (seq = DebugUpdate.sequence). Per-domain whole-frame dedup.
 // ---------------------------------------------------------------------------
 
-export type Domain = 'flow' | 'metrics' | 'topology' | 'monitor';
+export type Domain = 'flow' | 'metrics' | 'topology' | 'monitor' | 'sessions';
 
 export interface DashboardFrame {
   domain: Domain;
@@ -590,7 +621,9 @@ export const DOMAIN_PAYLOADS: Record<Domain, ReadonlySet<DashboardPayload['type'
   metrics: new Set(['metric_tick']),
   topology: new Set(['topology_update']),
   monitor: new Set(['monitor']),
+  sessions: new Set(['session_update']),
 };
+
 
 /** The first WS message after connect: a full snapshot the live frames build upon. */
 export interface SnapshotFrame {
@@ -667,10 +700,151 @@ export interface FlowSummary extends PhaseTimings {
    * when `client_label` is absent.
    */
   client_source?: ClientSource | null;
+  /**
+   * Sessions — the detected harness profile (`claude-code`, `codex`, `pi-agent`, ...) and version,
+   * flattened from the Rust `FlowSessionFacts`. Absent ⇒ persistence off / not detected (renders `—`).
+   */
+  harness?: string | null;
+  harness_version?: string | null;
+  /** Sessions — the gateway session node (`sessions.id`) this flow was linked into. */
+  session_id?: string | null;
+  /** Sessions — the chain predecessor's `api_call_id`, when this flow extends a chain. */
+  chain_parent_request_id?: string | null;
+  /** Sessions — where/how the flow diverged from its predecessor. Absent ⇒ lineage not computed. */
+  divergence_kind?: DivergenceKind | null;
+  /** Sessions — true when the divergence falls inside the predecessor's items (prefix-cache miss). */
+  cache_bust?: boolean | null;
+  /** Sessions — owner of the authenticating virtual key; absent for open-mode keys. */
+  user_id?: string | null;
+  /** Sessions — the authenticating virtual key's stable database id (never the credential). */
+  virtual_key_id?: string | null;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
 export type SnapshotFlowSummary = FlowSummary;
+
+// ---------------------------------------------------------------------------
+// Durable history (SQL-backed `/dashboard/api/history/*`). Sessions are the tree nodes requests
+// link into; a request row is the Rust `RequestSummary` (only the fields the UI reads are typed).
+// ---------------------------------------------------------------------------
+
+/** One session-tree node (the Rust `sessions::SessionRow`). */
+export interface SessionRow {
+  id: string;
+  parent_id: string | null;
+  kind: 'declared' | 'inferred' | string;
+  harness: string;
+  harness_version: string | null;
+  /** The harness's own id when declared; null for inferred nodes. */
+  external_id: string | null;
+  session_kind: string | null;
+  client_label: string | null;
+  virtual_key_id: string | null;
+  /** Owner of the key that opened the node; null for open-mode/legacy rows. */
+  user_id: string | null;
+  depth: number;
+  root_request_id: string | null;
+  spawned_by_request_id: string | null;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  request_count: number;
+}
+
+/** `GET /dashboard/api/history/sessions` */
+export interface SessionsResponse {
+  sessions: SessionRow[];
+  since_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** A durable request row as the history API returns it (subset the UI reads). */
+export interface HistoryRequest {
+  id: string;
+  response_id: string | null;
+  client_protocol: string;
+  client_model: string;
+  backend: string | null;
+  resolved_model: string | null;
+  status: string;
+  created_at_ms: number;
+  completed_at_ms: number | null;
+  first_token_at_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_tokens: number | null;
+  error: string | null;
+  client_label: string | null;
+  harness: string | null;
+  harness_version: string | null;
+  session_id: string | null;
+  chain_parent_request_id: string | null;
+  item_count: number | null;
+  shared_prefix_items: number | null;
+  divergence_kind: DivergenceKind | null;
+  divergence_index: number | null;
+  cache_bust: boolean | null;
+}
+
+/** `GET /dashboard/api/history/sessions/:id` */
+export interface SessionDetailResponse {
+  session: SessionRow;
+  /** Nearest first. */
+  ancestors: SessionRow[];
+  children: SessionRow[];
+  /** Oldest first. */
+  requests: HistoryRequest[];
+  requests_truncated: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Active sessions (live hub, `GET /dashboard/api/sessions/active`).
+// ---------------------------------------------------------------------------
+
+/** One request stub on a live session's ring (body-free scalar facts). */
+export interface SessionRequestStub {
+  api_call_id: string;
+  client_model: string;
+  created_at_ms: number;
+  /** `running` | `completed` | `failed`. */
+  status: string;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  error?: string | null;
+  terminal_reason?: string | null;
+}
+
+/** A live session: the tree node plus its trailing-window request counts. */
+export interface ActiveSession extends SessionRow {
+  /** Newest-first request stubs within the activity window. */
+  requests: SessionRequestStub[];
+  requests_1m: number;
+  requests_5m: number;
+  requests_10m: number;
+  requests_15m: number;
+}
+
+/** Lifetime token totals over a session's durable requests. */
+export interface SessionAggregate {
+  session_id: string;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  reasoning_tokens?: number | null;
+}
+
+/** `GET /dashboard/api/sessions/active` */
+export interface ActiveSessionsResponse {
+  /** Newest activity first. */
+  sessions: Array<ActiveSession & { aggregate: SessionAggregate | null }>;
+  /** The sessions-domain WS cursor at the cut. */
+  seq: number;
+}
+
+/** Which request-side hop of a durable request to reassemble. */
+export type HistoryBodyHop = 'client_in' | 'upstream_out';
 
 /** `GET /dashboard/api/flows` */
 export interface FlowsResponse {
@@ -776,11 +950,15 @@ export interface MetricsResponse {
   p95: number;
   p99: number;
   tokens_per_sec: number;
+  prefill_tokens_per_sec: number;
+  decode_tokens_per_sec: number;
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
   /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
   usage_samples: number;
+  prefill_samples: number;
+  decode_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
   /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
@@ -836,6 +1014,254 @@ export interface CatalogEntry {
   context_limit?: number | null;
 }
 
+export interface ProviderInventoryModel {
+  id: string;
+  context_limit?: number | null;
+}
+
+export interface AvailabilitySchedule {
+  timezone: string;
+  default_capacity: number;
+  weekly: AvailabilityWeeklyWindow[];
+  exceptions: AvailabilityException[];
+}
+
+export interface AvailabilityWeeklyWindow {
+  days: string[];
+  start_local: string;
+  end_local: string;
+  capacity: number;
+}
+
+export interface AvailabilityException {
+  start: string;
+  end: string;
+  capacity: number;
+}
+
+export interface ProviderInventoryEntry {
+  provider_id: string;
+  provider_name: string;
+  resource_id: string | null;
+  route: string | null;
+  base_url: string;
+  models: ProviderInventoryModel[];
+  availability: AvailabilitySchedule | null;
+  capacity_limit: number | null;
+  active_requests: number | null;
+  accepting_requests: boolean;
+  healthy: boolean;
+}
+
+export interface ProvidersResponse {
+  providers: ProviderInventoryEntry[];
+}
+
+/** Dashboard-managed OpenAI-compatible provider. Credentials never cross this wire. */
+export interface ConfiguredProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key_present: boolean;
+  auto_discover: boolean;
+  allowed_models?: string[] | null;
+  disabled_models: string[];
+  models: ProviderInventoryModel[];
+}
+
+export interface ConfiguredProvidersResponse {
+  providers: ConfiguredProvider[];
+}
+
+export interface CreateConfiguredProviderRequest {
+  name: string;
+  base_url: string;
+  api_key: string;
+}
+
+export interface UpdateConfiguredProviderRequest {
+  auto_discover?: boolean;
+  allowed_models?: string[] | null;
+  disabled_models?: string[];
+}
+
+export interface FleetModel {
+  id: string;
+  description?: string;
+  image: string;
+  gpu_count?: number;
+  max_instances?: number;
+}
+
+export interface FleetInstanceStatus {
+  instance_id?: string;
+  index: number;
+  port?: number;
+  phase: string;
+  container_status?: string;
+  assigned_gpus?: number[];
+  last_error?: string;
+}
+
+export interface FleetDeploymentStatus {
+  model_id: string;
+  phase: string;
+  desired_state: string;
+  desired_instances?: number;
+  ready_instances?: number;
+  container_status?: string;
+  health?: string;
+  exit_code?: number;
+  oom_killed?: boolean;
+  assigned_gpus: number[];
+  instances?: FleetInstanceStatus[];
+  last_error?: string;
+  last_checked?: string;
+}
+
+export interface FleetModelEntry {
+  model: FleetModel;
+  status: FleetDeploymentStatus;
+}
+
+export interface FleetModelsResponse {
+  models: FleetModelEntry[];
+}
+
+export interface FleetOperation {
+  id: string;
+  kind: string;
+  model_id: string;
+  state: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface FleetOperationResponse {
+  changed: boolean;
+  operation?: FleetOperation;
+}
+
+export interface MeshJoinKey {
+  id: string;
+  label?: string;
+  enabled: boolean;
+  created_at_ms: number;
+  expires_at_ms?: number;
+  max_uses?: number;
+  use_count: number;
+}
+
+export interface MeshNode {
+  endpoint_id: string;
+  label?: string;
+  enabled: boolean;
+  joined_at_ms: number;
+  join_key_id?: string;
+  last_seen_at_ms?: number;
+  model_switching?: MeshModelSwitching;
+}
+
+export interface MeshModelSwitching {
+  provider: string;
+  models: MeshSwitchableModel[];
+  revision: number;
+}
+
+export interface MeshSwitchableModel {
+  id: string;
+  description?: string;
+  phase: string;
+  desired_state: string;
+  gpu_count?: number;
+  max_instances?: number;
+  desired_instances?: number;
+  ready_instances?: number;
+  assigned_gpus?: number[];
+  instances?: FleetInstanceStatus[];
+  container_status?: string;
+  last_error?: string;
+}
+
+export interface MeshDisabledModel {
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+  disabled_at_ms: number;
+}
+
+export interface MeshAdminState {
+  join_keys: MeshJoinKey[];
+  nodes: MeshNode[];
+  disabled_models: MeshDisabledModel[];
+}
+
+export interface CreateMeshJoinKeyRequest {
+  label?: string;
+  max_uses?: number;
+  expires_in_secs?: number;
+}
+
+export interface CreateMeshJoinKeyResponse {
+  join_key: MeshJoinKey;
+  token: string;
+}
+
+export interface RevokeMeshJoinKeyResponse {
+  updated: boolean;
+  disabled_endpoint_ids: string[];
+  evicted_endpoint_ids: string[];
+}
+
+export interface SetMeshNodeResponse {
+  updated: boolean;
+  endpoint_id: string;
+  enabled: boolean;
+  evicted: boolean;
+}
+
+export interface MeshModelOverrideRequest {
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+}
+
+export interface SetMeshModelResponse {
+  updated: boolean;
+  endpoint_id: string;
+  resource_id: string;
+  model: string;
+  disabled: boolean;
+}
+
+export interface SwitchMeshModelResponse {
+  endpoint_id: string;
+  model_id: string;
+  accepted: boolean;
+  changed: boolean;
+  error?: string;
+}
+
+export type ProviderMetricsSource = 'vllm' | 'sglang';
+
+export interface ProviderCacheMetrics {
+  provider: string;
+  source: ProviderMetricsSource;
+  fetched_at_ms: number;
+  cache_hits: number | null;
+  cache_queries: number | null;
+  cache_hit_rate: number | null;
+  kv_cache_usage: number | null;
+  data_quality: 'derived';
+}
+
+export interface ProviderMetricsResponse {
+  generated_at_ms: number;
+  providers: ProviderCacheMetrics[];
+}
+
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */
 export interface SnapshotResponse {
   cursors: SeqCursors;
@@ -857,7 +1283,120 @@ export interface KillResponse {
 
 /** `POST /dashboard/login` body. */
 export interface LoginRequest {
-  token: string;
+  token?: string;
+  username?: string;
+  password?: string;
+}
+
+/** The user behind a dashboard session (embedded in the signed cookie). */
+export interface SessionUser {
+  id: string;
+  username: string;
+  is_admin: boolean;
+}
+
+export type AuthMode = 'users' | 'token' | 'open' | 'github';
+
+/** `GET /dashboard/api/me` */
+export interface MeResponse {
+  user: SessionUser | null;
+  is_admin: boolean;
+  auth_mode: AuthMode;
+  accounts_enabled: boolean;
+}
+
+export interface UserRecord {
+  id: string;
+  username: string;
+  is_admin: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface ApiKeyRecord {
+  id: string;
+  label: string | null;
+  user_id: string | null;
+  allowed_models: string[];
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** `POST /dashboard/api/keys` — the plaintext is returned exactly once. */
+export interface CreatedKeyResponse {
+  key: ApiKeyRecord;
+  secret: string;
+  registered_keys: number;
+}
+
+/** One cell of `GET /dashboard/api/history/throughput` (bucket × model × backend). */
+export interface ThroughputBucket {
+  bucket_ms: number;
+  model: string;
+  backend: string | null;
+  requests: number;
+  completed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  ttft_ms_sum: number;
+  ttft_count: number;
+  prefill_tokens: number;
+  decode_ms_sum: number;
+  decode_tokens: number;
+  decode_count: number;
+}
+
+export interface ThroughputResponse {
+  buckets: ThroughputBucket[];
+  since_ms: number;
+  bucket_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** One cell of `GET /dashboard/api/history/activity` (bucket × user × key). */
+export interface ActivityBucket {
+  bucket_ms: number;
+  user_id: string | null;
+  virtual_key_id: string | null;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+}
+
+export interface ActivityResponse {
+  buckets: ActivityBucket[];
+  since_ms: number;
+  bucket_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** One row of `GET /dashboard/api/history/metrics`: the sample JSON is in `data`. */
+export interface MetricSample {
+  backend: string;
+  ts_ms: number;
+  data: string;
+}
+
+export interface HistoryMetricsResponse {
+  samples: MetricSample[];
+  since_ms: number;
+  limit: number;
+  truncated: boolean;
+}
+
+/** A parsed upstream (vLLM/SGLang) sample, `kind: "upstream"` in `MetricSample.data`. */
+export interface UpstreamMetricsSample {
+  kind: 'upstream';
+  engine: 'vllm' | 'sglang' | 'unknown' | string;
+  backend: string;
+  scraped_at_ms: number;
+  models: Record<string, { values?: Record<string, number>; by_label?: Record<string, Record<string, number>> }>;
+  kept_lines: number;
 }
 
 /**
@@ -869,7 +1408,426 @@ export interface DashboardBootstrap {
   authenticated: boolean;
   csrf_token: string | null;
   mutations_enabled: boolean;
+  /** The signed-in user (null for token / dev-open sessions). */
+  user: SessionUser | null;
+  auth_mode: AuthMode;
 }
+
+// ---------------------------------------------------------------------------
+// Access management shapes (RBAC dashboard)
+// ---------------------------------------------------------------------------
+
+export type ManagementPermission =
+  | 'auth.keys.read'
+  | 'auth.keys.create'
+  | 'auth.keys.revoke'
+  | 'auth.keys.rotate'
+  | 'auth.principals.read'
+  | 'auth.principals.write'
+  | 'auth.groups.read'
+  | 'auth.groups.write'
+  | 'auth.roles.read'
+  | 'auth.roles.write'
+  | 'auth.policies.read'
+  | 'auth.policies.write'
+  | 'auth.usage.read'
+  | 'auth.audit.read'
+  | 'auth.pricing.read'
+  | 'auth.pricing.sync'
+  | 'auth.pricing.write'
+  | 'auth.sessions.read'
+  | 'auth.sessions.terminate'
+  | 'fleet.models.read'
+  | 'fleet.models.load'
+  | 'fleet.models.unload';
+
+export interface AuthSummary {
+  enabled: boolean;
+  policy_epoch: number;
+  actor: {
+    kind: 'bootstrap' | 'delegated';
+    principal_id: string | null;
+    display_name: string;
+    permissions: ManagementPermission[];
+  };
+  counts: {
+    users: number;
+    groups: number;
+    roles: number;
+    policies: number;
+    api_keys: number;
+    active_sessions: number;
+  };
+}
+
+export interface AuthUser {
+  id: string;
+  kind: 'user' | 'service_account';
+  display_name: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface AuthGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  member_count: number;
+}
+
+export interface AuthRole {
+  id: string;
+  name: string;
+  enabled: boolean;
+  permissions: ManagementPermission[];
+}
+
+export interface AuthPolicy {
+  id: string;
+  name: string;
+  effect: 'allow' | 'deny';
+  enabled: boolean;
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  requested_models: string[];
+  served_models: string[];
+  providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  max_daily_session_starts: number | null;
+  management_permissions: ManagementPermission[];
+}
+
+export interface AuthPolicyTimeWindow {
+  weekday_mask: number;
+  start_minute: number;
+  end_minute: number;
+  absolute_start_ms: number | null;
+  absolute_end_ms: number | null;
+}
+
+export interface AuthApiKey {
+  id: string;
+  principal_id: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  capture_payloads: boolean;
+}
+
+/** Returned only by create/rotate. `raw_key` must never be persisted or fetched later. */
+export interface CreatedAuthApiKey extends AuthApiKey {
+  raw_key: string;
+}
+
+export interface AuthSession {
+  id: string;
+  kind: 'inference' | 'dashboard';
+  principal_id: string;
+  key_id: string;
+  endpoint: string | null;
+  requested_model: string | null;
+  started_at: string;
+  expires_at: string | null;
+}
+
+export interface AuthUsageRow {
+  dimension: string;
+  value: string;
+  requests: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+  reasoning_tokens: number | null;
+  cost: number | null;
+  cost_confidence: CostConfidence;
+}
+
+export interface AuthAuditEvent {
+  id: string;
+  timestamp: string;
+  actor: string;
+  action: string;
+  target: string;
+  outcome: 'ok' | 'denied' | 'error';
+  metadata: Record<string, unknown>;
+}
+
+export interface AuthPricingRow {
+  model: string;
+  provider: string;
+  source: string;
+  fetched_at: string;
+  input_per_1k: string;
+  output_per_1k: string;
+  confidence: CostConfidence;
+}
+
+export interface AuthUsersResponse { users: AuthUser[] }
+export interface AuthGroupsResponse { groups: AuthGroup[] }
+export interface AuthRolesResponse { roles: AuthRole[] }
+export interface AuthPoliciesResponse { policies: AuthPolicy[] }
+export interface AuthApiKeysResponse { api_keys: AuthApiKey[] }
+export interface AuthSessionsResponse { sessions: AuthSession[] }
+export interface AuthUsageResponse { usage: AuthUsageRow[] }
+export interface AuthAuditResponse { events: AuthAuditEvent[] }
+export interface AuthPricingResponse { pricing: AuthPricingRow[] }
+
+export interface KeyLoginRequest { api_key: string }
+export interface CreateAuthUserRequest {
+  display_name: string;
+  kind: AuthUser['kind'];
+}
+export interface CreateAuthGroupRequest {
+  name: string;
+  members: string[];
+}
+export interface CreateAuthRoleRequest {
+  name: string;
+  permissions: ManagementPermission[];
+}
+export interface CreateAuthApiKeyRequest {
+  principal_id: string;
+  name: string;
+  expires_at?: string | null;
+  capture_payloads?: boolean;
+}
+export interface CreateAuthPolicyRequest {
+  name: string;
+  effect: AuthPolicy['effect'];
+  subjects: string[];
+  endpoints: string[];
+  models: string[];
+  requested_models: string[];
+  served_models: string[];
+  providers: string[];
+  routes: string[];
+  time_windows: AuthPolicyTimeWindow[];
+  max_concurrent_sessions: number | null;
+  max_daily_session_starts: number | null;
+  management_permissions: ManagementPermission[];
+}
+
+export function isAuthSummary(v: unknown): v is AuthSummary {
+  if (!isObj(v) || typeof v.enabled !== 'boolean' || !isUint(v.policy_epoch) || !isObj(v.actor) || !isObj(v.counts)) return false;
+  const actor = v.actor;
+  const counts = v.counts;
+  return isOneOf(actor.kind, ['bootstrap', 'delegated'] as const)
+    && isNullableStr(actor.principal_id)
+    && isStr(actor.display_name)
+    && isStringArray(actor.permissions)
+    && ['users', 'groups', 'roles', 'policies', 'api_keys', 'active_sessions'].every((k) => isUint(counts[k]));
+}
+
+function isAuthUser(v: unknown): v is AuthUser {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['user', 'service_account'] as const)
+    && isStr(v.display_name) && typeof v.enabled === 'boolean' && isStr(v.created_at);
+}
+function isAuthGroup(v: unknown): v is AuthGroup {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isUint(v.member_count);
+}
+function isAuthRole(v: unknown): v is AuthRole {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && typeof v.enabled === 'boolean' && isStringArray(v.permissions);
+}
+function isAuthPolicy(v: unknown): v is AuthPolicy {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isOneOf(v.effect, ['allow', 'deny'] as const)
+    && typeof v.enabled === 'boolean' && isStringArray(v.subjects) && isStringArray(v.endpoints)
+    && isStringArray(v.models) && isStringArray(v.requested_models) && isStringArray(v.served_models)
+    && isStringArray(v.providers) && isStringArray(v.routes)
+    && Array.isArray(v.time_windows) && v.time_windows.every((window) => isObj(window)
+      && isUint(window.weekday_mask) && isUint(window.start_minute) && isUint(window.end_minute)
+      && (window.absolute_start_ms === null || typeof window.absolute_start_ms === 'number')
+      && (window.absolute_end_ms === null || typeof window.absolute_end_ms === 'number'))
+    && (v.max_concurrent_sessions === null || isUint(v.max_concurrent_sessions))
+    && (v.max_daily_session_starts === null || isUint(v.max_daily_session_starts))
+    && isStringArray(v.management_permissions);
+}
+function isAuthApiKey(v: unknown): v is AuthApiKey {
+  return isObj(v) && isStr(v.id) && isStr(v.principal_id) && isStr(v.name) && isStr(v.prefix)
+    && typeof v.enabled === 'boolean' && isStr(v.created_at) && isNullableStr(v.expires_at)
+    && isNullableStr(v.last_used_at) && typeof v.capture_payloads === 'boolean';
+}
+function isAuthSession(v: unknown): v is AuthSession {
+  return isObj(v) && isStr(v.id) && isOneOf(v.kind, ['inference', 'dashboard'] as const)
+    && isStr(v.principal_id) && isStr(v.key_id) && isNullableStr(v.endpoint)
+    && isNullableStr(v.requested_model) && isStr(v.started_at) && isNullableStr(v.expires_at);
+}
+function isAuthUsageRow(v: unknown): v is AuthUsageRow {
+  return isObj(v) && isStr(v.dimension) && isStr(v.value) && isUint(v.requests)
+    && isNullableUint(v.prompt_tokens) && isNullableUint(v.completion_tokens)
+    && isNullableUint(v.cached_tokens) && isNullableUint(v.reasoning_tokens)
+    && (v.cost === null || isNum(v.cost)) && isOneOf(v.cost_confidence, COST_CONFIDENCES);
+}
+function isAuthAuditEvent(v: unknown): v is AuthAuditEvent {
+  return isObj(v) && isStr(v.id) && isStr(v.timestamp) && isStr(v.actor) && isStr(v.action)
+    && isStr(v.target) && isOneOf(v.outcome, ['ok', 'denied', 'error'] as const) && isObj(v.metadata);
+}
+function isAuthPricingRow(v: unknown): v is AuthPricingRow {
+  return isObj(v) && isStr(v.model) && isStr(v.provider) && isStr(v.source) && isStr(v.fetched_at)
+    && isStr(v.input_per_1k) && isStr(v.output_per_1k) && isOneOf(v.confidence, COST_CONFIDENCES);
+}
+
+function isArrayEnvelope(v: unknown, key: string, guard: (item: unknown) => boolean): boolean {
+  return isObj(v) && Array.isArray(v[key]) && v[key].every(guard);
+}
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every(isStr);
+}
+
+export const isAuthUsersResponse = (v: unknown): v is AuthUsersResponse => isArrayEnvelope(v, 'users', isAuthUser);
+export const isAuthGroupsResponse = (v: unknown): v is AuthGroupsResponse => isArrayEnvelope(v, 'groups', isAuthGroup);
+export const isAuthRolesResponse = (v: unknown): v is AuthRolesResponse => isArrayEnvelope(v, 'roles', isAuthRole);
+export const isAuthPoliciesResponse = (v: unknown): v is AuthPoliciesResponse => isArrayEnvelope(v, 'policies', isAuthPolicy);
+export const isAuthApiKeysResponse = (v: unknown): v is AuthApiKeysResponse => isArrayEnvelope(v, 'api_keys', isAuthApiKey);
+export const isAuthSessionsResponse = (v: unknown): v is AuthSessionsResponse => isArrayEnvelope(v, 'sessions', isAuthSession);
+export const isAuthUsageResponse = (v: unknown): v is AuthUsageResponse => isArrayEnvelope(v, 'usage', isAuthUsageRow);
+export const isAuthAuditResponse = (v: unknown): v is AuthAuditResponse => isArrayEnvelope(v, 'events', isAuthAuditEvent);
+export const isAuthPricingResponse = (v: unknown): v is AuthPricingResponse => isArrayEnvelope(v, 'pricing', isAuthPricingRow);
+export function isCreatedAuthApiKey(v: unknown): v is CreatedAuthApiKey {
+  if (!isObj(v) || !isAuthApiKey(v)) return false;
+  const rawKey = (v as unknown as Record<string, unknown>).raw_key;
+  return isStr(rawKey) && rawKey.startsWith('llmc_');
+}
+
+function isAvailabilitySchedule(v: unknown): v is AvailabilitySchedule {
+  return isObj(v) && isStr(v.timezone) && isUint(v.default_capacity)
+    && Array.isArray(v.weekly) && v.weekly.every((window) => isObj(window)
+      && isStringArray(window.days) && isStr(window.start_local) && isStr(window.end_local)
+      && isUint(window.capacity))
+    && Array.isArray(v.exceptions) && v.exceptions.every((exception) => isObj(exception)
+      && isStr(exception.start) && isStr(exception.end) && isUint(exception.capacity));
+}
+
+function isProviderInventoryModel(v: unknown): v is ProviderInventoryModel {
+  return isObj(v) && isStr(v.id) && isOptUint(v.context_limit);
+}
+
+function isProviderInventoryEntry(v: unknown): v is ProviderInventoryEntry {
+  return isObj(v) && isStr(v.provider_id) && isStr(v.provider_name)
+    && isNullableStr(v.resource_id) && isNullableStr(v.route) && isStr(v.base_url)
+    && Array.isArray(v.models) && v.models.every(isProviderInventoryModel)
+    && (v.availability === null || isAvailabilitySchedule(v.availability))
+    && isNullableUint(v.capacity_limit) && isNullableUint(v.active_requests)
+    && typeof v.accepting_requests === 'boolean'
+    && typeof v.healthy === 'boolean';
+}
+
+function isProviderCacheMetrics(v: unknown): v is ProviderCacheMetrics {
+  return isObj(v) && isStr(v.provider) && isOneOf(v.source, ['vllm', 'sglang'] as const)
+    && isUint(v.fetched_at_ms) && isOptNum(v.cache_hits) && isOptNum(v.cache_queries)
+    && isOptNum(v.cache_hit_rate) && isOptNum(v.kv_cache_usage)
+    && v.data_quality === 'derived';
+}
+
+export const isProvidersResponse = (v: unknown): v is ProvidersResponse => isArrayEnvelope(v, 'providers', isProviderInventoryEntry);
+function isConfiguredProvider(v: unknown): v is ConfiguredProvider {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.base_url)
+    && typeof v.api_key_present === 'boolean' && typeof v.auto_discover === 'boolean'
+    && (v.allowed_models === undefined || v.allowed_models === null || isStringArray(v.allowed_models))
+    && isStringArray(v.disabled_models)
+    && Array.isArray(v.models) && v.models.every(isProviderInventoryModel);
+}
+export const isConfiguredProvidersResponse = (v: unknown): v is ConfiguredProvidersResponse =>
+  isArrayEnvelope(v, 'providers', isConfiguredProvider);
+export const isConfiguredProviderResponse = isConfiguredProvider;
+export const isProviderMetricsResponse = (v: unknown): v is ProviderMetricsResponse =>
+  isObj(v) && isUint(v.generated_at_ms) && Array.isArray(v.providers) && v.providers.every(isProviderCacheMetrics);
+
+function isFleetModel(v: unknown): v is FleetModel {
+  return isObj(v) && isStr(v.id) && isOptStr(v.description) && isStr(v.image)
+    && (v.gpu_count === undefined || isUint(v.gpu_count))
+    && (v.max_instances === undefined || isUint(v.max_instances));
+}
+
+function isFleetInstanceStatus(v: unknown): v is FleetInstanceStatus {
+  return isObj(v) && isOptStr(v.instance_id) && isUint(v.index) && isOptUint(v.port)
+    && isStr(v.phase) && isOptStr(v.container_status)
+    && (v.assigned_gpus === undefined || (Array.isArray(v.assigned_gpus) && v.assigned_gpus.every(isUint)))
+    && isOptStr(v.last_error);
+}
+
+function isFleetDeploymentStatus(v: unknown): v is FleetDeploymentStatus {
+  return isObj(v) && isStr(v.model_id) && isStr(v.phase) && isStr(v.desired_state)
+    && (v.desired_instances === undefined || isUint(v.desired_instances))
+    && (v.ready_instances === undefined || isUint(v.ready_instances))
+    && isOptStr(v.container_status) && isOptStr(v.health) && isOptNum(v.exit_code)
+    && (v.oom_killed === undefined || typeof v.oom_killed === 'boolean')
+    && Array.isArray(v.assigned_gpus) && v.assigned_gpus.every(isUint)
+    && (v.instances === undefined || (Array.isArray(v.instances) && v.instances.every(isFleetInstanceStatus)))
+    && isOptStr(v.last_error) && isOptStr(v.last_checked);
+}
+
+function isFleetModelEntry(v: unknown): v is FleetModelEntry {
+  return isObj(v) && isFleetModel(v.model) && isFleetDeploymentStatus(v.status);
+}
+
+function isFleetOperation(v: unknown): v is FleetOperation {
+  return isObj(v) && isStr(v.id) && isStr(v.kind) && isStr(v.model_id) && isStr(v.state)
+    && isOptStr(v.error) && isStr(v.created_at) && isOptStr(v.started_at) && isOptStr(v.finished_at);
+}
+
+export const isFleetModelsResponse = (v: unknown): v is FleetModelsResponse =>
+  isArrayEnvelope(v, 'models', isFleetModelEntry);
+
+export const isFleetOperationResponse = (v: unknown): v is FleetOperationResponse =>
+  isObj(v) && typeof v.changed === 'boolean' && (v.operation === undefined || isFleetOperation(v.operation));
+
+function isMeshJoinKey(v: unknown): v is MeshJoinKey {
+  return isObj(v) && isStr(v.id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
+    && isUint(v.created_at_ms) && isOptUint(v.expires_at_ms) && isOptUint(v.max_uses)
+    && isUint(v.use_count);
+}
+
+function isMeshNode(v: unknown): v is MeshNode {
+  return isObj(v) && isStr(v.endpoint_id) && isOptStr(v.label) && typeof v.enabled === 'boolean'
+    && isUint(v.joined_at_ms) && isOptStr(v.join_key_id) && isOptUint(v.last_seen_at_ms)
+    && (v.model_switching === undefined || isMeshModelSwitching(v.model_switching));
+}
+
+function isMeshModelSwitching(v: unknown): v is MeshModelSwitching {
+  return isObj(v) && isStr(v.provider) && isUint(v.revision)
+    && Array.isArray(v.models) && v.models.every((model) => isObj(model) && isStr(model.id)
+      && isOptStr(model.description) && isStr(model.phase) && isStr(model.desired_state)
+      && (model.gpu_count === undefined || isUint(model.gpu_count))
+      && (model.max_instances === undefined || isUint(model.max_instances))
+      && (model.desired_instances === undefined || isUint(model.desired_instances))
+      && (model.ready_instances === undefined || isUint(model.ready_instances))
+      && (model.assigned_gpus === undefined || (Array.isArray(model.assigned_gpus) && model.assigned_gpus.every(isUint)))
+      && (model.instances === undefined || (Array.isArray(model.instances) && model.instances.every(isFleetInstanceStatus)))
+      && isOptStr(model.container_status) && isOptStr(model.last_error));
+}
+
+function isMeshDisabledModel(v: unknown): v is MeshDisabledModel {
+  return isObj(v) && isStr(v.endpoint_id) && isStr(v.resource_id) && isStr(v.model) && isUint(v.disabled_at_ms);
+}
+
+export const isMeshAdminState = (v: unknown): v is MeshAdminState =>
+  isObj(v)
+  && Array.isArray(v.join_keys) && v.join_keys.every(isMeshJoinKey)
+  && Array.isArray(v.nodes) && v.nodes.every(isMeshNode)
+  && Array.isArray(v.disabled_models) && v.disabled_models.every(isMeshDisabledModel);
+
+export const isCreateMeshJoinKeyResponse = (v: unknown): v is CreateMeshJoinKeyResponse =>
+  isObj(v) && isMeshJoinKey(v.join_key) && isStr(v.token);
+
+export const isRevokeMeshJoinKeyResponse = (v: unknown): v is RevokeMeshJoinKeyResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStringArray(v.disabled_endpoint_ids) && isStringArray(v.evicted_endpoint_ids);
+
+export const isSetMeshNodeResponse = (v: unknown): v is SetMeshNodeResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStr(v.endpoint_id) && typeof v.enabled === 'boolean' && typeof v.evicted === 'boolean';
+
+export const isSetMeshModelResponse = (v: unknown): v is SetMeshModelResponse =>
+  isObj(v) && typeof v.updated === 'boolean' && isStr(v.endpoint_id) && isStr(v.resource_id)
+  && isStr(v.model) && typeof v.disabled === 'boolean';
+
+export const isSwitchMeshModelResponse = (v: unknown): v is SwitchMeshModelResponse =>
+  isObj(v) && isStr(v.endpoint_id) && isStr(v.model_id) && typeof v.accepted === 'boolean'
+  && typeof v.changed === 'boolean' && isOptStr(v.error);
 
 // ---------------------------------------------------------------------------
 // Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).
@@ -914,7 +1872,7 @@ function isNullableUint(v: unknown): v is number | null {
   return v === null || isUint(v);
 }
 
-const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
+const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor', 'sessions'];
 export function isDomain(v: unknown): v is Domain {
   return isOneOf(v, DOMAINS);
 }
@@ -984,11 +1942,13 @@ function isOptUsage(v: unknown): boolean {
 function isMetricWindow(v: unknown): v is MetricWindow {
   return (
     isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
     // The three per-metric measurability denominators are non-negative integer counts
     // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
     // ($/min). All REQUIRED — the Rust tile always emits them.
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     // Gap 07: the aggregate cost-confidence tag is REQUIRED on every window.
     isCostConfidence(v.cost_confidence)
   );
@@ -1179,8 +2139,10 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
     case 'metric_tick':
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+        isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+        isUint(v.decode_samples) && isUint(v.priced_samples) &&
         isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
       );
     case 'flow_status':
@@ -1188,12 +2150,14 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
         isStr(v.api_call_id) && isOptStr(v.response_id) &&
         isOneOf(v.status, FLOW_STATUSES) &&
         isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms) &&
+        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
         // Gap 02/03: optional spine fields on the live flow update — validated when present.
         isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
       );
     case 'topology_update':
       return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
+    case 'session_update':
+      return Array.isArray(v.touched) && v.touched.every(isStr);
     default:
       return false;
   }
@@ -1236,8 +2200,20 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     // `client_source`, when present, must be a bounded `ClientSource` (don't trust the wire — a
     // bogus source must not paint the weak-UA fallback as a strong identity). Both absent ⇒ the
     // unattributed flow (renders `—`).
-    isOptStr(v.client_label) && isOptClientSource(v.client_source)
+    isOptStr(v.client_label) && isOptClientSource(v.client_source) &&
+    // Sessions: the optional harness/session facts (flattened `FlowSessionFacts`). A bogus
+    // divergence kind must not paint a row as a cache bust; `cache_bust` is a bool when present.
+    isOptStr(v.harness) && isOptStr(v.harness_version) && isOptStr(v.session_id) &&
+    isOptStr(v.chain_parent_request_id) && isOptDivergenceKind(v.divergence_kind) &&
+    (v.cache_bust === undefined || v.cache_bust === null || typeof v.cache_bust === 'boolean') &&
+    // Key attribution (flattened FlowSessionFacts): opaque ids when present.
+    isOptStr(v.user_id) && isOptStr(v.virtual_key_id)
   );
+}
+
+/** Optional `DivergenceKind`: absent, null, or one of the bounded kinds. */
+function isOptDivergenceKind(v: unknown): boolean {
+  return v === undefined || v === null || isOneOf(v, DIVERGENCE_KINDS);
 }
 
 /** Optional `ClientSource` (gap 04): absent, null, or one of the bounded snake_case sources. */
@@ -1249,8 +2225,10 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) &&
+    isNum(v.prefill_tokens_per_sec) && isNum(v.decode_tokens_per_sec) && isNum(v.cost_per_min) &&
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.prefill_samples) &&
+    isUint(v.decode_samples) && isUint(v.priced_samples) &&
     isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
   );
 }

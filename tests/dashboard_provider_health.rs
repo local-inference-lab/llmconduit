@@ -283,3 +283,26 @@ async fn idle_cooling_provider_flips_to_healthy_via_deadline_wake() {
     // A failure WAS recorded (cumulative), proving the entry is the same provider.
     assert!(provider.failover_count >= 1);
 }
+
+/// An idle gateway publishes its health vector ONCE: the 1 s tick republishes
+/// only when something changed, so the topology version (which every dashboard
+/// viewer polls and every 5 s snapshot cut captures) stays put with no traffic.
+#[tokio::test]
+async fn idle_publication_task_does_not_bump_the_topology_version() {
+    let gateway = gateway_with_upstream(Arc::new(leaf("http://127.0.0.1:9")));
+    let handle = gateway.spawn_provider_health_publisher();
+    let publisher = gateway.provider_health_publisher();
+    let initial = publisher.latest();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let later = publisher.latest();
+    handle.abort();
+    assert_eq!(
+        initial.version, 1,
+        "the initial snapshot is published at spawn"
+    );
+    assert_eq!(later.version, initial.version, "no change, no republish");
+    assert!(
+        Arc::ptr_eq(&initial, &later),
+        "the same snapshot stays current"
+    );
+}

@@ -76,7 +76,7 @@ async fn real_upstream_normal_stream_is_unaffected() {
             r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"}}]}"#
         ),
         frame(
-            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":" world"}}]}"#
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}"#
         ),
         "data: [DONE]\n\n",
     );

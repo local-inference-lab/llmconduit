@@ -13,6 +13,7 @@ use axum::http::Request;
 use llmconduit::config::Config;
 use llmconduit::config::PersistedConfig;
 use serde_json::json;
+use std::io::Read as _;
 use tower::ServiceExt;
 
 /// A config with the given inbound body cap whose upstream points at a closed
@@ -136,6 +137,39 @@ async fn length_less_body_over_limit_on_raw_bytes_route_is_413_not_400() {
         response.status().as_u16(),
         413,
         "length-less oversize must be 413, not 400"
+    );
+}
+
+#[tokio::test]
+async fn compressed_body_decoded_over_limit_is_413_before_dashboard_auth() {
+    let app = llmconduit::build_app(config_with_limit(4096));
+    let mut encoder = flate2::read::GzEncoder::new(
+        std::io::Cursor::new("x".repeat(8192)),
+        flate2::Compression::best(),
+    );
+    let mut compressed = Vec::new();
+    encoder.read_to_end(&mut compressed).expect("gzip encode");
+    assert!(
+        compressed.len() < 4096,
+        "test payload must be compressed under the inbound byte cap"
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/flows")
+                .header("content-encoding", "gzip")
+                .body(Body::from(compressed))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status().as_u16(),
+        413,
+        "decoded-over-limit body must be rejected before dashboard auth"
     );
 }
 

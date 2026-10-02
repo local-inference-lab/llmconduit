@@ -118,7 +118,7 @@ impl UpstreamClient for PendingUpstream {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<reqwest::Response, AppError> {
+    async fn list_models(&self) -> Result<llmconduit::upstream::UpstreamModelsResponse, AppError> {
         Err(AppError::internal("unused in this test"))
     }
 

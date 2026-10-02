@@ -27,6 +27,7 @@
 //! `active_streams` is the live count of OPEN flows (the metrics rings don't track
 //! liveness; the FlowStore does).
 
+use crate::dashboard_auth::{AuthSession, DashboardAuth, MutationPolicy};
 use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::ClientSource;
 use crate::dashboard_flow::FlowRecord;
@@ -46,10 +47,13 @@ use crate::metrics::MetricsView;
 use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
 use crate::monitor::DebugWsMessage;
-use crate::upstream::ProviderHealthSnapshot;
+use crate::upstream::{ProviderHealthSnapshot, ProviderInventoryEntry};
+use axum::Extension;
+use axum::Json;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -58,6 +62,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 /// Window lengths in SECONDS (the divisor for the per-window rate fields). Must
 /// match the MetricsLayer ring spans (1m/5m/1h at 1 s resolution).
@@ -76,26 +82,39 @@ const WINDOW_1H_SECS: f64 = 3600.0;
 /// to match the frontend's optional-key validators, EXCEPT `usage` (serialized as
 /// `null` when absent — the frontend accepts absent/null/usage) and `cost`
 /// (`null`-not-absent when the served model has no configured price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowRow {
+    /// The gateway's per-request id (the flow's primary key).
     pub api_call_id: String,
+    /// The engine response id the flow is linked to, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Inbound HTTP method.
     pub method: String,
+    /// Inbound request URI.
     pub uri: String,
+    /// Model id the client asked for, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_requested: Option<String>,
+    /// Model id that actually served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_served: Option<String>,
+    /// The upstream (URL or provider name) that served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
+    /// Token usage reported by the upstream; `null` until reported.
     pub usage: Option<FlowUsage>,
+    /// Lifecycle status.
     pub status: FlowStatus,
+    /// Epoch-ms the flow opened.
     pub started_ms: u128,
+    /// Epoch-ms the flow reached its terminal state, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_ms: Option<u128>,
+    /// Monotonic wall-clock duration in ms from open to terminal, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
+    /// Reason recorded at finalize, when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
     /// Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`
@@ -143,6 +162,11 @@ pub struct FlowRow {
     /// the CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Harness/session facts (harness, harness_version, session_id,
+    /// chain_parent_request_id, divergence_kind, cache_bust), flattened as
+    /// sibling fields; each absent when unknown.
+    #[serde(flatten)]
+    pub session: crate::dashboard_flow::FlowSessionFacts,
 }
 
 impl FlowRow {
@@ -178,6 +202,7 @@ impl FlowRow {
             phases: record.phases,
             attempts: record.attempts.clone(),
             first_upstream_byte_ms: record.first_upstream_byte_ms,
+            session: record.session.clone(),
         }
     }
 
@@ -216,28 +241,39 @@ impl FlowRow {
             phases: summary.phases,
             attempts: summary.attempts.clone(),
             first_upstream_byte_ms: summary.first_upstream_byte_ms,
+            session: summary.session.clone(),
         }
     }
 }
 
 /// `GET /dashboard/api/flows` — the paged flow list + total + the FlowStore
 /// domain cursor. Matches the frozen `FlowsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowsResponse {
+    /// The requested page of rows, newest first.
     pub flows: Vec<FlowRow>,
     /// Total rows AFTER filtering but BEFORE paging (so the SPA can page).
     pub total: usize,
+    /// FlowStore domain cursor at the time of the read.
     pub flow_seq: u64,
 }
 
 /// Query params for `GET /dashboard/api/flows`. All optional; `status`/`model`/
 /// `upstream` filter, `page`/`limit` page (1-based page; absent ⇒ all rows).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct FlowsQuery {
+    /// Filter by lifecycle status: `open`, `completed`, `failed` or `cancelled`
+    /// (an unrecognized value is ignored, not an error).
     pub status: Option<String>,
+    /// Case-insensitive substring match on the served OR requested model id.
     pub model: Option<String>,
+    /// Case-insensitive substring match on the upstream target.
     pub upstream: Option<String>,
+    /// 1-based page number (default 1); only applies together with `limit`.
     pub page: Option<usize>,
+    /// Rows per page; absent or `0` returns every filtered row.
     pub limit: Option<usize>,
 }
 
@@ -246,12 +282,17 @@ pub struct FlowsQuery {
 /// `{sequence, kind, payload?, ts_ms?}`. `payload` is the heterogeneous delta body
 /// (a segment text, an event summary, a status, …); the SPA narrows at the use
 /// site. `sequence` is a per-flow ordinal (the replay order), NOT a domain cursor.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowDelta {
+    /// Per-flow replay ordinal (0-based, monitor order) — NOT a domain cursor.
     pub sequence: u64,
+    /// `segment.<output|reasoning|tool>`, `event.<kind>` or `status`.
     pub kind: String,
+    /// Kind-specific body: `{text}` for a segment, `{summary, payload_preview}` for
+    /// an event, `{status, error}` for a status delta.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// Epoch-ms of the delta, when the monitor recorded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts_ms: Option<u128>,
 }
@@ -271,7 +312,7 @@ pub struct FlowDelta {
 /// enclosing [`FlowDetailBody`] stays serialize-only (it is only ever a response), so the
 /// round-trip is pinned on THIS self-contained sub-DTO. Consumed by gap 14 (failure
 /// taxonomy).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FlowUpstreamResponse {
     /// The redacted, capped upstream response/error body, parsed to JSON (or a string
     /// `Value` for a non-JSON / marker body). An EMPTY captured body parses to a string
@@ -288,16 +329,20 @@ pub struct FlowUpstreamResponse {
 /// headers, the replayed deltas, usage, the terminal, and cost. Mirrors the frozen
 /// `FlowDetail` (`:id == api_call_id`). The three bodies, headers, and deltas are
 /// the additive detail fields over a [`FlowRow`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowDetailBody {
+    /// The record's OWN FlowStore cursor (frozen at its last mutation).
     pub flow_seq: u64,
+    /// The gateway's per-request id (the flow's primary key).
     pub api_call_id: String,
+    /// The engine response id the flow is linked to, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     /// The captured INBOUND request body (parsed JSON). Absent when evicted by the
     /// D1 summary-byte quota; parsed back to a `Value` so the SPA renders the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_body: Option<serde_json::Value>,
+    /// Captured inbound request headers; absent when none were retained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_headers: Option<BTreeMap<String, String>>,
     /// The captured CANONICAL/normalized body (D2), parsed. Absent when evicted.
@@ -318,22 +363,34 @@ pub struct FlowDetailBody {
     /// key. Consumed by gap 14 (failure taxonomy); the React app ignores it until then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_response: Option<FlowUpstreamResponse>,
+    /// Model id the client asked for, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_requested: Option<String>,
+    /// Model id that actually served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_served: Option<String>,
+    /// The upstream (URL or provider name) that served the flow, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
+    /// Token usage reported by the upstream; `null` until reported.
     pub usage: Option<FlowUsage>,
+    /// Lifecycle status.
     pub status: FlowStatus,
+    /// The streamed deltas replayed from the monitor, in monitor order.
     pub deltas: Vec<FlowDelta>,
+    /// Reason recorded at finalize, when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// Epoch-ms the flow opened.
     pub started_ms: u128,
+    /// Epoch-ms the flow reached its terminal state, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_ms: Option<u128>,
+    /// Monotonic wall-clock duration in ms from open to terminal, when terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
+    /// USD cost of the flow (usage × the served model's price); `null` when the
+    /// served model has no configured price.
     pub cost: Option<f64>,
     /// Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
     /// mirroring the flow-row tag so the inspector labels an `estimated` figure.
@@ -359,6 +416,9 @@ pub struct FlowDetailBody {
     /// CLIENT). `None` ⇒ absent ⇒ renders `—`, NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Harness/session facts, flattened (see [`FlowRow::session`]).
+    #[serde(flatten)]
+    pub session: crate::dashboard_flow::FlowSessionFacts,
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
@@ -374,8 +434,9 @@ pub struct FlowDetailBody {
 /// The frontend renders `—` on `null`, NEVER `0`. Derives `Deserialize` alongside
 /// `Serialize` so the changed wire field round-trips in a test (AGENTS.md: no
 /// changed wire field without a deserialize-then-serialize proof).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CatalogEntry {
+    /// Model id as advertised by the upstream `/v1/models` catalog.
     pub id: String,
     /// The per-model max-context window (tokens), or `null`/absent when the
     /// upstream advertises none. `skip_serializing_if` so an unavailable window
@@ -386,16 +447,59 @@ pub struct CatalogEntry {
     pub context_limit: Option<i64>,
 }
 
+/// `GET /dashboard/api/providers` — concrete provider resources and their
+/// advertised model/capacity metadata. Kept separate from topology so graph
+/// snapshots remain small and provider inventory can carry schedules.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvidersBody {
+    pub providers: Vec<ProviderInventoryEntry>,
+}
+
+fn dashboard_error(status: StatusCode, message: impl Into<String>) -> Response {
+    json_no_store(
+        status,
+        &crate::openapi::DashboardError {
+            error: message.into(),
+        },
+    )
+}
+
+fn dashboard_admin_denial(session: &AuthSession) -> Option<Response> {
+    if session
+        .user
+        .as_ref()
+        .map_or_else(|| session.bootstrap_admin(), |user| user.is_admin)
+    {
+        None
+    } else {
+        Some(dashboard_error(
+            StatusCode::FORBIDDEN,
+            "administrator role required",
+        ))
+    }
+}
+
+fn dashboard_mutation_denial(auth: &DashboardAuth, headers: &HeaderMap) -> Option<Response> {
+    auth.authorize_mutation(headers)
+        .err()
+        .map(|denied| dashboard_error(denied.status(), denied.message()))
+}
+
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors
 /// the frozen `SnapshotResponse`: the per-domain `cursors`, the cut instant, the
 /// body-free flow summaries (priced), and the metrics/topology cuts reshaped into
 /// their REST bodies (`null` when the cut is empty for that domain).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SnapshotResponse {
+    /// The cut's per-domain cursors (all zero when no cut exists).
     pub cursors: SeqCursors,
+    /// Epoch-ms the cut was taken (the requested `at`, or `0`, when no cut exists).
     pub at_ms: u128,
+    /// The cut's body-free flow summaries, priced (empty when no cut exists).
     pub summaries: Vec<FlowRow>,
+    /// The cut's metrics in the `/metrics` shape; `null` when no cut exists.
     pub metrics: Option<MetricsSnapshot>,
+    /// The cut's topology in the `/topology` shape; `null` when no cut exists.
     pub topology: Option<TopologySnapshot>,
 }
 
@@ -403,8 +507,12 @@ pub struct SnapshotResponse {
 /// ms) to time-travel to. Absent ⇒ the latest cut. Typed `u64` (NOT `u128`): the
 /// axum/serde QUERY deserializer does not support `u128`, and unix-ms fits `u64`
 /// for ~580 million years; the handler widens it to the `u128` `snapshot_at` key.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotQuery {
+    /// Unix-ms instant to time-travel to (the nearest cut at or before it);
+    /// absent ⇒ the latest cut.
     pub at: Option<u64>,
 }
 
@@ -447,7 +555,7 @@ pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
 /// every flow row + detail (and aggregated onto the metrics windows). Serializes
 /// snake_case to mirror the data-quality vocabulary the frontend already uses
 /// (`measured`/`derived`/`estimated`/`unavailable`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CostConfidence {
     /// The model is priced AND every billed token class has a known rate: the prompt
@@ -519,6 +627,17 @@ fn flow_cost_and_confidence(
     gateway: &Gateway,
 ) -> (Option<f64>, CostConfidence) {
     let price = model_served.and_then(|model| gateway.price_for(model));
+    priced_cost_and_confidence(price, usage)
+}
+
+/// The cost/confidence rule itself, independent of where the price came from, so
+/// the REST rows (`FlowRow`) and the WS snapshot rows
+/// (`dashboard_ws::price_snapshot_summaries`) can never tag the same flow
+/// differently.
+pub(crate) fn priced_cost_and_confidence(
+    price: Option<ModelPrice>,
+    usage: Option<FlowUsage>,
+) -> (Option<f64>, CostConfidence) {
     match (price, usage) {
         // Priced AND usage present: a real cost, tagged confident/estimated by the
         // cached-rate presence.
@@ -669,6 +788,8 @@ fn rest_window_tile(
     };
     let reqs_per_sec = total as f64 / window_secs;
     let tokens_per_sec = window_total_tokens(report) as f64 / window_secs;
+    let prefill_tokens_per_sec = report.prefill_tokens_per_sec();
+    let decode_tokens_per_sec = report.decode_tokens_per_sec();
     let cost_per_min = window_total_cost(report, prices) / (window_secs / 60.0);
     // Per-metric measurability denominators (gap 01 review round 1, finding 3): token
     // and cost availability are SEPARATE from latency/error. `usage_samples` counts
@@ -679,6 +800,8 @@ fn rest_window_tile(
     // renders `—`; or `usage_samples > 0` yet `priced_samples == 0` (only unpriced
     // models) → `cost_per_min` renders `—`, distinguishing "unpriced" from `$0.00`.
     let usage_samples = report.usage_sample_count();
+    let prefill_samples = report.prefill_sample_count();
+    let decode_samples = report.decode_sample_count();
     let priced_samples = report.priced_sample_count(|model| price_lookup(prices, model).is_some());
     // Gap 07: the aggregate cost confidence for this window's `cost_per_min` — `estimated`
     // when any priced bucket would silently bill cached at the default `0.0`, so the strip
@@ -695,6 +818,8 @@ fn rest_window_tile(
         p95: finite(percentiles.p95),
         p99: finite(percentiles.p99),
         tokens_per_sec: finite(tokens_per_sec),
+        prefill_tokens_per_sec: finite(prefill_tokens_per_sec),
+        decode_tokens_per_sec: finite(decode_tokens_per_sec),
         cost_per_min: finite(cost_per_min),
         // `total` is the count of TERMINAL flows in the window — the latency/error
         // measured/unavailable signal. `0` here ≠ "zero throughput"; it means NO
@@ -703,6 +828,8 @@ fn rest_window_tile(
         // use the separate denominators above.
         samples: total,
         usage_samples,
+        prefill_samples,
+        decode_samples,
         priced_samples,
         cost_confidence,
     }
@@ -731,9 +858,13 @@ pub fn metrics_body(
         p95: m1.p95,
         p99: m1.p99,
         tokens_per_sec: m1.tokens_per_sec,
+        prefill_tokens_per_sec: m1.prefill_tokens_per_sec,
+        decode_tokens_per_sec: m1.decode_tokens_per_sec,
         cost_per_min: m1.cost_per_min,
         samples: m1.samples,
         usage_samples: m1.usage_samples,
+        prefill_samples: m1.prefill_samples,
+        decode_samples: m1.decode_samples,
         priced_samples: m1.priced_samples,
         cost_confidence: m1.cost_confidence,
         windows: MetricWindows { m1, m5, h1 },
@@ -833,12 +964,7 @@ fn upstream_edge_rates(
 /// `pub(crate)` so the live `/dashboard/ws` tick + initial snapshot derive the SAME
 /// open-flow count as the REST `/metrics` read (gap 01 — one source, no drift).
 pub(crate) fn active_stream_count(gateway: &Gateway) -> u64 {
-    gateway
-        .flow_store()
-        .list()
-        .iter()
-        .filter(|record| record.status == FlowStatus::Open)
-        .count() as u64
+    gateway.flow_store().open_count()
 }
 
 /// Count the OPEN flows in a FROZEN snapshot cut's body-free summaries — the
@@ -846,7 +972,7 @@ pub(crate) fn active_stream_count(gateway: &Gateway) -> u64 {
 /// live FlowStore for a time-travel cut would report NOW's open count, not the cut's;
 /// the summaries are the cut's own consistent flow projection, so counting their open
 /// status keeps the whole snapshot frozen to one instant.
-fn cut_active_stream_count(summaries: &[crate::dashboard_flow::SnapshotFlowSummary]) -> u64 {
+fn cut_active_stream_count(summaries: &[crate::dashboard_flow::SharedFlowSummary]) -> u64 {
     summaries
         .iter()
         .filter(|summary| summary.status == FlowStatus::Open)
@@ -955,6 +1081,33 @@ fn parse_captured_body(body: &Arc<[u8]>) -> serde_json::Value {
 /// table. Lists newest-first from the FlowStore (D1), filters by status/model/
 /// upstream, pages, and stamps the FlowStore domain `flow_seq`. Each row carries
 /// its `cost` (usage × served-model price).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/flows",
+    tag = "dashboard",
+    operation_id = "dashboard_flows",
+    params(FlowsQuery),
+    responses(
+        (
+            status = 200,
+            description = "The filtered, paged flow rows plus the FlowStore domain cursor.",
+            body = FlowsResponse
+        ),
+        (status = 400, description = "Unknown or mistyped query parameter (the query string is strict; the text names the field). Plain text from the extractor.", content_type = "text/plain", body = String),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
@@ -1000,6 +1153,43 @@ pub async fn dashboard_flows(
 /// on-wire bodies (absent, not error, when evicted), the inbound headers, the
 /// replayed deltas (MonitorHub snapshot filtered by `response_id`), usage, the
 /// terminal, timing, the served identity, and the `cost`. `404` for an unknown id.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/flows/{id}",
+    tag = "dashboard",
+    operation_id = "dashboard_flow_detail",
+    params(
+        (
+            "id" = String,
+            Path,
+            description = "The flow's `api_call_id`; a linked `response_id` also resolves via the FlowStore link index."
+        )
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The inspector detail body for the flow.",
+            body = FlowDetailBody
+        ),
+        (
+            status = 404,
+            description = "No live flow for that id (also when the flow store is disabled). Body: `{\"error\": \"no flow for that id\"}`.",
+            body = crate::openapi::DashboardError
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_flow_detail(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
@@ -1070,6 +1260,7 @@ pub async fn dashboard_flow_detail(
         phases: record.phases,
         attempts: record.attempts.clone(),
         first_upstream_byte_ms: record.first_upstream_byte_ms,
+        session: record.session.clone(),
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1079,20 +1270,72 @@ pub async fn dashboard_flow_detail(
 /// `cost_per_min`. Per-window TRUE per-second rates (D13 divides by the window
 /// seconds). The view + its cursor are captured in ONE metrics-lock hold so the
 /// body and `metrics_seq` are consistent.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/metrics",
+    tag = "dashboard",
+    operation_id = "dashboard_metrics",
+    responses(
+        (
+            status = 200,
+            description = "The live metrics tiles (headline `m1` + all three windows) and the metrics domain cursor.",
+            body = MetricsSnapshot
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
     let (view, metrics_seq) = gateway.metrics().view_with_seq();
     let active = active_stream_count(gateway.as_ref());
-    let body = metrics_body(&view, metrics_seq, active, gateway.price_table());
+    let prices = gateway.price_table();
+    let body = metrics_body(&view, metrics_seq, active, &prices);
     json_no_store(StatusCode::OK, &body)
 }
 
 /// `GET /dashboard/api/topology` — the provider topology (D4 nodes + edges) + the
 /// price table + the topology domain `topology_seq`. Edges carry per-upstream
 /// per-second request/token/cost rates rolled up from the live `m1` metrics window.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/topology",
+    tag = "dashboard",
+    operation_id = "dashboard_topology",
+    responses(
+        (
+            status = 200,
+            description = "Provider nodes, gateway→provider edges, the price table and the topology domain cursor.",
+            body = TopologySnapshot
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
     let snapshot = gateway.provider_health_publisher().latest();
     let view = gateway.metrics().view();
-    let body = topology_body(&snapshot, gateway.price_table(), &view.window_1m);
+    let prices = gateway.price_table();
+    let body = topology_body(&snapshot, &prices, &view.window_1m);
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1110,10 +1353,52 @@ pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response
 ///
 /// An upstream catalog-fetch failure yields an empty array (the dashboard simply
 /// shows no catalog) rather than a 5xx that would blank the whole view.
-pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response {
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/catalog",
+    tag = "dashboard",
+    operation_id = "dashboard_catalog",
+    responses(
+        (
+            status = 200,
+            description = "Bare array of catalog entries; an empty array when the upstream catalog fetch fails.",
+            body = Vec<CatalogEntry>
+        ),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
+pub async fn dashboard_catalog(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(dashboard_auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    headers: HeaderMap,
+) -> Response {
+    let access = match crate::http::dashboard_inference_access(
+        &gateway,
+        &dashboard_auth,
+        &session,
+        &headers,
+    )
+    .await
+    {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
     let entries = match gateway.upstream_client().supported_model_catalog().await {
         Ok(catalog) => catalog
             .into_iter()
+            .filter(|entry| access.allows_model(&entry.id))
             .map(|entry| CatalogEntry {
                 id: entry.id,
                 // Pass the parsed `Option<i64>` THROUGH unchanged: a known window
@@ -1127,12 +1412,240 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
     json_no_store(StatusCode::OK, &entries)
 }
 
+/// `GET /dashboard/api/providers` — provider-scoped model catalogs, availability
+/// schedules, and current capacity. A failed inventory refresh returns an empty
+/// list so the rest of the dashboard remains usable while an upstream is down.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/providers",
+    tag = "dashboard",
+    responses(
+        (status = 200, body = serde_json::Value, description = "Configured provider inventory and current mesh capacity."),
+        (status = 401, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn dashboard_providers(State(gateway): State<Arc<Gateway>>) -> Response {
+    let providers = gateway
+        .upstream_client()
+        .provider_inventory()
+        .await
+        .unwrap_or_default();
+    json_no_store(StatusCode::OK, &ProvidersBody { providers })
+}
+
+/// `GET /dashboard/api/configured-providers` — dashboard-managed
+/// OpenAI-compatible providers. Credentials are never returned.
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/configured-providers",
+    tag = "dashboard",
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn dashboard_configured_providers(State(gateway): State<Arc<Gateway>>) -> Response {
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.list().await {
+        Ok(providers) => json_no_store(
+            StatusCode::OK,
+            &crate::managed_providers::ConfiguredProvidersBody { providers },
+        ),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
+/// `POST /dashboard/api/configured-providers` — add one provider after
+/// server-side `/v1/models` discovery.
+#[utoipa::path(
+    post,
+    path = "/dashboard/api/configured-providers",
+    tag = "dashboard",
+    request_body(content = crate::managed_providers::CreateConfiguredProviderRequest),
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 502, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn create_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    headers: HeaderMap,
+    payload: Result<
+        Json<crate::managed_providers::CreateConfiguredProviderRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return dashboard_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON body, expected {{name, base_url, api_key}}: {rejection}"),
+            );
+        }
+    };
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.add(payload).await {
+        Ok(provider) => json_no_store(StatusCode::CREATED, &provider),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
+/// `PATCH /dashboard/api/configured-providers/{id}` — update discovery and model selection.
+#[utoipa::path(
+    patch,
+    path = "/dashboard/api/configured-providers/{id}",
+    tag = "dashboard",
+    params(("id" = String, Path)),
+    request_body(content = crate::managed_providers::UpdateConfiguredProviderRequest),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 400, body = crate::openapi::DashboardError),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn update_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<
+        Json<crate::managed_providers::UpdateConfiguredProviderRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            return dashboard_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid JSON body, expected optional {{auto_discover, allowed_models, disabled_models}}: {rejection}"
+                ),
+            );
+        }
+    };
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.update(&id, payload).await {
+        Ok(Some(provider)) => json_no_store(StatusCode::OK, &provider),
+        Ok(None) => dashboard_error(StatusCode::NOT_FOUND, "configured provider not found"),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
+/// `DELETE /dashboard/api/configured-providers/{id}` — remove one provider.
+#[utoipa::path(
+    delete,
+    path = "/dashboard/api/configured-providers/{id}",
+    tag = "dashboard",
+    params(("id" = String, Path)),
+    responses(
+        (status = 204, description = "Deleted."),
+        (status = 401, body = crate::openapi::DashboardError),
+        (status = 403, body = crate::openapi::DashboardError),
+        (status = 404, body = crate::openapi::DashboardError),
+        (status = 503, body = crate::openapi::DashboardError)
+    ),
+    security(("session" = []))
+)]
+pub async fn delete_configured_provider(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    session: AuthSession,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) =
+        dashboard_admin_denial(&session).or_else(|| dashboard_mutation_denial(&auth, &headers))
+    {
+        return response;
+    }
+    let Some(registry) = gateway.managed_providers() else {
+        return dashboard_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SQL storage is required for configured providers",
+        );
+    };
+    match registry.delete(&id).await {
+        Ok(true) => crate::dashboard_auth::no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => dashboard_error(StatusCode::NOT_FOUND, "configured provider not found"),
+        Err(err) => dashboard_error(err.status_code(), err.client_message),
+    }
+}
+
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut from the D5
 /// snapshot ring (`snapshot_at(ts)` nearest ≤ ts, or the latest cut when `at` is
 /// absent). Reshapes the cut's metrics ([`MetricsView`]) + topology
 /// ([`ProviderHealthSnapshot`]) into their REST bodies and prices the body-free
 /// summaries. `200` with empty summaries + `null` metrics/topology + zero cursors
 /// when no cut has been taken yet (rather than a 404 the SPA would treat as fatal).
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/snapshot",
+    tag = "dashboard",
+    operation_id = "dashboard_snapshot",
+    params(SnapshotQuery),
+    responses(
+        (
+            status = 200,
+            description = "The frozen cut nearest at-or-before `at` (or the latest). When no cut exists: empty `summaries`, `null` `metrics`/`topology`, zero `cursors`.",
+            body = SnapshotResponse
+        ),
+        (status = 400, description = "Unknown or mistyped query parameter (the query string is strict; the text names the field). Plain text from the extractor.", content_type = "text/plain", body = String),
+        (
+            status = 401,
+            description = "No valid dashboard session (plain text `unauthorized`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+        (
+            status = 500,
+            description = "Response serialization failed (plain text `failed to serialize response`).",
+            body = String,
+            content_type = "text/plain"
+        ),
+    )
+)]
 pub async fn dashboard_snapshot(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<SnapshotQuery>,
@@ -1177,9 +1690,13 @@ pub async fn dashboard_snapshot(
         &cut.metrics,
         cut.cursors.metrics_seq,
         active,
-        prices,
+        &prices,
     ));
-    let topology = Some(topology_body(&cut.topology, prices, &cut.metrics.window_1m));
+    let topology = Some(topology_body(
+        &cut.topology,
+        &prices,
+        &cut.metrics.window_1m,
+    ));
     json_no_store(
         StatusCode::OK,
         &SnapshotResponse {
@@ -1245,7 +1762,7 @@ fn apply_paging(rows: Vec<FlowRow>, page: Option<usize>, limit: Option<usize>) -
 /// carries the locked-down CSP/nosniff/no-referrer/X-Frame-Options set, exactly
 /// like the auth-layer responses. A serialization failure (should be unreachable —
 /// the DTOs are plain data) degrades to a 500 with the same headers.
-fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
+pub(crate) fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
     let response = match serde_json::to_vec(body) {
         Ok(bytes) => (
             status,
@@ -1260,6 +1777,91 @@ fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
             .into_response(),
     };
     crate::dashboard_auth::no_store(response)
+}
+
+// ---------------------------------------------------------------------------
+// Active sessions (live hub)
+// ---------------------------------------------------------------------------
+
+/// `GET /dashboard/api/sessions/active` — the dashboard's primary live view:
+/// every session with activity in the last 15 minutes (the [`SessionHub`] cut),
+/// each with its 1/5/10/15-minute request windows, the newest request stubs,
+/// and — when durable history is configured — the session's LIFETIME token
+/// totals joined from the store. Attribution (`user_id`, `virtual_key_id`,
+/// `client_label`) rides the hub's `SessionRow` verbatim.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ActiveSessionsBody {
+    /// Newest activity first.
+    sessions: Vec<ActiveSessionBody>,
+    /// The sessions-domain WS cursor at the cut (monotonic; a live
+    /// `session_update` frame with `seq <= this` dedups client-side).
+    seq: u64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ActiveSessionBody {
+    #[serde(flatten)]
+    session: crate::session_hub::ActiveSession,
+    /// Lifetime totals over the node's durable requests; `None` per class
+    /// when no row reported it. Absent (null) when history is disabled.
+    aggregate: Option<crate::control_plane_store::SessionAggregate>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/dashboard/api/sessions/active",
+    tag = "dashboard",
+    operation_id = "dashboard_sessions_active",
+    responses(
+        (status = 200, description = "The active-session cut (last 15 minutes), newest first.", body = ActiveSessionsBody),
+        (status = 401, description = "No valid dashboard session (plain text `unauthorized`).", body = String, content_type = "text/plain"),
+    )
+)]
+pub async fn dashboard_sessions_active(State(gateway): State<Arc<Gateway>>) -> Response {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let cut = gateway
+        .session_hub()
+        .active_sessions(u64::try_from(now_ms).unwrap_or(u64::MAX));
+    let seq = gateway.session_hub().last_seq();
+    // Join the durable lifetime aggregates when history is configured. The
+    // per-session queries are bounded (one per ACTIVE session, and the hub
+    // caps actives); a store error degrades that session's aggregate to
+    // `None` rather than failing the whole read (don't-lie-with-zeros: absent
+    // renders `—`, not a fabricated 0).
+    let store = gateway.persistence_store();
+    let mut sessions = Vec::with_capacity(cut.len());
+    for entry in cut {
+        let aggregate = match &store {
+            Some(store) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    store.session_aggregate(&entry.row.id),
+                )
+                .await
+                {
+                    Ok(Ok(aggregate)) => aggregate,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            session_id = %entry.row.id,
+                            error = %error,
+                            "active-sessions aggregate join failed"
+                        );
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        sessions.push(ActiveSessionBody {
+            session: entry,
+            aggregate,
+        });
+    }
+    json_no_store(StatusCode::OK, &ActiveSessionsBody { sessions, seq })
 }
 
 #[cfg(test)]
@@ -1348,13 +1950,15 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // One completed flow on a priced model: 1000 prompt + 500 completion tokens.
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             1200,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         let (view, seq) = metrics.view_with_seq();
@@ -1382,6 +1986,16 @@ mod tests {
             (body.tokens_per_sec - 25.0).abs() < 1e-9,
             "tok/s {} == 1500/60",
             body.tokens_per_sec
+        );
+        assert!(
+            (body.prefill_tokens_per_sec - 10_000.0).abs() < 1e-9,
+            "prefill tok/s {} == 1000/0.1s",
+            body.prefill_tokens_per_sec
+        );
+        assert!(
+            (body.decode_tokens_per_sec - 250.0).abs() < 1e-9,
+            "decode tok/s {} == 500/2s",
+            body.decode_tokens_per_sec
         );
         // cost = 1000 prompt @2.0/1k + 500 completion @6.0/1k = 2.0 + 3.0 = 5.0 over
         // 1 minute → cost_per_min ≈ 5.0.
@@ -1437,13 +2051,15 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // (a) usage on a PRICED model → counts toward samples + usage + priced.
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         // (b) NO usage (e.g. an upstream that omitted it) → samples only.
@@ -1502,13 +2118,15 @@ mod tests {
         use crate::dashboard_flow::FlowStatus as FS;
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
+        metrics.record_terminal_with_phases(
             FS::Completed,
             Some("glm-5.1"),
             "/v1/responses",
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            Some(100),
+            Some(2000),
             &[],
         );
         let (view, seq) = metrics.view_with_seq();
@@ -1522,9 +2140,19 @@ mod tests {
         // Headline mirrors.
         assert_eq!(value["usage_samples"], serde_json::json!(1));
         assert_eq!(value["priced_samples"], serde_json::json!(1));
+        assert_eq!(value["prefill_tokens_per_sec"], serde_json::json!(10_000.0));
+        assert_eq!(value["decode_tokens_per_sec"], serde_json::json!(250.0));
         // Per-window (m1 fed the terminal; m5/h1 share the same epoch ⇒ same counts).
         for window in ["m1", "m5", "h1"] {
             assert_eq!(value["windows"][window]["samples"], serde_json::json!(1));
+            assert_eq!(
+                value["windows"][window]["prefill_tokens_per_sec"],
+                serde_json::json!(10_000.0)
+            );
+            assert_eq!(
+                value["windows"][window]["decode_tokens_per_sec"],
+                serde_json::json!(250.0)
+            );
             assert_eq!(
                 value["windows"][window]["usage_samples"],
                 serde_json::json!(1)
@@ -1543,6 +2171,7 @@ mod tests {
         let rows = |n: usize| -> Vec<FlowRow> {
             (0..n)
                 .map(|i| FlowRow {
+                    session: Default::default(),
                     api_call_id: format!("api_{i}"),
                     response_id: None,
                     method: "POST".to_string(),
@@ -1582,8 +2211,76 @@ mod tests {
     /// pair OMITS both keys entirely (never `null`/empty-string-as-id). This pins the
     /// `/flows` + `/snapshot` summary wire contract for the new fields.
     #[test]
+    fn flow_session_facts_round_trip_and_project_present_and_absent() {
+        use crate::dashboard_flow::FlowSessionFacts;
+        let facts = FlowSessionFacts {
+            harness: Some("claude-code".to_string()),
+            harness_version: Some("2.1.205".to_string()),
+            session_id: Some("node-1".to_string()),
+            chain_parent_request_id: Some("api_prev".to_string()),
+            divergence_kind: Some("tools_changed".to_string()),
+            cache_bust: Some(true),
+            user_id: Some("user-7".to_string()),
+            virtual_key_id: Some("vk-1".to_string()),
+        };
+        // AGENTS.md: every new wire field proves it survives a round trip.
+        let encoded = serde_json::to_string(&facts).unwrap();
+        let decoded: FlowSessionFacts = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, facts);
+
+        let base = || FlowRow {
+            session: Default::default(),
+            api_call_id: "api_x".to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Open,
+            started_ms: 0,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+        let mut row = base();
+        row.session = facts;
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["harness"], "claude-code");
+        assert_eq!(value["session_id"], "node-1");
+        assert_eq!(value["divergence_kind"], "tools_changed");
+        assert_eq!(value["cache_bust"], true);
+        assert_eq!(value["chain_parent_request_id"], "api_prev");
+        // Absent facts are omitted, never null/false.
+        let value = serde_json::to_value(base()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in [
+            "harness",
+            "harness_version",
+            "session_id",
+            "chain_parent_request_id",
+            "divergence_kind",
+            "cache_bust",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "{key} must be absent when unknown"
+            );
+        }
+    }
+
+    #[test]
     fn flow_row_serializes_optional_client_attribution_present_and_absent() {
         let base = || FlowRow {
+            session: Default::default(),
             api_call_id: "api_x".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1643,6 +2340,7 @@ mod tests {
     #[test]
     fn flow_detail_body_upstream_response_round_trips_present_and_absent() {
         let base = || FlowDetailBody {
+            session: Default::default(),
             flow_seq: 7,
             api_call_id: "api_d".to_string(),
             response_id: Some("resp_d".to_string()),
@@ -1769,6 +2467,7 @@ mod tests {
     #[test]
     fn flow_row_projects_spine_fields_present_and_absent() {
         let base = || FlowRow {
+            session: Default::default(),
             api_call_id: "api_s".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1846,6 +2545,7 @@ mod tests {
     #[test]
     fn flow_detail_body_projects_spine_fields_present_and_absent() {
         let base = || FlowDetailBody {
+            session: Default::default(),
             flow_seq: 3,
             api_call_id: "api_sd".to_string(),
             response_id: None,
@@ -1925,6 +2625,7 @@ mod tests {
     #[test]
     fn flow_usage_unreported_class_is_absent_measured_zero_is_present() {
         let row = |cached: Option<i64>, reasoning: Option<i64>| FlowRow {
+            session: Default::default(),
             api_call_id: "api_u".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -2232,6 +2933,42 @@ mod tests {
             catalog_fetched_ms: None,
             catalog_size: None,
         }
+    }
+
+    #[test]
+    fn providers_body_preserves_provider_scoped_models_schedule_and_capacity() {
+        let body = ProvidersBody {
+            providers: vec![crate::upstream::ProviderInventoryEntry {
+                provider_id: "mesh:worker-a".into(),
+                provider_name: "local-vllm".into(),
+                resource_id: Some("gpu-0".into()),
+                route: Some("gpu-0".into()),
+                base_url: "mesh://worker-a/gpu-0".into(),
+                models: vec![crate::upstream::UpstreamModelEntry {
+                    id: "local-model".into(),
+                    context_limit: Some(32_768),
+                }],
+                availability: Some(crate::config::AvailabilitySchedule {
+                    timezone: "America/Chicago".into(),
+                    default_capacity: 2,
+                    weekly: Vec::new(),
+                    exceptions: Vec::new(),
+                }),
+                capacity_limit: Some(2),
+                active_requests: Some(1),
+                accepting_requests: true,
+                healthy: true,
+            }],
+        };
+
+        let value = serde_json::to_value(body).expect("serialize providers body");
+        let provider = &value["providers"][0];
+        assert_eq!(provider["provider_id"], "mesh:worker-a");
+        assert_eq!(provider["models"][0]["id"], "local-model");
+        assert_eq!(provider["models"][0]["context_limit"], 32_768);
+        assert_eq!(provider["availability"]["timezone"], "America/Chicago");
+        assert_eq!(provider["capacity_limit"], 2);
+        assert_eq!(provider["active_requests"], 1);
     }
 
     /// Gap 12 (AGENTS.md changed-wire-field rule): the per-provider latency/error metrics

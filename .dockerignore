@@ -1,8 +1,17 @@
 .git
 .codex
+.playwright-mcp
+/*.png
 target
 dashboard-frontend/node_modules
 dashboard-frontend/dist
 dashboard-frontend/*.tsbuildinfo
+config.yaml
+.env
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 Dockerfile
 .dockerignore

@@ -1,4 +1,4 @@
-use crate::config::merge_json_maps;
+use crate::config::{AvailabilitySchedule, merge_json_maps};
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::error::FailoverDisposition;
@@ -19,7 +19,7 @@ use http::HeaderName;
 use regex::Regex;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Map as JsonMap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -46,6 +47,23 @@ use url::Url;
 /// times in a row AND is still inside its cooldown window is shown as hard-down
 /// in the topology map; a single transient failure stays `Cooling`.
 const DOWN_THRESHOLD: u32 = 3;
+
+/// Provider error bodies are diagnostics, not model output. Stop reading once
+/// this prefix is retained so a hostile non-2xx response cannot make
+/// `Response::text` allocate an unbounded `String` before redaction.
+const UPSTREAM_ERROR_BODY_CAP_BYTES: usize = 128 * 1024;
+
+/// Successful provider JSON endpoints are allowed substantially more room than
+/// diagnostic error snippets, but still need a finite boundary before parsing
+/// into `serde_json::Value`.
+const UPSTREAM_JSON_BODY_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// The opt-in upstream request log is diagnostic data, not a second request
+/// archive. Bound every JSONL entry before it reaches disk so a very large
+/// prompt cannot create an unbounded allocation or append. Individual strings
+/// use the same cap as the other durable capture surfaces.
+const UPSTREAM_REQUEST_LOG_BODY_CAP_BYTES: usize = 128 * 1024;
+const UPSTREAM_REQUEST_LOG_SCALAR_CAP_BYTES: usize = 4 * 1024;
 
 /// Wall-clock epoch-ms, for the serializable [`ProviderHealth`] timestamps. The
 /// upstream cooldown bookkeeping uses a monotonic [`Instant`] (immune to clock
@@ -82,7 +100,7 @@ fn now_epoch_ms_u128() -> u128 {
 /// No-op when no token is threaded (tests / non-engine paths). Called by the leaf right
 /// after `logged_send_chat_request` returns, for BOTH a 2xx and a non-2xx response, so the
 /// failover loop / bare-leaf reads the TRUE wire TTFB even for an HTTP-status failure.
-fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
+pub(crate) fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
     if let Some(serving) = serving {
         serving.stamp_attempt_header_byte(now_epoch_ms_u128());
     }
@@ -191,11 +209,14 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
 /// Per-provider serving status for the topology map (D4). `Cooling` while inside
 /// the failure cooldown window; `Down` once a cooling provider has also crossed
 /// [`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
+    /// Serving normally.
     Healthy,
+    /// Inside the failure cooldown window.
     Cooling,
+    /// Cooling AND past the consecutive-failure threshold.
     Down,
 }
 
@@ -359,16 +380,145 @@ impl ProviderHealthPublisher {
 pub type UpstreamStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AppError>> + Send + 'static>>;
 
+/// Inference surface being authorized. This is intentionally transport-neutral:
+/// the same scope is evaluated for HTTP, Responses WebSocket, token counting,
+/// legacy completions, routing/failover, and mesh candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceEndpoint {
+    Responses,
+    ChatCompletions,
+    Messages,
+    CountTokens,
+    Completions,
+}
+
+type CandidatePredicate =
+    dyn Fn(&str, Option<&str>, &str, InferenceEndpoint) -> bool + Send + Sync + 'static;
+
+/// Immutable per-request authorization predicate carried to every dispatch
+/// layer. `Default` is deliberately unrestricted so auth-disabled deployments
+/// and existing callers retain their historical behavior. Enforced requests
+/// install a restricted predicate after policy evaluation.
+#[derive(Clone, Default)]
+pub struct AuthorizationScope {
+    predicate: Option<Arc<CandidatePredicate>>,
+}
+
+impl std::fmt::Debug for AuthorizationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationScope")
+            .field("restricted", &self.predicate.is_some())
+            .finish()
+    }
+}
+
+impl AuthorizationScope {
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+
+    pub fn restricted<F>(predicate: F) -> Self
+    where
+        F: Fn(&str, Option<&str>, &str, InferenceEndpoint) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            predicate: Some(Arc::new(predicate)),
+        }
+    }
+
+    pub fn allows_candidate(
+        &self,
+        provider_id: &str,
+        route_id: Option<&str>,
+        served_model: &str,
+        endpoint: InferenceEndpoint,
+    ) -> bool {
+        self.predicate
+            .as_ref()
+            .is_none_or(|predicate| predicate(provider_id, route_id, served_model, endpoint))
+    }
+
+    fn ensure_candidate(
+        &self,
+        provider_id: &str,
+        route_id: Option<&str>,
+        served_model: &str,
+        endpoint: InferenceEndpoint,
+    ) -> AppResult<()> {
+        if self.allows_candidate(provider_id, route_id, served_model, endpoint) {
+            Ok(())
+        } else {
+            Err(AppError::forbidden(
+                "the authenticated key is not authorized for this inference candidate",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyCompletionsRequest {
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub authorization: AuthorizationScope,
+    pub authorization_route: Option<String>,
+    pub authorization_provider: Option<String>,
+}
+
+impl ProxyCompletionsRequest {
+    pub fn new(headers: HeaderMap, body: Bytes) -> Self {
+        Self {
+            headers,
+            body,
+            authorization: AuthorizationScope::unrestricted(),
+            authorization_route: None,
+            authorization_provider: None,
+        }
+    }
+
+    pub fn with_authorization(mut self, authorization: AuthorizationScope) -> Self {
+        self.authorization = authorization;
+        self
+    }
+}
+
 /// One entry of the upstream `/v1/models` catalog: the model id plus its
 /// context-window length (`None` when the upstream reports no positive context
 /// length for it). Ids and context limits are derived from a SINGLE
 /// `/v1/models` snapshot so they always describe the same provider/state (G3:
 /// a separate context-limit fetch could otherwise pair one provider's ids with
 /// another's limits under failover).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamModelEntry {
     pub id: String,
     pub context_limit: Option<i64>,
+}
+
+/// One concrete provider resource advertised to the gateway. Unlike the union
+/// model catalog, this preserves which provider/resource owns each model and,
+/// for dynamic transports such as the mesh, its schedule and current capacity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderInventoryEntry {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub resource_id: Option<String>,
+    pub route: Option<String>,
+    pub base_url: String,
+    pub models: Vec<UpstreamModelEntry>,
+    pub availability: Option<AvailabilitySchedule>,
+    pub capacity_limit: Option<u32>,
+    pub active_requests: Option<u32>,
+    pub accepting_requests: bool,
+    pub healthy: bool,
+}
+
+/// Transport-neutral `/v1/models` response. Model catalogs can originate from
+/// HTTP providers or the in-memory mesh registry without manufacturing a
+/// `reqwest::Response`.
+#[derive(Debug, Clone)]
+pub struct UpstreamModelsResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
 }
 
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
@@ -417,11 +567,10 @@ pub trait UpstreamClient: Send + Sync {
         let stream = self.stream_chat_completion(request).await?;
         Ok(timeout_upstream_stream(stream, request_timeout))
     }
-    async fn list_models(&self) -> AppResult<reqwest::Response>;
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse>;
     async fn proxy_completions(
         &self,
-        _headers: HeaderMap,
-        _body: Bytes,
+        _request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         Err(AppError::internal(
             "upstream completions proxy is not implemented",
@@ -443,6 +592,25 @@ pub trait UpstreamClient: Send + Sync {
     async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
         let response = self.list_models().await?;
         collect_supported_model_catalog(response).await
+    }
+
+    /// Provider-scoped catalog and capacity data for administrative surfaces.
+    /// A bare upstream has one implicit provider; composites and dynamic
+    /// transports override this to retain their real provider boundaries.
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        Ok(vec![ProviderInventoryEntry {
+            provider_id: "upstream".to_string(),
+            provider_name: "Upstream".to_string(),
+            resource_id: None,
+            route: None,
+            base_url: self.provider_base_url(),
+            models: self.supported_model_catalog().await?,
+            availability: None,
+            capacity_limit: None,
+            active_requests: None,
+            accepting_requests: true,
+            healthy: true,
+        }])
     }
 
     /// Every backend model `requested_model` could ACTUALLY be served by
@@ -497,7 +665,27 @@ pub trait UpstreamClient: Send + Sync {
     fn provider_health(&self) -> Vec<ProviderHealth> {
         Vec::new()
     }
+
+    fn provider_base_url(&self) -> String {
+        "synthetic://upstream".to_string()
+    }
+
+    /// How long callers may cache this client's model catalog. Static HTTP
+    /// providers keep the historical five-minute window; dynamic transports
+    /// such as the mesh can request a shorter refresh without bypassing the
+    /// existing catalog abstraction.
+    fn model_catalog_cache_ttl(&self) -> Duration {
+        Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS)
+    }
+
+    /// Tell composite upstreams whether a request that resolves only through
+    /// catalog-default fallback should be rejected before dispatch. Leaf
+    /// upstreams have no catalog-default resolution step, so the default is a
+    /// no-op and the method stays dyn-safe for `Arc<dyn UpstreamClient>`.
+    fn set_reject_unknown_models(&self, _reject: bool) {}
 }
+
+pub type DynUpstreamClient = Arc<dyn UpstreamClient>;
 
 #[derive(Debug, Clone)]
 pub struct ReqwestUpstreamClient {
@@ -538,10 +726,10 @@ pub struct ReqwestUpstreamClient {
     tag_primary_provider: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FailoverUpstreamProvider {
     name: String,
-    client: ReqwestUpstreamClient,
+    client: DynUpstreamClient,
     upstream_model: Option<String>,
     exposed_model: Option<String>,
     upstream_chat_kwargs: JsonMap<String, Value>,
@@ -555,7 +743,23 @@ pub struct FailoverUpstreamProvider {
 impl FailoverUpstreamProvider {
     pub fn new(
         name: impl Into<String>,
-        client: ReqwestUpstreamClient,
+        client: impl UpstreamClient + 'static,
+        upstream_model: Option<String>,
+        exposed_model: Option<String>,
+        upstream_chat_kwargs: JsonMap<String, Value>,
+    ) -> Self {
+        Self::from_dyn(
+            name,
+            Arc::new(client),
+            upstream_model,
+            exposed_model,
+            upstream_chat_kwargs,
+        )
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        client: DynUpstreamClient,
         upstream_model: Option<String>,
         exposed_model: Option<String>,
         upstream_chat_kwargs: JsonMap<String, Value>,
@@ -571,6 +775,16 @@ impl FailoverUpstreamProvider {
     }
 }
 
+impl std::fmt::Debug for FailoverUpstreamProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailoverUpstreamProvider")
+            .field("name", &self.name)
+            .field("upstream_model", &self.upstream_model)
+            .field("exposed_model", &self.exposed_model)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FailoverUpstreamClient {
     providers: Vec<FailoverUpstreamProvider>,
@@ -578,10 +792,10 @@ pub struct FailoverUpstreamClient {
     states: Arc<Mutex<Vec<ProviderCooldownState>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RoutingUpstreamProvider {
     name: String,
-    primary_client: ReqwestUpstreamClient,
+    primary_client: DynUpstreamClient,
     primary_upstream_model: Option<String>,
     fallback_exposed_models: Vec<RoutingFallbackExposedModel>,
     client: FailoverUpstreamClient,
@@ -590,16 +804,34 @@ pub struct RoutingUpstreamProvider {
 impl RoutingUpstreamProvider {
     pub fn new(
         name: impl Into<String>,
-        primary_client: ReqwestUpstreamClient,
+        primary_client: impl UpstreamClient + 'static,
+        primary_upstream_model: Option<String>,
+        primary_upstream_chat_kwargs: JsonMap<String, Value>,
+        fallback_providers: Vec<FailoverUpstreamProvider>,
+        cooldown: Duration,
+    ) -> Self {
+        Self::from_dyn(
+            name,
+            Arc::new(primary_client),
+            primary_upstream_model,
+            primary_upstream_chat_kwargs,
+            fallback_providers,
+            cooldown,
+        )
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        primary_client: DynUpstreamClient,
         primary_upstream_model: Option<String>,
         primary_upstream_chat_kwargs: JsonMap<String, Value>,
         fallback_providers: Vec<FailoverUpstreamProvider>,
         cooldown: Duration,
     ) -> Self {
         let name = name.into();
-        let mut providers = vec![FailoverUpstreamProvider::new(
+        let mut providers = vec![FailoverUpstreamProvider::from_dyn(
             name.clone(),
-            primary_client.clone(),
+            Arc::clone(&primary_client),
             primary_upstream_model.clone(),
             None,
             primary_upstream_chat_kwargs,
@@ -637,6 +869,16 @@ impl RoutingUpstreamProvider {
     }
 }
 
+impl std::fmt::Debug for RoutingUpstreamProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutingUpstreamProvider")
+            .field("name", &self.name)
+            .field("primary_upstream_model", &self.primary_upstream_model)
+            .field("fallback_exposed_models", &self.fallback_exposed_models)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A synthetic upstream backing one or more ad-hoc model routes (G7). Unlike a
 /// catalog provider, a route provider is matched by request-model *name* (in
 /// `ModelRouteSpec`), never enumerated into the `/v1/models` union, so routes
@@ -649,12 +891,24 @@ pub struct RouteUpstreamProvider {
 }
 
 impl RouteUpstreamProvider {
-    pub fn new(name: impl Into<String>, client: ReqwestUpstreamClient, cooldown: Duration) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        client: impl UpstreamClient + 'static,
+        cooldown: Duration,
+    ) -> Self {
+        Self::from_dyn(name, Arc::new(client), cooldown)
+    }
+
+    pub fn from_dyn(
+        name: impl Into<String>,
+        client: DynUpstreamClient,
+        cooldown: Duration,
+    ) -> Self {
         let name = name.into();
         Self {
             name: name.clone(),
             client: FailoverUpstreamClient::new(
-                vec![FailoverUpstreamProvider::new(
+                vec![FailoverUpstreamProvider::from_dyn(
                     name,
                     client,
                     None,
@@ -664,6 +918,25 @@ impl RouteUpstreamProvider {
                 cooldown,
             ),
         }
+    }
+
+    /// Build one synthetic route backed by an ordered provider chain. This is
+    /// the control-plane alias seam: it reuses the canonical failover client,
+    /// including its pre-first-chunk retry and cooldown semantics, instead of
+    /// retaining the fork's second routing implementation.
+    pub fn from_failover(
+        name: impl Into<String>,
+        providers: Vec<FailoverUpstreamProvider>,
+        cooldown: Duration,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        if providers.is_empty() {
+            return Err(format!("route provider '{name}' has no upstream providers"));
+        }
+        Ok(Self {
+            name,
+            client: FailoverUpstreamClient::new(providers, cooldown),
+        })
     }
 }
 
@@ -680,6 +953,9 @@ pub struct ModelRouteSpec {
     route_provider_index: usize,
     /// Upstream model to send. `None` passes the request model through.
     upstream_model: Option<String>,
+    /// Explicit client-facing aliases are advertised in `/v1/models`; ordinary
+    /// ad-hoc/glob routes remain hidden for upstream compatibility.
+    advertised: bool,
 }
 
 impl ModelRouteSpec {
@@ -697,6 +973,17 @@ impl ModelRouteSpec {
             glob,
             route_provider_index,
             upstream_model,
+            advertised: false,
+        }
+    }
+
+    pub fn advertised_exact(name: impl Into<String>, route_provider_index: usize) -> Self {
+        Self {
+            name: name.into(),
+            glob: None,
+            route_provider_index,
+            upstream_model: None,
+            advertised: true,
         }
     }
 }
@@ -717,6 +1004,7 @@ pub struct RoutingUpstreamClient {
     /// always move together. Default `Arc<CatalogMeta>` (both `None`) until the
     /// first refresh.
     catalog_meta: Arc<Mutex<Arc<CatalogMeta>>>,
+    reject_unknown_models: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -810,21 +1098,12 @@ struct ProviderCooldownState {
     last_error: Option<String>,
 }
 
-/// Cheap case-insensitive scan for a potential image-URI marker (`data:` /
-/// `http`) in serialized request bytes, so the log fast-path only pays the
-/// redaction round-trip when an image URL might be present (G4 round-4 #3).
-fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
-    bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"data:"))
-        || bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"http"))
-}
-
 /// F1d: the redacted bytes for the turn-capture `upstream_request` section — the
 /// FINAL sanitized on-wire `ChatCompletionRequest` (post profile/lowering/
-/// sanitize), redacted through the SAME primitives `UpstreamRequestLogger`/the
-/// HTTP inbound-trace capture use: secret keys via
+/// sanitize), redacted through the SAME primitives the upstream request logger
+/// and HTTP inbound-trace capture use: secret keys via
 /// [`crate::redaction::redact_payload_secrets_in_value`] (AGENTS.md line 137 — a
-/// NEW logged surface must not bypass secret redaction; `UpstreamRequestLogger`
-/// only redacts image URIs, so this is a STRICTER pass, not a mirror of it),
+/// NEW logged surface must not bypass secret redaction),
 /// image/data URIs via [`crate::redaction::redact_image_uris_in_value`].
 /// Serializes into a fresh owned `Vec<u8>` — never retains a slice of any larger
 /// buffer (AGENTS.md line 144); `request` is already an owned, parsed typed
@@ -881,7 +1160,7 @@ fn estimate_request_text_len(request: &ChatCompletionRequest) -> usize {
 /// `replace` lands well before the finalize barrier reads the section (no race, no
 /// hang). `None` ONLY on a `spawn_blocking` join failure (runtime shutdown) — the
 /// caller then leaves the section ABSENT (don't-lie-with-zeros), never a panic.
-async fn offload_redacted_upstream_request_bytes(
+pub(crate) async fn offload_redacted_upstream_request_bytes(
     request: &ChatCompletionRequest,
 ) -> Option<Vec<u8>> {
     if estimate_request_text_len(request) <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
@@ -912,28 +1191,52 @@ impl UpstreamRequestLogger {
     }
 
     async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
-        // G4 round-4 #3: the JSONL request log is written to DISK and would
-        // otherwise serialize raw `data:` image bytes / signed `image_url`s for
-        // native-vision-passthrough / disabled-agent / missing-url /
-        // tool_choice:"none" image requests (any path that does NOT strip). The
-        // common no-image request serializes directly (format unchanged); only
-        // when the serialized bytes contain an image-URI marker do we re-redact
-        // via a CLONED JSON value through the shared redactor, so the on-disk log
-        // never carries request image content.
-        let mut payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
-        if bytes_contain_image_uri(&payload) {
-            let mut value = serde_json::to_value(request).map_err(std::io::Error::other)?;
-            crate::redaction::redact_image_uris_in_value(&mut value);
-            payload = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
-        }
-        payload.push(b'\n');
+        // Clone the already-owned typed request once so all CPU-heavy
+        // serialize/redact/validate work can run on the blocking pool. The logger
+        // never borrows or retains a slice of the HTTP middleware body.
+        let request = request.clone();
         let path = self.path.clone();
         let write_lock = self.write_lock.clone();
         tokio::task::spawn_blocking(move || {
+            // The shared streaming serializer applies BOTH sensitive-key and
+            // image-URI redaction while retaining at most O(cap) bytes. A clipped
+            // preview is not complete JSON, so replace it with a small, valid JSON
+            // marker: every append remains one parseable JSONL record.
+            let mut payload = crate::redaction::capture_capped_redacted_value(
+                &request,
+                UPSTREAM_REQUEST_LOG_BODY_CAP_BYTES,
+                UPSTREAM_REQUEST_LOG_SCALAR_CAP_BYTES,
+            );
+            if serde_json::from_slice::<Value>(&payload).is_err() {
+                payload = serde_json::to_vec(&serde_json::json!({
+                    "_llmconduit_request_log": {
+                        "status": "redacted_or_truncated",
+                        "body_cap_bytes": UPSTREAM_REQUEST_LOG_BODY_CAP_BYTES,
+                    }
+                }))
+                .map_err(std::io::Error::other)?;
+            }
+            payload.push(b'\n');
+
             let _guard = write_lock.lock().map_err(|err| {
                 std::io::Error::other(format!("request log lock poisoned: {err}"))
             })?;
-            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // `mode` protects a newly-created file; chmod also tightens a
+                // pre-existing log whose permissions were previously broader.
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(&payload)
         })
         .await
@@ -1112,10 +1415,13 @@ impl ReqwestUpstreamClient {
         &self,
         url: &Url,
         request: &ChatCompletionRequest,
+        capture_payloads: bool,
         response_id: Option<&str>,
         capture: Option<&Arc<TurnCaptureState>>,
+        persistence: Option<&Arc<crate::flow_persistence::PersistenceCapture>>,
     ) -> AppResult<reqwest::Response> {
-        if let Some(ref logger) = self.request_logger
+        if capture_payloads
+            && let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(request).await
         {
             tracing::warn!(
@@ -1124,7 +1430,9 @@ impl ReqwestUpstreamClient {
                 "failed to append upstream request log"
             );
         }
-        self.capture_upstream_body(response_id, request);
+        if capture_payloads {
+            self.capture_upstream_body(response_id, request);
+        }
         // Finding 1: redact the `upstream_request` section OFF the tokio worker for
         // large requests (spawn_blocking), AWAITED here — before the send and before
         // `write_upstream_request` — so the last-writer-wins `replace` lands well
@@ -1140,7 +1448,19 @@ impl ReqwestUpstreamClient {
                 None => capture.mark_upstream_request_redaction_failed(),
             }
         }
-        self.send_chat_request(url, request).await
+        if let Some(persistence) = persistence {
+            // This is the finalized/sanitized value handed to reqwest's JSON
+            // serializer. Each send replaces the prior value, so shrink retry,
+            // failover, and server-tool rounds are final-attempt-wins.
+            persistence.stage_upstream_request(request);
+        }
+        let response = self.send_chat_request(url, request).await;
+        if response.is_ok()
+            && let Some(persistence) = persistence
+        {
+            persistence.mark_upstream_request_dispatched();
+        }
+        response
     }
 
     /// D2 capture: store the on-wire upstream body for `response_id` through the
@@ -1195,12 +1515,27 @@ impl ReqwestUpstreamClient {
     /// the first send's). The redaction is consistent with the existing request-capture
     /// surface; this is a diagnostic body shown to the authenticated operator, captured ONLY
     /// when explicitly opted in.
+    #[allow(clippy::too_many_arguments)]
     fn capture_upstream_response_body(
         &self,
+        capture_payloads: bool,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
+        persistence: Option<&Arc<crate::flow_persistence::PersistenceCapture>>,
         body: &str,
+        persistence_partial: bool,
+        truncated: bool,
     ) {
+        if !capture_payloads {
+            return;
+        }
+        if let Some(persistence) = persistence {
+            persistence.stage_upstream_error_response(
+                body.as_bytes(),
+                persistence_partial,
+                truncated,
+            );
+        }
         // F1e: STAGE the failed HTTP body on the turn-capture handle -- gated ONLY
         // on capture being enabled (independent of the dashboard response-capture
         // flag, so durable capture works without the debug UI). Image-URI redaction
@@ -1211,6 +1546,9 @@ impl ReqwestUpstreamClient {
         if let Some(capture) = capture {
             let redacted = crate::redaction::redact_image_uris(body).into_bytes();
             capture.stage_upstream_response_body(&redacted);
+            if persistence_partial || truncated {
+                capture.mark_upstream_response_degraded();
+            }
         }
         // gap-05 dashboard staging (separately gated on the response-capture flag).
         if !self.flow_store.is_response_capture_enabled() {
@@ -1219,7 +1557,10 @@ impl ReqwestUpstreamClient {
         let Some(serving) = serving else {
             return;
         };
-        let captured = crate::dashboard_flow::capture_response_body(body.as_bytes());
+        let captured = crate::dashboard_flow::capture_response_body_with_truncation(
+            body.as_bytes(),
+            truncated,
+        );
         serving.set_pending_response_body(captured);
     }
 
@@ -1334,13 +1675,16 @@ impl ReqwestUpstreamClient {
     /// wrap the result for gap-03 attempt recording WITHOUT duplicating the recording
     /// across this method's several return sites. `response_id` keys the D2 on-wire body
     /// capture (already performed by `logged_send_chat_request`).
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_chat_stream(
         &self,
         url: &Url,
         request: ChatCompletionRequest,
+        capture_payloads: bool,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
+        persistence: Option<&Arc<crate::flow_persistence::PersistenceCapture>>,
     ) -> AppResult<UpstreamStream> {
         // F1e review r1/r2: per-attempt reset of the `upstream_response` capture at
         // the START of this dispatch attempt, so the turn's raw response is
@@ -1364,7 +1708,14 @@ impl ReqwestUpstreamClient {
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
         let response = self
-            .logged_send_chat_request(url, &request, response_id, capture)
+            .logged_send_chat_request(
+                url,
+                &request,
+                capture_payloads,
+                response_id,
+                capture,
+                persistence,
+            )
             .await?;
         // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
         // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
@@ -1374,13 +1725,18 @@ impl ReqwestUpstreamClient {
         stamp_header_byte(serving);
         let status = response.status();
         if status.is_success() {
-            return stream_success_response(response, self.max_sse_frame_bytes, capture.cloned())
-                .await;
+            return stream_success_response(
+                response,
+                self.max_sse_frame_bytes,
+                capture.cloned(),
+                persistence.cloned(),
+            )
+            .await;
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let body = read_capped_upstream_error_body(response).await;
         if let Some(retry) = classify_context_overflow(
-            &body,
+            &body.text,
             self.min_completion_tokens,
             Some(estimate_leaf_input_tokens(&request)),
         ) {
@@ -1408,7 +1764,14 @@ impl ReqwestUpstreamClient {
             // `response_id`; F1d is last-writer-wins so this overwrites the first
             // oversized attempt's write — AC-10).
             let retry_response = self
-                .logged_send_chat_request(url, &retried, response_id, capture)
+                .logged_send_chat_request(
+                    url,
+                    &retried,
+                    capture_payloads,
+                    response_id,
+                    capture,
+                    persistence,
+                )
                 .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
@@ -1416,6 +1779,7 @@ impl ReqwestUpstreamClient {
                     retry_response,
                     self.max_sse_frame_bytes,
                     capture.cloned(),
+                    persistence.cloned(),
                 )
                 .await;
             }
@@ -1425,14 +1789,22 @@ impl ReqwestUpstreamClient {
             // the same oversized prompt on another provider (only one shrink-and-
             // retry is allowed; we do not loop). Any other non-2xx is a normal
             // (failover-eligible) upstream error.
-            let retry_body = retry_response.text().await.unwrap_or_default();
+            let retry_body = read_capped_upstream_error_body(retry_response).await;
             // Gap 05: the RETRY is the body that actually ended the turn on the
             // shrink-and-retry path — stage IT (last-writer-wins over the first
             // attempt's body) so the dashboard shows the upstream's final word.
             // F1e also stages it onto the turn-capture handle.
-            self.capture_upstream_response_body(serving, capture, &retry_body);
+            self.capture_upstream_response_body(
+                capture_payloads,
+                serving,
+                capture,
+                persistence,
+                &retry_body.text,
+                retry_body.partial,
+                retry_body.truncated,
+            );
             if classify_context_overflow(
-                &retry_body,
+                &retry_body.text,
                 self.min_completion_tokens,
                 Some(estimate_leaf_input_tokens(&retried)),
             )
@@ -1442,7 +1814,7 @@ impl ReqwestUpstreamClient {
                     format!(
                         "upstream context-window overflow persisted after shrink-and-retry; \
                          failed with {retry_status}: {}",
-                        redact_and_truncate_error_body(&retry_body, 500)
+                        redact_and_truncate_error_body(&retry_body.text, 500)
                     ),
                     FailoverDisposition::Terminal,
                 ));
@@ -1460,7 +1832,7 @@ impl ReqwestUpstreamClient {
             return Err(AppError::upstream_with_disposition(
                 format!(
                     "upstream chat failed with {retry_status}: {}",
-                    redact_and_truncate_error_body(&retry_body, 500)
+                    redact_and_truncate_error_body(&retry_body.text, 500)
                 ),
                 retry_disposition,
             ));
@@ -1470,7 +1842,15 @@ impl ReqwestUpstreamClient {
         // — stage the upstream error body so the operator can see why the turn failed (it
         // is cleared if a later failover provider serves; committed at finalize otherwise).
         // F1e also stages it onto the turn-capture handle (final failed HTTP body).
-        self.capture_upstream_response_body(serving, capture, &body);
+        self.capture_upstream_response_body(
+            capture_payloads,
+            serving,
+            capture,
+            persistence,
+            &body.text,
+            body.partial,
+            body.truncated,
+        );
         // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
         // over a healthy provider — the request itself is unacceptable to any equivalent
         // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
@@ -1485,7 +1865,7 @@ impl ReqwestUpstreamClient {
         Err(AppError::upstream_with_disposition(
             format!(
                 "upstream chat failed with {status}: {}",
-                redact_and_truncate_error_body(&body, 500)
+                redact_and_truncate_error_body(&body.text, 500)
             ),
             disposition,
         ))
@@ -1509,6 +1889,15 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // is re-asserted last so an explicit client value still wins).
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        backend.authorization.ensure_candidate(
+            backend
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
+            backend.authorization_route.as_deref(),
+            &backend.request.model,
+            backend.endpoint,
+        )?;
         // D2: the flow's `response_id` keys the on-wire capture below. Capture it
         // BEFORE `backend.request` is moved into `sanitize_chat_request` so the
         // first + retry send sites can both pass `response_id.as_deref()`.
@@ -1533,6 +1922,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // shrink-retry send below can write the SANITIZED on-wire request into the
         // SAME turn's `upstream_request` section (last-writer-wins).
         let capture = backend.capture.clone();
+        let persistence = backend.persistence_capture.clone();
         let request = sanitize_chat_request(backend.request, self.flatten_content);
         // D5 R4 (MEDIUM): finalize the ACTUAL on-wire model onto the shared serving
         // token, overwriting the engine's PRE-routing guess (and any earlier
@@ -1575,9 +1965,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 .dispatch_chat_stream(
                     &url,
                     request,
+                    backend.capture_payloads,
                     response_id.as_deref(),
                     serving.as_ref(),
                     capture.as_ref(),
+                    persistence.as_ref(),
                 )
                 .await
             {
@@ -1617,9 +2009,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.dispatch_chat_stream(
             &url,
             request,
+            backend.capture_payloads,
             response_id.as_deref(),
             serving.as_ref(),
             capture.as_ref(),
+            persistence.as_ref(),
         )
         .await
     }
@@ -1627,6 +2021,15 @@ impl UpstreamClient for ReqwestUpstreamClient {
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        backend.authorization.ensure_candidate(
+            backend
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
+            backend.authorization_route.as_deref(),
+            &backend.request.model,
+            InferenceEndpoint::CountTokens,
+        )?;
         let request = sanitize_chat_request(backend.request, self.flatten_content);
 
         let mut body = JsonMap::new();
@@ -1668,7 +2071,13 @@ impl UpstreamClient for ReqwestUpstreamClient {
             tracing::debug!(status = %response.status(), "upstream /tokenize returned non-success status");
             return Ok(None);
         }
-        let value: Value = match response.json().await {
+        let value: Value = match collect_capped_upstream_json(
+            response,
+            UPSTREAM_JSON_BODY_CAP_BYTES,
+            "upstream /tokenize",
+        )
+        .await
+        {
             Ok(value) => value,
             Err(err) => {
                 tracing::debug!(error = %err, "upstream /tokenize response was not JSON");
@@ -1678,7 +2087,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         Ok(value.get("count").and_then(Value::as_u64))
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let url = self.endpoint_url("models")?;
         let response = self
             .with_auth(self.client.get(url))
@@ -1687,29 +2096,88 @@ impl UpstreamClient for ReqwestUpstreamClient {
             .map_err(|err| AppError::upstream(format!("upstream models request failed: {err}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_capped_upstream_error_body(response).await;
             return Err(AppError::upstream(format!(
                 "upstream /models failed with {status}: {}",
-                redact_and_truncate_error_body(&body, 500)
+                redact_and_truncate_error_body(&body.text, 500)
             )));
         }
-        Ok(response)
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.map_err(|err| {
+            AppError::upstream(format!("failed to read upstream /models body: {err}"))
+        })?;
+        Ok(UpstreamModelsResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
+        let model = proxy_body_model(&request.body).unwrap_or_default();
+        request.authorization.ensure_candidate(
+            request
+                .authorization_provider
+                .as_deref()
+                .unwrap_or("primary"),
+            request.authorization_route.as_deref(),
+            &model,
+            InferenceEndpoint::Completions,
+        )?;
         let url = self.endpoint_url("completions")?;
-        let request = copy_proxy_request_headers(self.client.post(url), &headers).body(body);
-        self.with_auth(request).send().await.map_err(|err| {
+        let outbound =
+            copy_proxy_request_headers(self.client.post(url), &request.headers).body(request.body);
+        self.with_auth(outbound).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
+    }
+
+    fn provider_base_url(&self) -> String {
+        self.base_url_string()
     }
 }
 
 impl FailoverUpstreamClient {
+    fn provider_is_authorized(&self, provider_index: usize, backend: &BackendChatRequest) -> bool {
+        self.providers.get(provider_index).is_some_and(|provider| {
+            let model = provider
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&backend.request.model);
+            backend.authorization.allows_candidate(
+                &provider.name,
+                backend.authorization_route.as_deref(),
+                model,
+                backend.endpoint,
+            )
+        })
+    }
+
+    fn authorized_provider_indices(
+        &self,
+        provider_indices: Vec<usize>,
+        backend: &BackendChatRequest,
+    ) -> Vec<usize> {
+        provider_indices
+            .into_iter()
+            .filter(|index| self.provider_is_authorized(*index, backend))
+            .collect()
+    }
+
+    fn ensure_any_authorized_provider(&self, backend: &BackendChatRequest) -> AppResult<()> {
+        if (0..self.providers.len()).any(|index| self.provider_is_authorized(index, backend)) {
+            Ok(())
+        } else {
+            Err(AppError::forbidden(
+                "no authorized upstream candidate is available for this request",
+            ))
+        }
+    }
+
     pub fn new(providers: Vec<FailoverUpstreamProvider>, cooldown: Duration) -> Self {
         let states = vec![ProviderCooldownState::default(); providers.len()];
         Self {
@@ -1820,7 +2288,7 @@ impl FailoverUpstreamClient {
                     id: provider.name.clone(),
                     name: provider.name.clone(),
                     route: route.map(ToString::to_string),
-                    base_url: provider.client.base_url_string(),
+                    base_url: provider.client.provider_base_url(),
                     status,
                     cooling_until_ms,
                     last_error,
@@ -1877,6 +2345,13 @@ impl FailoverUpstreamClient {
             // F1d (AC-11): carry the turn-capture handle forward too -- a captured
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
+            persistence_capture: backend.persistence_capture.clone(),
+            capture_payloads: backend.capture_payloads,
+            authorization: backend.authorization.clone(),
+            affinity: backend.affinity.clone(),
+            endpoint: backend.endpoint,
+            authorization_route: backend.authorization_route.clone(),
+            authorization_provider: Some(provider.name.clone()),
         }
     }
 
@@ -2026,6 +2501,11 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
+        if !self.provider_is_authorized(provider_index, backend) {
+            return Err(AppError::forbidden(
+                "the selected upstream candidate is not authorized",
+            ));
+        }
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
@@ -2047,6 +2527,12 @@ impl FailoverUpstreamClient {
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            provider_request.authorization.ensure_candidate(
+                &provider.name,
+                provider_request.authorization_route.as_deref(),
+                &provider_request.request.model,
+                provider_request.endpoint,
+            )?;
             // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
             // is issued; the provider's on-wire model is `provider_request.request.model`
             // (post `request_for_provider` remap). The attempt's outcome (served / failed)
@@ -2283,6 +2769,11 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
+        if !self.provider_is_authorized(provider_index, backend) {
+            return Err(AppError::forbidden(
+                "the selected token-count candidate is not authorized",
+            ));
+        }
         self.count_tokens_with_provider_indices(vec![provider_index], backend)
             .await
     }
@@ -2295,6 +2786,12 @@ impl FailoverUpstreamClient {
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            provider_request.authorization.ensure_candidate(
+                &provider.name,
+                provider_request.authorization_route.as_deref(),
+                &provider_request.request.model,
+                InferenceEndpoint::CountTokens,
+            )?;
             match provider.client.count_tokens(&provider_request).await {
                 Ok(Some(count)) => return Ok(Some(count)),
                 Ok(None) => {}
@@ -2311,34 +2808,57 @@ impl FailoverUpstreamClient {
     async fn proxy_completions_from_provider(
         &self,
         provider_index: usize,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         if provider_index >= self.providers.len() {
             return Err(AppError::internal(
                 "resolved fallback provider index was out of range",
             ));
         }
+        let provider = &self.providers[provider_index];
+        let provider_body = proxy_body_for_provider(provider, &request.body);
+        let model = proxy_body_model(&provider_body).unwrap_or_default();
+        request.authorization.ensure_candidate(
+            &provider.name,
+            request.authorization_route.as_deref(),
+            &model,
+            InferenceEndpoint::Completions,
+        )?;
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(vec![provider_index], headers, body)
+        self.proxy_completions_with_provider_indices(vec![provider_index], request)
             .await
     }
 
     async fn proxy_completions_with_provider_indices(
         &self,
         provider_indices: Vec<usize>,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         let mut last_error = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
-            let provider_body = proxy_body_for_provider(provider, &body);
+            let provider_body = proxy_body_for_provider(provider, &request.body);
+            let model = proxy_body_model(&provider_body).unwrap_or_default();
+            if !request.authorization.allows_candidate(
+                &provider.name,
+                request.authorization_route.as_deref(),
+                &model,
+                InferenceEndpoint::Completions,
+            ) {
+                continue;
+            }
+            let provider_request = ProxyCompletionsRequest {
+                headers: request.headers.clone(),
+                body: provider_body,
+                authorization: request.authorization.clone(),
+                authorization_route: request.authorization_route.clone(),
+                authorization_provider: Some(provider.name.clone()),
+            };
             match self.providers[provider_index]
                 .client
-                .proxy_completions(headers.clone(), provider_body)
+                .proxy_completions(provider_request)
                 .await
             {
                 Ok(response) => {
@@ -2346,10 +2866,10 @@ impl FailoverUpstreamClient {
                     if !status_is_failover_eligible(status) {
                         return Ok(response);
                     }
-                    let body = response.text().await.unwrap_or_default();
+                    let body = read_capped_upstream_error_body(response).await;
                     let err = AppError::upstream(format!(
                         "upstream completions failed with {status}: {}",
-                        redact_and_truncate_error_body(&body, 500)
+                        redact_and_truncate_error_body(&body.text, 500)
                     ));
                     self.mark_failure(provider_index, &err);
                     last_error = Some(err);
@@ -2361,7 +2881,7 @@ impl FailoverUpstreamClient {
             }
         }
         Err(last_error.unwrap_or_else(|| {
-            AppError::upstream("all upstream providers failed to proxy completions")
+            AppError::forbidden("no authorized upstream candidate can proxy completions")
         }))
     }
 }
@@ -2385,7 +2905,27 @@ impl RoutingUpstreamClient {
             routes,
             catalog: Arc::new(AsyncMutex::new(None)),
             catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
+            reject_unknown_models: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn ensure_default_resolution_allowed(
+        &self,
+        requested_model: &str,
+        resolved_model: &str,
+        kind: MatchKind,
+    ) -> AppResult<()> {
+        if kind == MatchKind::Default && self.reject_unknown_models.load(Ordering::Relaxed) {
+            tracing::warn!(
+                requested_model = %requested_model,
+                resolved_model = %resolved_model,
+                "rejecting catalog-default model resolution under unknown-model reject policy"
+            );
+            return Err(AppError::not_found(
+                "requested model is not currently routable",
+            ));
+        }
+        Ok(())
     }
 
     /// Look up a synthetic route provider by index, mapping an out-of-range
@@ -2423,13 +2963,20 @@ impl RoutingUpstreamClient {
             // F1d: carry the turn-capture handle forward too (same reasoning as the
             // failover rebuild above, `request_for_provider`).
             capture: backend.capture.clone(),
+            persistence_capture: backend.persistence_capture.clone(),
+            capture_payloads: backend.capture_payloads,
+            authorization: backend.authorization.clone(),
+            affinity: backend.affinity.clone(),
+            endpoint: backend.endpoint,
+            authorization_route: Some(provider_name.to_string()),
+            authorization_provider: Some(provider_name.to_string()),
         }
     }
 
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
         let mut cache = self.catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < self.model_catalog_cache_ttl()
         {
             return Ok(cached.catalog.clone());
         }
@@ -2449,10 +2996,14 @@ impl RoutingUpstreamClient {
         let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
         let mut seen_union_ids = HashSet::new();
         let mut last_error = None;
+        let mut catalog_loaded = false;
 
         for (provider_index, provider) in self.providers.iter().enumerate() {
             let entries = match primary_provider_model_entries(provider).await {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    catalog_loaded = true;
+                    entries
+                }
                 Err(err) => {
                     tracing::warn!(
                         provider = %provider.name,
@@ -2507,10 +3058,33 @@ impl RoutingUpstreamClient {
             });
         }
 
-        // With ad-hoc routes (G7), an empty union is still a usable catalog:
-        // routes resolve by name without a live model listing. Only error when
-        // there are neither catalog models nor routes to dispatch to.
-        if union_ids.is_empty() && self.routes.is_empty() {
+        // Control-plane aliases are reserved client-facing model ids. Refuse a
+        // live catalog collision instead of silently letting exact-id precedence
+        // bypass the alias's backend chain and model-scoped authorization.
+        for route in self.routes.iter().filter(|route| route.advertised) {
+            if union_ids
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(&route.name))
+            {
+                return Err(AppError::upstream(format!(
+                    "operational route '{}' conflicts with an upstream catalog model id",
+                    route.name
+                )));
+            }
+        }
+        // Advertise those exact routes; generic config/CLI routes retain the
+        // historical hidden behavior.
+        for route in self.routes.iter().filter(|route| route.advertised) {
+            if seen_union_ids.insert(route.name.clone()) {
+                union_ids.push(route.name.clone());
+                union_entries.push(single_model_entry(&route.name));
+            }
+        }
+
+        // A successfully loaded empty catalog is a valid snapshot (notably when
+        // a mesh has no healthy workers yet). Only surface an upstream failure
+        // when every provider catalog failed and no ad-hoc route can dispatch.
+        if union_ids.is_empty() && self.routes.is_empty() && !catalog_loaded {
             return Err(last_error.unwrap_or_else(|| {
                 AppError::upstream("no models are currently available from configured upstreams")
             }));
@@ -2787,7 +3361,9 @@ impl UpstreamClient for FailoverUpstreamClient {
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let provider_indices = self.available_provider_indices();
+        self.ensure_any_authorized_provider(backend)?;
+        let provider_indices =
+            self.authorized_provider_indices(self.available_provider_indices(), backend);
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
@@ -2800,7 +3376,9 @@ impl UpstreamClient for FailoverUpstreamClient {
     }
 
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
-        let provider_indices = self.available_provider_indices();
+        self.ensure_any_authorized_provider(backend)?;
+        let provider_indices =
+            self.authorized_provider_indices(self.available_provider_indices(), backend);
         if provider_indices.is_empty() {
             return Ok(None);
         }
@@ -2808,7 +3386,7 @@ impl UpstreamClient for FailoverUpstreamClient {
             .await
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let mut last_error = None;
         let provider_indices = self.available_provider_indices();
         if provider_indices.is_empty() {
@@ -2832,14 +3410,28 @@ impl UpstreamClient for FailoverUpstreamClient {
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
+        let any_authorized = self.providers.iter().any(|provider| {
+            let body = proxy_body_for_provider(provider, &request.body);
+            let model = proxy_body_model(&body).unwrap_or_default();
+            request.authorization.allows_candidate(
+                &provider.name,
+                request.authorization_route.as_deref(),
+                &model,
+                InferenceEndpoint::Completions,
+            )
+        });
+        if !any_authorized {
+            return Err(AppError::forbidden(
+                "no authorized upstream candidate can proxy completions",
+            ));
+        }
         let provider_indices = self.available_provider_indices();
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(provider_indices, headers, body)
+        self.proxy_completions_with_provider_indices(provider_indices, request)
             .await
     }
 
@@ -2867,11 +3459,72 @@ impl UpstreamClient for FailoverUpstreamClient {
         BackendCandidatePlan { candidates }
     }
 
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        let health = self.provider_health_with_route(None, CatalogMeta::default());
+        let mut entries = Vec::new();
+        for (index, provider) in self.providers.iter().enumerate() {
+            let mut provider_entries = provider
+                .client
+                .provider_inventory()
+                .await
+                .unwrap_or_else(|_| Vec::new());
+            if provider_entries.is_empty() {
+                provider_entries.push(ProviderInventoryEntry {
+                    provider_id: provider.name.clone(),
+                    provider_name: provider.name.clone(),
+                    resource_id: None,
+                    route: None,
+                    base_url: provider.client.provider_base_url(),
+                    models: Vec::new(),
+                    availability: None,
+                    capacity_limit: None,
+                    active_requests: None,
+                    accepting_requests: true,
+                    healthy: true,
+                });
+            }
+            let state = health.get(index);
+            for entry in &mut provider_entries {
+                // The trait default describes a bare leaf with a placeholder id.
+                // Composite clients (notably mesh) return real nested resources,
+                // which must survive this failover wrapper unchanged.
+                if entry.provider_id == "upstream" && entry.resource_id.is_none() {
+                    entry.provider_id.clone_from(&provider.name);
+                    entry.provider_name.clone_from(&provider.name);
+                }
+                if let Some(model) = provider.upstream_model.as_deref() {
+                    entry
+                        .models
+                        .retain(|candidate| candidate.id.eq_ignore_ascii_case(model));
+                    if entry.models.is_empty() {
+                        entry.models.push(UpstreamModelEntry {
+                            id: model.to_string(),
+                            context_limit: None,
+                        });
+                    }
+                }
+                let outer_accepting =
+                    state.is_none_or(|value| value.status == ProviderStatus::Healthy);
+                let outer_healthy = state.is_none_or(|value| value.status != ProviderStatus::Down);
+                entry.accepting_requests &= outer_accepting;
+                entry.healthy &= outer_healthy;
+            }
+            entries.extend(provider_entries);
+        }
+        Ok(entries)
+    }
+
     /// D4: a bare failover chain (no routing wrapper) reports each provider with
     /// no `route` and no catalog metadata (a failover chain loads no per-chain
     /// `/v1/models` snapshot — only the routing client populates catalog meta).
     fn provider_health(&self) -> Vec<ProviderHealth> {
         self.provider_health_with_route(None, CatalogMeta::default())
+    }
+
+    fn set_reject_unknown_models(&self, reject: bool) {
+        for provider in &self.providers {
+            provider.client.set_reject_unknown_models(reject);
+        }
     }
 }
 
@@ -3011,6 +3664,16 @@ impl UpstreamClient for RoutingUpstreamClient {
         health
     }
 
+    fn set_reject_unknown_models(&self, reject: bool) {
+        self.reject_unknown_models.store(reject, Ordering::Relaxed);
+        for provider in &self.providers {
+            provider.client.set_reject_unknown_models(reject);
+        }
+        for route_provider in &self.route_providers {
+            route_provider.client.set_reject_unknown_models(reject);
+        }
+    }
+
     async fn stream_chat_completion_with_timeout(
         &self,
         backend: &BackendChatRequest,
@@ -3057,6 +3720,11 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(
+            &backend.request.model,
+            &resolution.model_id,
+            match_kind,
+        )?;
         let routed_request =
             self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         // D2: tag the `route` serving field with the selected routing provider's
@@ -3115,6 +3783,11 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(
+            &backend.request.model,
+            &resolution.model_id,
+            match_kind,
+        )?;
         let routed = self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         match resolution.target {
             RoutingModelTarget::Primary => provider.client.count_tokens(&routed).await,
@@ -3129,18 +3802,17 @@ impl UpstreamClient for RoutingUpstreamClient {
         }
     }
 
-    async fn list_models(&self) -> AppResult<reqwest::Response> {
+    async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
         let catalog = self.load_catalog().await?;
         json_response(catalog.union_body())
     }
 
     async fn proxy_completions(
         &self,
-        headers: HeaderMap,
-        body: Bytes,
+        request: ProxyCompletionsRequest,
     ) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
-        let requested_model = proxy_body_model(&body).unwrap_or_default();
+        let requested_model = proxy_body_model(&request.body).unwrap_or_default();
         let (resolution, match_kind) = catalog.resolve(&requested_model).ok_or_else(|| {
             tracing::warn!(
                 requested_model = %requested_model,
@@ -3155,8 +3827,10 @@ impl UpstreamClient for RoutingUpstreamClient {
         {
             let provider = self.route_provider(*route_provider_index)?;
             log_model_resolution(&requested_model, model_id, &provider.name, match_kind);
-            let body = proxy_body_with_model(body, model_id);
-            return provider.client.proxy_completions(headers, body).await;
+            let mut routed = request;
+            routed.body = proxy_body_with_model(routed.body, model_id);
+            routed.authorization_route = Some(provider.name.clone());
+            return provider.client.proxy_completions(routed).await;
         }
         let RoutingResolution::Catalog(resolution) = resolution else {
             unreachable!("route resolution handled above");
@@ -3167,21 +3841,24 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        self.ensure_default_resolution_allowed(&requested_model, &resolution.model_id, match_kind)?;
         log_model_resolution(
             &requested_model,
             &resolution.model_id,
             &provider.name,
             match_kind,
         );
-        let body = proxy_body_with_model(body, &resolution.model_id);
+        let mut routed = request;
+        routed.body = proxy_body_with_model(routed.body, &resolution.model_id);
+        routed.authorization_route = Some(provider.name.clone());
         match resolution.target {
-            RoutingModelTarget::Primary => provider.client.proxy_completions(headers, body).await,
+            RoutingModelTarget::Primary => provider.client.proxy_completions(routed).await,
             RoutingModelTarget::Fallback {
                 failover_provider_index,
             } => {
                 provider
                     .client
-                    .proxy_completions_from_provider(failover_provider_index, headers, body)
+                    .proxy_completions_from_provider(failover_provider_index, routed)
                     .await
             }
         }
@@ -3202,6 +3879,33 @@ impl UpstreamClient for RoutingUpstreamClient {
                 UpstreamModelEntry { id, context_limit }
             })
             .collect())
+    }
+
+    async fn provider_inventory(&self) -> AppResult<Vec<ProviderInventoryEntry>> {
+        let mut entries = Vec::new();
+        for provider in &self.providers {
+            let mut provider_entries = provider.client.provider_inventory().await?;
+            for entry in &mut provider_entries {
+                entry.route = Some(provider.name.clone());
+            }
+            entries.extend(provider_entries);
+        }
+        for provider in &self.route_providers {
+            let mut provider_entries = provider.client.provider_inventory().await?;
+            for entry in &mut provider_entries {
+                entry.route = Some(provider.name.clone());
+            }
+            entries.extend(provider_entries);
+        }
+        Ok(entries)
+    }
+
+    fn model_catalog_cache_ttl(&self) -> Duration {
+        self.providers
+            .iter()
+            .map(|provider| provider.primary_client.model_catalog_cache_ttl())
+            .min()
+            .unwrap_or_else(|| Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS))
     }
 }
 
@@ -3385,6 +4089,11 @@ struct ServingInfo {
     /// attempt's measured value is never clobbered. `None` until a chunk arrives — NEVER
     /// `0` when unmeasured (don't-lie-with-zeros).
     first_upstream_byte_ms: Option<u128>,
+    /// First canonical content delta emitted to the client. Retained on the same
+    /// evict-safe token as usage so terminal metrics never need to re-read the store.
+    first_content_delta_ms: Option<u128>,
+    /// Clean stream end after the terminal response event was emitted.
+    stream_end_ms: Option<u128>,
     /// Gap 03 round-1 review (F1): a PER-ATTEMPT scratch slot holding the epoch-ms the
     /// CURRENT attempt's upstream RESPONSE HEADERS arrived on the wire — the instant
     /// `logged_send_chat_request` (the `send().await`) returned, stamped by the leaf for
@@ -3522,6 +4231,28 @@ impl ServingToken {
         (info.attempts.clone(), info.first_upstream_byte_ms)
     }
 
+    /// Record the first canonical content delta timestamp (first-write-wins).
+    pub fn stamp_first_content_delta(&self, ms: u128) {
+        let mut info = self.lock();
+        if info.first_content_delta_ms.is_none() {
+            info.first_content_delta_ms = Some(ms);
+        }
+    }
+
+    /// Record the clean stream-end timestamp (first-write-wins).
+    pub fn stamp_stream_end(&self, ms: u128) {
+        let mut info = self.lock();
+        if info.stream_end_ms.is_none() {
+            info.stream_end_ms = Some(ms);
+        }
+    }
+
+    /// Eviction-safe phase endpoints used to derive prefill/decode speed.
+    pub fn phase_snapshot(&self) -> (Option<u128>, Option<u128>) {
+        let info = self.lock();
+        (info.first_content_delta_ms, info.stream_end_ms)
+    }
+
     /// Gap 03 round-1 review (F1): arm the per-attempt wire-header-byte slot to `None`
     /// before a dispatch is issued. The leaf stamps it (via [`stamp_attempt_header_byte`])
     /// the instant the upstream response headers arrive; the failover loop / bare-leaf
@@ -3612,6 +4343,11 @@ impl ServingToken {
     }
 }
 
+/// Opaque, caller-scoped conversation identity used for inference-instance affinity.
+/// Ingress hashes the identity so neither credentials nor raw session IDs are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestAffinity(pub String);
+
 /// Leaf-boundary wrapper carrying finalization metadata that does NOT belong on
 /// the wire DTO `ChatCompletionRequest`. Built at the leaf boundary (in the
 /// engine, before dispatch) from per-model policies keyed by the FINAL
@@ -3673,6 +4409,24 @@ pub struct BackendChatRequest {
     /// (spec Design #3) precisely because the carrier is here, not on
     /// `ServingToken`.
     pub capture: Option<Arc<TurnCaptureState>>,
+    /// Bounded in-memory four-hop capture. Unlike `capture`, this never enables
+    /// disk diagnostics and every database write remains a terminal `try_*`.
+    pub persistence_capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    /// Whether this request may be retained in any observability body sink.
+    /// Metadata, timing, usage, and terminal status remain available when false.
+    pub capture_payloads: bool,
+    /// Request-local provider/route authorization. Unrestricted unless inference
+    /// auth is enforced. Rebuilds must clone this exact immutable scope.
+    pub authorization: AuthorizationScope,
+    pub affinity: Option<RequestAffinity>,
+    /// The ingress surface whose policy is being enforced.
+    pub endpoint: InferenceEndpoint,
+    /// Routing writes the selected route here so nested failover/leaf checks can
+    /// evaluate both the route and the concrete provider.
+    pub authorization_route: Option<String>,
+    /// Wrappers write the concrete provider before the leaf sends bytes. Bare
+    /// single-provider requests use `primary`.
+    pub authorization_provider: Option<String>,
 }
 
 impl BackendChatRequest {
@@ -3698,7 +4452,29 @@ impl BackendChatRequest {
             response_id,
             serving,
             capture: None,
+            persistence_capture: None,
+            capture_payloads: true,
+            authorization: AuthorizationScope::unrestricted(),
+            affinity: None,
+            endpoint: InferenceEndpoint::Responses,
+            authorization_route: None,
+            authorization_provider: None,
         }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        authorization: AuthorizationScope,
+        endpoint: InferenceEndpoint,
+    ) -> Self {
+        self.authorization = authorization;
+        self.endpoint = endpoint;
+        self
+    }
+
+    pub fn with_affinity(mut self, affinity: Option<RequestAffinity>) -> Self {
+        self.affinity = affinity;
+        self
     }
 
     /// F1d: attach the turn-capture handle (builder-style, so the many existing
@@ -3707,6 +4483,19 @@ impl BackendChatRequest {
     /// construction site (`engine.rs`'s `run_turn`) calls this.
     pub fn with_capture(mut self, capture: Option<Arc<TurnCaptureState>>) -> Self {
         self.capture = capture;
+        self
+    }
+
+    pub fn with_persistence_capture(
+        mut self,
+        capture: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
+    ) -> Self {
+        self.persistence_capture = capture;
+        self
+    }
+
+    pub fn with_payload_capture(mut self, capture_payloads: bool) -> Self {
+        self.capture_payloads = capture_payloads;
         self
     }
 
@@ -4234,6 +5023,7 @@ fn copy_proxy_request_headers(mut request: RequestBuilder, headers: &HeaderMap) 
 fn should_proxy_request_header(name: &HeaderName) -> bool {
     !is_hop_by_hop_header(name)
         && !header_name_eq(name, "authorization")
+        && !header_name_eq(name, "x-api-key")
         && !header_name_eq(name, "host")
         && !header_name_eq(name, "content-length")
 }
@@ -4479,6 +5269,110 @@ fn parse_token_count(group: &str) -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
+struct CappedUpstreamBody {
+    bytes: Vec<u8>,
+    /// The remote body continued beyond the retained prefix.
+    truncated: bool,
+    /// Reading the remote body stream failed before a clean end-of-stream.
+    partial: bool,
+}
+
+/// Collect a provider response through a hard byte boundary. This is the shared
+/// primitive behind both the small diagnostic error surface and the larger,
+/// explicitly bounded JSON endpoints.
+async fn read_capped_upstream_body(response: reqwest::Response, cap: usize) -> CappedUpstreamBody {
+    let declared_length = response.content_length();
+    let reserve = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(cap);
+    let mut bytes = Vec::with_capacity(reserve);
+    let mut stream = response.bytes_stream();
+    let mut truncated = declared_length.is_some_and(|length| length > cap as u64);
+    let mut partial = false;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                let remaining = cap.saturating_sub(bytes.len());
+                let take = chunk.len().min(remaining);
+                bytes.extend_from_slice(&chunk[..take]);
+                if chunk.len() > take || (bytes.len() == cap && truncated) {
+                    truncated = true;
+                    break;
+                }
+            }
+            Err(error) => {
+                partial = true;
+                tracing::debug!(error = %error, "failed while reading capped upstream error body");
+                break;
+            }
+        }
+    }
+
+    CappedUpstreamBody {
+        bytes,
+        truncated,
+        partial,
+    }
+}
+
+#[derive(Debug)]
+struct CappedUpstreamErrorBody {
+    text: String,
+    truncated: bool,
+    partial: bool,
+}
+
+/// Read a non-success provider response through the diagnostic hard cap.
+///
+/// `reqwest::Response::text` buffers the complete response before returning,
+/// which lets an upstream allocate arbitrarily on a Tokio worker. This reader
+/// copies only the retained prefix and drops the response stream as soon as one
+/// byte beyond the cap is observed. The lossy UTF-8 conversion is capped again
+/// because replacement characters can expand invalid input.
+async fn read_capped_upstream_error_body(response: reqwest::Response) -> CappedUpstreamErrorBody {
+    let captured = read_capped_upstream_body(response, UPSTREAM_ERROR_BODY_CAP_BYTES).await;
+
+    let mut text = String::from_utf8_lossy(&captured.bytes).into_owned();
+    let mut truncated = captured.truncated;
+    if text.len() > UPSTREAM_ERROR_BODY_CAP_BYTES {
+        let mut end = UPSTREAM_ERROR_BODY_CAP_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        truncated = true;
+    }
+    CappedUpstreamErrorBody {
+        text,
+        truncated,
+        partial: captured.partial,
+    }
+}
+
+async fn collect_capped_upstream_json(
+    response: reqwest::Response,
+    cap: usize,
+    surface: &str,
+) -> AppResult<Value> {
+    let captured = read_capped_upstream_body(response, cap).await;
+    if captured.partial {
+        return Err(AppError::upstream(format!(
+            "{surface} response body ended before a clean end-of-stream"
+        )));
+    }
+    if captured.truncated {
+        return Err(AppError::upstream(format!(
+            "{surface} response body exceeded the {cap}-byte limit"
+        )));
+    }
+    serde_json::from_slice(&captured.bytes)
+        .map_err(|err| AppError::upstream(format!("invalid {surface} JSON: {err}")))
+}
+
 /// Convert an already-confirmed-success upstream response into the parsed SSE
 /// chunk stream. The first chunk is only produced lazily by the returned
 /// stream, so the context-overflow retry (which happens before this is called)
@@ -4487,6 +5381,7 @@ async fn stream_success_response(
     response: reqwest::Response,
     max_sse_frame_bytes: usize,
     capture: Option<Arc<TurnCaptureState>>,
+    persistence: Option<Arc<crate::flow_persistence::PersistenceCapture>>,
 ) -> AppResult<UpstreamStream> {
     // F1e: tap the RAW pre-parse upstream bytes into the turn's `upstream_response`
     // section BEFORE the G6 frame guard + SSE parser see them -- the raw bytes are
@@ -4510,6 +5405,11 @@ async fn stream_success_response(
             Some(capture) => Box::pin(tap_upstream_response(response.bytes_stream(), capture)),
             None => Box::pin(response.bytes_stream()),
         };
+    let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+        match persistence {
+            Some(capture) => Box::pin(tap_persistence_upstream_response(byte_stream, capture)),
+            None => byte_stream,
+        };
     // Bound the upstream SSE read BEFORE `eventsource()` parses it (G6). The
     // `eventsource-stream` 0.2 parser accumulates bytes into an internal
     // `String`/`Vec` buffer and only flushes on an event boundary (a blank
@@ -4519,26 +5419,108 @@ async fn stream_success_response(
     // `AppError` before the parser can over-accumulate. The configured request-body
     // cap in `http.rs` is inbound-only and does NOT cover this response path.
     let bounded = bounded_sse_byte_stream(byte_stream, max_sse_frame_bytes);
-    let stream = bounded.eventsource().filter_map(|result| async move {
-        match result {
-            Ok(event) if event.data == "[DONE]" => None,
-            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                AppError::upstream(format!(
-                    "failed to parse upstream chat chunk: {err}; payload={}",
-                    redact_and_truncate_error_body(&event.data, 500)
-                ))
-            })),
-            // The bounded adapter surfaces the frame-cap rejection through the
-            // transport-error channel as an already-formed `AppError` (its
-            // `Display` carries the cap message); other transport errors are
-            // wrapped here. Either way the model output is never silently
-            // truncated — the stream ends in an error item.
-            Err(err) => Some(Err(AppError::upstream(format!(
-                "failed to read upstream SSE: {err}"
-            )))),
+    let stream = async_stream::stream! {
+        let events = bounded.eventsource();
+        futures::pin_mut!(events);
+        let mut saw_done = false;
+        let mut saw_finish_reason = false;
+        while let Some(result) = events.next().await {
+            match result {
+                Ok(event) if event.data == "[DONE]" => {
+                    saw_done = true;
+                }
+                Ok(event) => match parse_chat_completion_chunk(&event.data) {
+                    Ok(chunk) => {
+                        saw_finish_reason |= chunk
+                            .choices
+                            .iter()
+                            .any(|choice| choice.finish_reason.is_some());
+                        yield Ok(chunk);
+                    }
+                    Err(err) => {
+                        yield Err(AppError::upstream(format!(
+                            "failed to parse upstream chat chunk: {err}; payload={}",
+                            redact_and_truncate_error_body(&event.data, 500)
+                        )));
+                        return;
+                    }
+                },
+                // The bounded adapter surfaces the frame-cap rejection through the
+                // transport-error channel as an already-formed `AppError` (its
+                // `Display` carries the cap message); other transport errors are
+                // wrapped here. Either way the model output is never silently
+                // truncated — the stream ends in an error item.
+                Err(err) => {
+                    yield Err(AppError::upstream(format!(
+                        "failed to read upstream SSE: {err}"
+                    )));
+                    return;
+                }
+            }
         }
-    });
+        if !saw_done {
+            yield Err(AppError::upstream(
+                "upstream SSE ended before the [DONE] marker",
+            ));
+        } else if !saw_finish_reason {
+            // [DONE] with a clean HTTP body is an explicit end of generation.
+            // Keep missing metadata observable, but do not turn already-delivered
+            // text/tool calls into a client error. The engine retains reason Other.
+            tracing::warn!(
+                "upstream SSE completed with [DONE] but without a terminal finish_reason"
+            );
+        }
+    };
     Ok(Box::pin(stream))
+}
+
+/// Nonblocking bounded counterpart to the disk turn-capture tap. It forwards
+/// every raw network chunk unchanged, copies only the remaining preview budget,
+/// and marks an early drop/transport error partial. No database operation occurs
+/// while the upstream stream is being polled.
+fn tap_persistence_upstream_response<S>(
+    inner: S,
+    capture: Arc<crate::flow_persistence::PersistenceCapture>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        let mut guard = PersistenceUpstreamTapGuard::new(Arc::clone(&capture));
+        let mut inner = std::pin::pin!(inner);
+        while let Some(item) = inner.next().await {
+            match &item {
+                Ok(bytes) => capture.push_upstream_response(bytes),
+                Err(_) => capture.finish_upstream_response(true),
+            }
+            yield item;
+        }
+        guard.mark_clean();
+    }
+}
+
+struct PersistenceUpstreamTapGuard {
+    capture: Arc<crate::flow_persistence::PersistenceCapture>,
+    clean: bool,
+}
+
+impl PersistenceUpstreamTapGuard {
+    fn new(capture: Arc<crate::flow_persistence::PersistenceCapture>) -> Self {
+        Self {
+            capture,
+            clean: false,
+        }
+    }
+
+    fn mark_clean(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for PersistenceUpstreamTapGuard {
+    fn drop(&mut self) {
+        self.capture.finish_upstream_response(!self.clean);
+    }
 }
 
 /// F1e: tee the RAW upstream byte stream into the turn's `upstream_response`
@@ -4696,58 +5678,72 @@ fn normalize_sparse_tool_call_types(value: &mut Value) -> bool {
 }
 
 pub async fn collect_models_response(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
 ) -> AppResult<(StatusCode, Value, Option<String>)> {
-    let status = response.status();
+    let status = response.status;
     let etag = response
-        .headers()
+        .headers
         .get(http::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
-    let body = response
-        .json::<Value>()
-        .await
+    if response.body.len() > UPSTREAM_JSON_BODY_CAP_BYTES {
+        return Err(AppError::upstream(format!(
+            "upstream /models response body exceeded the {UPSTREAM_JSON_BODY_CAP_BYTES}-byte limit"
+        )));
+    }
+    let body = serde_json::from_slice::<Value>(&response.body)
         .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
     Ok((status, body, etag))
 }
 
 pub async fn collect_supported_model_catalog(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
 ) -> AppResult<Vec<UpstreamModelEntry>> {
     let (_, body, _) = collect_models_response(response).await?;
     Ok(extract_supported_model_catalog(&body))
 }
 
 async fn filter_models_response(
-    response: reqwest::Response,
+    response: UpstreamModelsResponse,
     model: &str,
-) -> AppResult<reqwest::Response> {
-    let status = response.status();
-    let body = response
-        .json::<Value>()
-        .await
+) -> AppResult<UpstreamModelsResponse> {
+    let status = response.status;
+    if response.body.len() > UPSTREAM_JSON_BODY_CAP_BYTES {
+        return Err(AppError::upstream(format!(
+            "upstream /models response body exceeded the {UPSTREAM_JSON_BODY_CAP_BYTES}-byte limit"
+        )));
+    }
+    let body = serde_json::from_slice::<Value>(&response.body)
         .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
     let body = filter_models_body(body, model);
-    let body = serde_json::to_string(&body).map_err(|err| {
+    let body = serde_json::to_vec(&body).map_err(|err| {
         AppError::internal(format!("failed to serialize /models response: {err}"))
     })?;
-    let response = http::Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|err| AppError::internal(format!("failed to build /models response: {err}")))?;
-    Ok(reqwest::Response::from(response))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    Ok(UpstreamModelsResponse {
+        status,
+        headers,
+        body: Bytes::from(body),
+    })
 }
 
-fn json_response(body: Value) -> AppResult<reqwest::Response> {
-    let body = serde_json::to_string(&body)
+fn json_response(body: Value) -> AppResult<UpstreamModelsResponse> {
+    let body = serde_json::to_vec(&body)
         .map_err(|err| AppError::internal(format!("failed to serialize JSON response: {err}")))?;
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .map_err(|err| AppError::internal(format!("failed to build JSON response: {err}")))?;
-    Ok(reqwest::Response::from(response))
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    Ok(UpstreamModelsResponse {
+        status: StatusCode::OK,
+        headers,
+        body: Bytes::from(body),
+    })
 }
 
 fn filter_models_body(body: Value, model: &str) -> Value {
@@ -4943,7 +5939,7 @@ fn truncate_for_error(s: &str, max: usize) -> String {
 /// without this they would leak through `response.failed` and failover logs
 /// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
 /// URI cannot survive at the truncation boundary.
-fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
+pub(crate) fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
     truncate_for_error(&crate::redaction::redact_image_uris(body), max)
 }
 
@@ -4953,21 +5949,56 @@ fn stringify_json_value(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn stream_timeout_is_idle_time_between_chunks_not_total_generation_time() {
+        use futures::StreamExt;
+
+        let stream = async_stream::stream! {
+            tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"first","choices":[]})).unwrap());
+            tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"second","choices":[]})).unwrap());
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+            yield Ok(serde_json::from_value(serde_json::json!({"id":"late","choices":[]})).unwrap());
+        };
+        let mut guarded =
+            super::timeout_upstream_stream(Box::pin(stream), std::time::Duration::from_secs(10));
+
+        assert_eq!(guarded.next().await.unwrap().unwrap().id, "first");
+        assert_eq!(guarded.next().await.unwrap().unwrap().id, "second");
+        assert_eq!(
+            guarded.next().await.unwrap().unwrap_err().to_string(),
+            "upstream stream timed out"
+        );
+        assert!(guarded.next().await.is_none());
+    }
+
+    use super::ProxyCompletionsRequest;
     use super::ReqwestUpstreamClient;
+    use super::RoutingUpstreamClient;
+    use super::RoutingUpstreamProvider;
+    use super::UpstreamClient;
     use super::UpstreamModelEntry;
+    use super::UpstreamModelsResponse;
     use super::UpstreamRequestLogger;
+    use super::UpstreamStream;
     use super::classify_attempt_error;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use super::should_proxy_request_header;
     use crate::error::AppError;
+    use crate::error::AppResult;
     use crate::error::FailoverDisposition;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
+    use axum::body::Bytes;
+    use http::HeaderMap;
     use http::HeaderName;
     use reqwest::StatusCode;
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
     /// the response-direction parity test in `http.rs`.
@@ -4995,7 +6026,7 @@ mod tests {
 
     #[test]
     fn request_direction_strips_authorization_host_content_length() {
-        for header in ["authorization", "host", "content-length"] {
+        for header in ["authorization", "x-api-key", "host", "content-length"] {
             let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
             assert!(
                 !should_proxy_request_header(&name),
@@ -5049,13 +6080,14 @@ mod tests {
 
     // --- G2: family detection + chat_template_kwargs injection at the leaf ---
 
+    use super::AuthorizationScope;
     use super::BackendChatRequest;
     use super::BackendFinalizationPolicies;
     use super::FailoverUpstreamClient;
     use super::FailoverUpstreamProvider;
+    use super::InferenceEndpoint;
     use super::ModelFamily;
     use super::ProviderStatus;
-    use super::UpstreamClient as _;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
     use super::merge_chat_kwargs_gap_fill;
@@ -5063,6 +6095,7 @@ mod tests {
     use serde_json::Map as JsonMap;
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// Minimal request for family-injection tests. `model` is the FINAL provider
     /// model the leaf sees (after any routing/failover/alias rewrite).
@@ -5127,6 +6160,86 @@ mod tests {
         client_kwargs: Option<JsonMap<String, Value>>,
     ) -> BackendChatRequest {
         BackendChatRequest::new(family_request(model), client_kwargs, None, None)
+    }
+
+    #[derive(Clone, Default)]
+    struct CatalogDefaultDispatchProbe {
+        stream_calls: Arc<AtomicUsize>,
+        count_calls: Arc<AtomicUsize>,
+        completions_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl UpstreamClient for CatalogDefaultDispatchProbe {
+        async fn stream_chat_completion(
+            &self,
+            _request: &BackendChatRequest,
+        ) -> AppResult<UpstreamStream> {
+            self.stream_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(AppError::internal("stream dispatch should not be reached"))
+        }
+
+        async fn list_models(&self) -> AppResult<UpstreamModelsResponse> {
+            super::json_response(json!({
+                "data": [{"id": "wielick-large"}]
+            }))
+        }
+
+        async fn count_tokens(&self, _request: &BackendChatRequest) -> AppResult<Option<u64>> {
+            self.count_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(Some(1))
+        }
+
+        async fn proxy_completions(
+            &self,
+            _request: ProxyCompletionsRequest,
+        ) -> AppResult<reqwest::Response> {
+            self.completions_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(AppError::internal(
+                "completions dispatch should not be reached",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_models_blocks_catalog_default_before_dispatch() {
+        let probe = CatalogDefaultDispatchProbe::default();
+        let client = RoutingUpstreamClient::new(vec![RoutingUpstreamProvider::new(
+            "mesh",
+            probe.clone(),
+            None,
+            JsonMap::new(),
+            Vec::new(),
+            Duration::ZERO,
+        )]);
+        client.set_reject_unknown_models(true);
+
+        let backend = family_backend("DeepSeek-V4.1-Flash", None);
+        let stream_error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("catalog default must reject before stream dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(stream_error.status_code(), StatusCode::NOT_FOUND);
+
+        let count_error = match client.count_tokens(&backend).await {
+            Ok(_) => panic!("catalog default must reject before token-count dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(count_error.status_code(), StatusCode::NOT_FOUND);
+
+        let completions = ProxyCompletionsRequest::new(
+            HeaderMap::new(),
+            Bytes::from(json!({"model": "DeepSeek-V4.1-Flash", "prompt": "hello"}).to_string()),
+        );
+        let completions_error = match client.proxy_completions(completions).await {
+            Ok(_) => panic!("catalog default must reject before completions dispatch"),
+            Err(err) => err,
+        };
+        assert_eq!(completions_error.status_code(), StatusCode::NOT_FOUND);
+
+        assert_eq!(probe.stream_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(probe.count_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(probe.completions_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
     /// Empty finalization policies (no effort map, no family override, no
@@ -6021,14 +7134,8 @@ mod tests {
         assert_eq!(url.as_str(), "https://api.example.com/chat/completions");
     }
 
-    #[tokio::test]
-    async fn upstream_request_logger_writes_jsonl() {
-        let path = std::env::temp_dir().join(format!(
-            "llmconduit-upstream-log-{}.jsonl",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let logger = UpstreamRequestLogger::new(path.clone());
-        let request = sanitize_chat_request(
+    fn request_for_upstream_log(extra_body: BTreeMap<String, Value>) -> ChatCompletionRequest {
+        sanitize_chat_request(
             ChatCompletionRequest {
                 model: "grok-4".to_string(),
                 messages: vec![ChatMessage {
@@ -6056,10 +7163,20 @@ mod tests {
                 frequency_penalty: None,
                 presence_penalty: None,
                 stop: None,
-                extra_body: BTreeMap::new(),
+                extra_body,
             },
             true,
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn upstream_request_logger_writes_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-log-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logger = UpstreamRequestLogger::new(path.clone());
+        let request = request_for_upstream_log(BTreeMap::new());
 
         logger.log(&request).await.expect("write request log");
 
@@ -6071,6 +7188,73 @@ mod tests {
                 serde_json::to_string(&request).expect("serialize request")
             )
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn upstream_request_logger_redacts_secret_extra_body_and_image_uri() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-log-redaction-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logger = UpstreamRequestLogger::new(path.clone());
+        let request = request_for_upstream_log(BTreeMap::from([
+            ("api_key".to_string(), serde_json::json!("sk-log-leak")),
+            (
+                "vendor_options".to_string(),
+                serde_json::json!({
+                    "client_secret": "nested-log-leak",
+                    "image_url": "data:image/png;base64,raw-image-leak"
+                }),
+            ),
+        ]));
+
+        logger.log(&request).await.expect("write request log");
+
+        let contents = std::fs::read_to_string(&path).expect("read request log");
+        assert!(
+            contents.ends_with('\n'),
+            "entry keeps JSONL newline framing"
+        );
+        assert_eq!(contents.lines().count(), 1, "one request is one JSONL row");
+        let logged: Value = serde_json::from_str(contents.trim()).expect("valid JSONL row");
+        assert_eq!(logged["model"], "grok-4");
+        assert_eq!(logged["api_key"], "[redacted]");
+        assert_eq!(logged["vendor_options"]["client_secret"], "[redacted]");
+        assert_eq!(logged["vendor_options"]["image_url"], "<redacted uri>");
+        assert!(!contents.contains("sk-log-leak"));
+        assert!(!contents.contains("nested-log-leak"));
+        assert!(!contents.contains("raw-image-leak"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_request_logger_tightens_existing_file_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-log-mode-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::File::create(&path).expect("create permissive request log");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make request log permissive");
+
+        let logger = UpstreamRequestLogger::new(path.clone());
+        logger
+            .log(&request_for_upstream_log(BTreeMap::new()))
+            .await
+            .expect("append request log");
+
+        let mode = std::fs::metadata(&path)
+            .expect("request log metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "existing log permissions are tightened");
 
         let _ = std::fs::remove_file(path);
     }
@@ -6347,7 +7531,9 @@ mod tests {
         // `request_for_provider` is the failover production rebuild. It must carry
         // `response_id` forward AND clone the SAME `Arc<ServingToken>` (so a tag set
         // on the rebuilt request is visible on the original — they share the token).
-        let backend = d2_backend_with_identity("glm-x", "resp_failover");
+        let backend = d2_backend_with_identity("glm-x", "resp_failover")
+            .with_payload_capture(false)
+            .with_affinity(Some(super::RequestAffinity("opaque-session".to_owned())));
         let provider = FailoverUpstreamProvider::new(
             "p0",
             d2_leaf_client(),
@@ -6357,6 +7543,8 @@ mod tests {
         );
         let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
+        assert!(!rebuilt.capture_payloads);
+        assert_eq!(rebuilt.affinity, backend.affinity);
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
         assert!(
@@ -6373,7 +7561,9 @@ mod tests {
     fn routing_rebuild_preserves_response_id_and_shares_serving_arc() {
         // `routed_request` is the routing production rebuild. Same contract.
         let routing = super::RoutingUpstreamClient::new(Vec::new());
-        let backend = d2_backend_with_identity("requested", "resp_routing");
+        let backend = d2_backend_with_identity("requested", "resp_routing")
+            .with_payload_capture(false)
+            .with_affinity(Some(super::RequestAffinity("opaque-session".to_owned())));
         let rebuilt = routing.routed_request(
             &backend,
             "served-model",
@@ -6381,6 +7571,8 @@ mod tests {
             super::MatchKind::ExactId,
         );
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_routing"));
+        assert!(!rebuilt.capture_payloads);
+        assert_eq!(rebuilt.affinity, backend.affinity);
         assert_eq!(rebuilt.request.model, "served-model");
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
@@ -6474,6 +7666,65 @@ mod tests {
     use wiremock::matchers::path as wm_path;
 
     #[tokio::test]
+    async fn oversized_provider_error_body_is_read_through_a_hard_cap() {
+        let server = MockServer::start().await;
+        let oversized = format!(
+            "{{\"error\":\"{}\"}}",
+            "x".repeat(super::UPSTREAM_ERROR_BODY_CAP_BYTES * 4)
+        );
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/oversized-error"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(oversized))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/oversized-error", server.uri()))
+            .await
+            .expect("provider response");
+        let captured = super::read_capped_upstream_error_body(response).await;
+        assert!(captured.truncated);
+        assert!(!captured.partial);
+        assert!(captured.text.len() <= super::UPSTREAM_ERROR_BODY_CAP_BYTES);
+        assert!(captured.text.starts_with("{\"error\":\""));
+    }
+
+    #[tokio::test]
+    async fn oversized_models_json_is_rejected_at_the_explicit_json_cap() {
+        let server = MockServer::start().await;
+        let oversized = format!(
+            "{{\"data\":[{{\"id\":\"{}\"}}]}}",
+            "m".repeat(super::UPSTREAM_JSON_BODY_CAP_BYTES + 1)
+        );
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(oversized))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/v1/models", server.uri()))
+            .await
+            .expect("provider response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.expect("provider body");
+        let response = super::UpstreamModelsResponse {
+            status,
+            headers,
+            body,
+        };
+        let error = super::collect_models_response(response)
+            .await
+            .expect_err("oversized catalog must be rejected before JSON allocation");
+        assert!(
+            error
+                .to_string()
+                .contains("response body exceeded the 4194304-byte limit")
+        );
+    }
+
+    #[tokio::test]
     async fn count_tokens_posts_finalized_payload_to_server_root_tokenize() {
         use super::UpstreamClient as _;
 
@@ -6523,7 +7774,7 @@ mod tests {
     /// it, so `stream_chat_completion` returns Ok and the capture is observable).
     fn d2_sse_ok_body() -> String {
         "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\
-         \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+         \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
          data: [DONE]\n\n"
             .to_string()
     }
@@ -6639,6 +7890,46 @@ mod tests {
             record.model_served.as_deref(),
             Some("served-model"),
             "leaf populated model_served with the finalized request model"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_capture_policy_suppresses_global_upstream_request_log() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-disabled-payload-log-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            Some(path.clone()),
+            true,
+            4096,
+        );
+        let backend = BackendChatRequest::new(family_request("served-model"), None, None, None)
+            .with_payload_capture(false);
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        assert!(
+            !path.exists(),
+            "metadata-only keys must not create an upstream payload log entry"
         );
     }
 
@@ -8525,6 +9816,187 @@ mod tests {
             "F3: model scalar capped to SCALAR_CAP before retention"
         );
     }
+    #[tokio::test]
+    async fn authorization_scope_filters_failover_before_dispatch_or_health_mutation() {
+        let denied = MockServer::start().await;
+        let allowed = MockServer::start().await;
+        for server in [&denied, &allowed] {
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+                )
+                .mount(server)
+                .await;
+        }
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "denied",
+                    d2_capturing_client(&denied.uri(), DashboardFlowStore::disabled()),
+                    Some("model-denied".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "allowed",
+                    d2_capturing_client(&allowed.uri(), DashboardFlowStore::disabled()),
+                    Some("model-allowed".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            Duration::from_secs(60),
+        );
+        let scope = AuthorizationScope::restricted(|provider, _, model, endpoint| {
+            provider == "allowed"
+                && model == "model-allowed"
+                && endpoint == InferenceEndpoint::ChatCompletions
+        });
+        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
+            .with_authorization(scope, InferenceEndpoint::ChatCompletions);
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("authorized fallback serves");
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("valid chunk");
+        }
+
+        assert!(denied.received_requests().await.unwrap().is_empty());
+        assert_eq!(allowed.received_requests().await.unwrap().len(), 1);
+        let health = failover.provider_health();
+        assert_eq!(health[0].failover_count, 0, "denial is not a failure");
+        assert_eq!(health[0].consecutive_failures, 0, "denial does not cool");
+    }
+
+    #[tokio::test]
+    async fn authorization_scope_empty_candidate_set_is_terminal_forbidden() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        let backend = BackendChatRequest::new(family_request("alias"), None, None, None)
+            .with_authorization(
+                AuthorizationScope::restricted(|_, _, _, _| false),
+                InferenceEndpoint::ChatCompletions,
+            );
+        let err = match failover.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("empty authorized set must deny before network"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        assert_eq!(failover.provider_health()[0].failover_count, 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_scope_cannot_be_bypassed_by_raw_completions_proxy() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        let request = super::ProxyCompletionsRequest::new(
+            http::HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{"model":"alias","prompt":"hello"}"#),
+        )
+        .with_authorization(AuthorizationScope::restricted(|_, _, _, _| false));
+        let err = failover
+            .proxy_completions(request)
+            .await
+            .expect_err("raw completions must use the same candidate scope");
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        assert_eq!(failover.provider_health()[0].failover_count, 0);
+    }
+
+    #[tokio::test]
+    async fn raw_completions_denial_precedes_selected_provider_cooldown() {
+        let leaf = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "only",
+                leaf,
+                Some("served".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            Duration::from_secs(60),
+        );
+        failover.mark_failure(0, &AppError::upstream("provider unavailable"));
+        let health_before_denial = failover.provider_health();
+        let cooldown_before_denial = failover
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned")[0]
+            .cooling_until;
+        let request = super::ProxyCompletionsRequest::new(
+            http::HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{"model":"alias","prompt":"hello"}"#),
+        )
+        .with_authorization(AuthorizationScope::restricted(|_, _, _, _| false));
+
+        let err = failover
+            .proxy_completions_from_provider(0, request)
+            .await
+            .expect_err("authorization denial must not disclose provider cooldown state");
+
+        assert_eq!(err.status_code(), http::StatusCode::FORBIDDEN);
+        let health = failover.provider_health();
+        assert_eq!(
+            health[0].failover_count, health_before_denial[0].failover_count,
+            "denial is not a failure"
+        );
+        assert_eq!(
+            health[0].consecutive_failures, health_before_denial[0].consecutive_failures,
+            "denial does not mutate health"
+        );
+        assert_eq!(health[0].status, health_before_denial[0].status);
+        let cooldown_after_denial = failover
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned")[0]
+            .cooling_until;
+        assert_eq!(
+            cooldown_after_denial, cooldown_before_denial,
+            "denial does not mutate the monotonic cooldown deadline"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8966,9 +10438,10 @@ mod f1e_upstream_response_truthful_tests {
                     .body(b"data: {\"choices\":[]}\n\n".to_vec())
                     .expect("build response"),
             );
-            let stream = stream_success_response(response, 1024 * 1024, Some(Arc::clone(&state)))
-                .await
-                .expect("stream built");
+            let stream =
+                stream_success_response(response, 1024 * 1024, Some(Arc::clone(&state)), None)
+                    .await
+                    .expect("stream built");
             // Dropped WITHOUT a single poll -> the tap block never runs, and (fix) there
             // is no eager header-time streamed mark, so the discriminator stays clear.
             drop(stream);
@@ -8982,6 +10455,52 @@ mod f1e_upstream_response_truthful_tests {
             artifact["sections"].get("upstream_response").is_none(),
             "2xx headers then cancel before the first byte must leave upstream_response \
              ABSENT, never an empty partial:false complete: {artifact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_success_rejects_eof_without_done_marker() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body(
+                    b"data: {\"id\":\"chat-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                        .to_vec(),
+                )
+                .expect("build response"),
+        );
+        let mut stream = stream_success_response(response, 1024 * 1024, None, None)
+            .await
+            .expect("stream built");
+
+        assert!(stream.next().await.expect("terminal chunk").is_ok());
+        let error = stream
+            .next()
+            .await
+            .expect("missing done error")
+            .expect_err("EOF without [DONE] must fail");
+        assert!(error.to_string().contains("[DONE]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stream_success_accepts_done_without_finish_reason() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body(
+                    b"data: {\"id\":\"chat-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n"
+                        .to_vec(),
+                )
+                .expect("build response"),
+        );
+        let mut stream = stream_success_response(response, 1024 * 1024, None, None)
+            .await
+            .expect("stream built");
+
+        assert!(stream.next().await.expect("content chunk").is_ok());
+        assert!(
+            stream.next().await.is_none(),
+            "clean [DONE] must not become a stream failure when finish metadata is absent"
         );
     }
 

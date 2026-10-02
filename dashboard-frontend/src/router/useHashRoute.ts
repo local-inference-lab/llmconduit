@@ -1,15 +1,15 @@
 /**
- * Minimal hash router. The views live at `#/flows`, `#/topology`, `#/sankey`, `#/theater` (D9),
- * and `#/overview` (gap 16 — the control-room overview that COMPOSES the other surfaces). No router
- * dependency — a `hashchange` listener bridged into React via useSyncExternalStore keeps it tear-free.
+ * Minimal hash router. The views live at `#/flows`, the telemetry/history surfaces,
+ * `#/overview` (gap 16), `#/providers`, and `#/access`. No router dependency — a
+ * `hashchange` listener bridged into React via useSyncExternalStore keeps it tear-free.
  */
 import { useSyncExternalStore } from 'react';
 
-export type RouteName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview';
+export type RouteName = 'flows' | 'sessions' | 'throughput' | 'activity' | 'chat' | 'account' | 'topology' | 'sankey' | 'theater' | 'overview' | 'providers' | 'access';
 
-export const ROUTES: RouteName[] = ['flows', 'topology', 'sankey', 'theater', 'overview'];
+export const ROUTES: RouteName[] = ['flows', 'sessions', 'throughput', 'activity', 'chat', 'account', 'topology', 'sankey', 'theater', 'overview', 'providers', 'access'];
 
-const DEFAULT_ROUTE: RouteName = 'flows';
+const DEFAULT_ROUTE: RouteName = 'chat';
 
 function parseHash(): RouteName {
   const raw = (typeof window !== 'undefined' ? window.location.hash : '').replace(/^#\/?/, '');

@@ -17,7 +17,7 @@ import type { FlowSummary, MetricsResponse, ProviderLatency, ProviderHealth, Top
  */
 
 function metrics(over: Partial<MetricsResponse> = {}): MetricsResponse {
-  const w = { reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1, p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21, samples: 10, usage_samples: 10, priced_samples: 10, cost_confidence: 'estimated' as const };
+  const w = { reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1, p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, prefill_tokens_per_sec: 10_000, decode_tokens_per_sec: 78.34, cost_per_min: 0.21, samples: 10, usage_samples: 10, prefill_samples: 10, decode_samples: 10, priced_samples: 10, cost_confidence: 'estimated' as const };
   return { metrics_seq: 1, ...w, ...over, windows: { m1: { ...w, ...over }, m5: { ...w }, h1: { ...w } } };
 }
 
@@ -223,12 +223,13 @@ describe('OverviewView — headline echoes the gap-01 honest tile (samples-gated
   });
 
   it('a window with samples 0 renders latency/tok/$ as — (unavailable), never 0', async () => {
-    seed([], { metrics: metrics({ samples: 0, usage_samples: 0, priced_samples: 0, cost_confidence: 'unavailable' }) });
+    seed([], { metrics: metrics({ samples: 0, usage_samples: 0, prefill_samples: 0, decode_samples: 0, priced_samples: 0, cost_confidence: 'unavailable' }) });
     const { getByTestId } = renderWithQuery(<OverviewView />);
     await waitFor(() => expect(getByTestId('overview-headline')).toBeTruthy());
     expect(getByTestId('overview-hl-err').textContent).toContain('—');
     expect(getByTestId('overview-hl-err').getAttribute('data-quality')).toBe('unavailable');
-    expect(getByTestId('overview-hl-toks').textContent).toContain('—');
+    expect(getByTestId('overview-hl-prefill').textContent).toContain('—');
+    expect(getByTestId('overview-hl-decode').textContent).toContain('—');
     expect(getByTestId('overview-hl-cost').textContent).toContain('—');
     // active streams + samples stay numeric (a genuine 0, not unavailable).
     expect(getByTestId('overview-hl-samples').getAttribute('data-quality')).toBe('measured');

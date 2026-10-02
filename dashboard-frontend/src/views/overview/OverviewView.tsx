@@ -49,6 +49,7 @@ import {
   type TokenMix,
 } from './overviewModel';
 import { fmtCost, fmtTokens } from '../../components/FlowTable/format';
+import { fmtTokenRate } from '../../components/StatsStrip/chips';
 import { buildProviderLatency } from '../../components/viz/providerLatency';
 import { ProviderLatencyTile } from '../../components/viz/ProviderLatencyTile';
 import { failureTaxonomy, type FailureTaxonomy as FailureTaxonomyModel } from '../../components/FlowTable/failureTaxonomy';
@@ -220,9 +221,10 @@ function HeadlineCell({
 }
 
 /**
- * The headline strip — the honest gap-01 metrics (active streams / tok-s / $/min / err% / samples) +
+ * The headline strip — the honest gap-01 metrics (active streams / prefill + decode tok/s /
+ * $/min / err% / samples) +
  * a cost-over-time sparkline. Every figure respects don't-lie-with-zeros: a window whose denominator
- * is `0` renders `—` (the `samples`/`usage_samples`/`priced_samples` gates), never a fabricated `0`.
+ * is `0` renders `—` (the `samples`/phase-sample/`priced_samples` gates), never a fabricated `0`.
  * Reads the headline (`m1`) window fields directly off the unified live tile.
  */
 function HeadlineStrip({
@@ -237,15 +239,18 @@ function HeadlineStrip({
   // No tick yet ⇒ the whole strip is unavailable (`—`), never an all-`0` headline.
   const has = metrics !== null;
   const samples = metrics?.samples ?? 0;
-  const usageSamples = metrics?.usage_samples ?? 0;
+  const prefillSamples = metrics?.prefill_samples ?? 0;
+  const decodeSamples = metrics?.decode_samples ?? 0;
   const pricedSamples = metrics?.priced_samples ?? 0;
 
-  // Latency/err% need a finalized flow (`samples`); tok/s a usage-bearing one; $/min a priced one.
+  // Latency/err% need a finalized flow (`samples`); each phase speed needs its own measured
+  // duration+usage sample; $/min needs a priced one.
   // active_streams + req/s are never sample-gated (a genuine idle `0` is honest).
   const activeStreams = has ? String(metrics!.active_streams) : DASH;
   const reqs = has ? metrics!.reqs_per_sec.toFixed(1) : DASH;
   const errPct = has && samples > 0 ? `${metrics!.error_pct.toFixed(1)}%` : DASH;
-  const tokS = has && usageSamples > 0 ? fmtTokens(metrics!.tokens_per_sec) : DASH;
+  const prefillTokS = has && prefillSamples > 0 ? fmtTokenRate(metrics!.prefill_tokens_per_sec) : DASH;
+  const decodeTokS = has && decodeSamples > 0 ? fmtTokenRate(metrics!.decode_tokens_per_sec) : DASH;
   const costPerMin = has && pricedSamples > 0 ? `$${metrics!.cost_per_min.toFixed(2)}` : DASH;
   // $/min DQ tag: the AGGREGATE cost_confidence (confident ⇒ derived, estimated ⇒ estimated, else —).
   const costConfidence = metrics?.cost_confidence ?? 'unavailable';
@@ -255,7 +260,7 @@ function HeadlineStrip({
   const errOver = has && samples > 0 && metrics!.error_pct > ERROR_RATE_THRESHOLD;
 
   return (
-    <Panel className="flex items-stretch gap-1 px-2 py-2" data-testid="overview-headline">
+    <Panel className="grid grid-cols-2 gap-1 px-2 py-2 sm:grid-cols-4 xl:grid-cols-[repeat(7,minmax(0,1fr))_auto]" data-testid="overview-headline">
       <HeadlineCell testId="overview-hl-active" label="active streams" value={activeStreams} quality={has ? 'measured' : 'unavailable'} />
       <HeadlineCell testId="overview-hl-reqs" label="req/s" value={reqs} quality={has ? 'measured' : 'unavailable'} accent="text-accent" />
       <HeadlineCell
@@ -265,14 +270,15 @@ function HeadlineStrip({
         quality={errPct === DASH ? 'unavailable' : 'derived'}
         accent={errOver ? 'text-status-down' : 'text-text'}
       />
-      <HeadlineCell testId="overview-hl-toks" label="tok/s" value={tokS} quality={tokS === DASH ? 'unavailable' : 'derived'} accent="text-status-healthy" />
+      <HeadlineCell testId="overview-hl-prefill" label="prefill tok/s" value={prefillTokS} quality={prefillTokS === DASH ? 'unavailable' : 'derived'} accent="text-status-healthy" />
+      <HeadlineCell testId="overview-hl-decode" label="decode tok/s" value={decodeTokS} quality={decodeTokS === DASH ? 'unavailable' : 'derived'} accent="text-status-cooling" />
       <HeadlineCell testId="overview-hl-cost" label="$/min" value={costPerMin} quality={costQuality} accent="text-meta" />
       <HeadlineCell testId="overview-hl-samples" label="samples" value={has ? String(samples) : DASH} quality={has ? 'measured' : 'unavailable'} />
       {/* Cost-over-time trend — LIVE-only $/min history (mirrors the strip sparkline discipline). An
           unpriced tick is a GAP (NaN) — the line breaks rather than dropping to a fabricated 0; the
           trend is tagged with the latest tick's cost quality (estimated/unavailable labelled). */}
       <div
-        className="ml-auto flex flex-col justify-center px-2"
+        className="col-span-2 flex min-w-0 flex-col justify-center border-t border-border px-2 pt-2 sm:col-span-4 xl:col-span-1 xl:border-l xl:border-t-0 xl:pt-0"
         data-testid="overview-cost-trend"
         data-quality={trendQuality}
         title={`cost-over-time ($/min, live trend) — ${trendQuality}`}

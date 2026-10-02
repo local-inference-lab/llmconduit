@@ -6,12 +6,18 @@
  * "auth flag only" helper for callers that don't need the full teardown.
  */
 import { createStore } from 'zustand/vanilla';
+import type { AuthMode, SessionUser } from '../api/types';
 
 export interface AuthState {
   authenticated: boolean;
   /** Double-submit CSRF token from the bootstrap/cookie (D7). */
   csrfToken: string | null;
   mutationsEnabled: boolean;
+  /** The signed-in user; null for a token / dev-open session. */
+  user: SessionUser | null;
+  authMode: AuthMode;
+  setUser: (user: SessionUser | null) => void;
+  setAuthMode: (mode: AuthMode) => void;
 
   setAuthenticated: (v: boolean) => void;
   setCsrfToken: (t: string | null) => void;
@@ -30,12 +36,16 @@ export const authStore = createStore<AuthState>((set) => ({
   authenticated: false,
   csrfToken: null,
   mutationsEnabled: false,
+  user: null,
+  authMode: 'token',
 
+  setUser: (user) => set({ user }),
+  setAuthMode: (authMode) => set({ authMode }),
   setAuthenticated: (authenticated) => set({ authenticated }),
   setCsrfToken: (csrfToken) => set({ csrfToken }),
   setMutationsEnabled: (mutationsEnabled) => set({ mutationsEnabled }),
   bounceToLogin: () => set({ authenticated: false }),
-  reset: () => set({ authenticated: false, csrfToken: null, mutationsEnabled: false }),
+  reset: () => set({ authenticated: false, csrfToken: null, mutationsEnabled: false, user: null }),
 }));
 
 export type AuthStore = typeof authStore;

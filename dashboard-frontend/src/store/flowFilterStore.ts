@@ -29,6 +29,10 @@ export interface FlowFilterState {
   setModel: (model: string) => void;
   /** Gap 15 — cross-link from the "by client" roll-up: SET the client filter to that `client_label`. */
   setClient: (client: string) => void;
+  /** Sessions — cross-link from the Sessions view: SET the session facet to that node id. */
+  setSession: (session: string) => void;
+  /** Sessions — cross-link: SET the harness facet. */
+  setHarness: (harness: string) => void;
   /** Clear every facet. */
   clear: () => void;
 }
@@ -43,6 +47,8 @@ export const flowFilterStore = createStore<FlowFilterState>((set) => ({
   // Gap 15: a "by client" roll-up click SETS the client facet so the table lands scoped to that
   // client (the FilterBar owns the toggle-off-on-repeat chip behavior, like the other facets).
   setClient: (client) => set((s) => ({ filters: { ...s.filters, client } })),
+  setSession: (session) => set((s) => ({ filters: { ...s.filters, session } })),
+  setHarness: (harness) => set((s) => ({ filters: { ...s.filters, harness } })),
   clear: () => set({ filters: EMPTY_FILTERS }),
 }));
 

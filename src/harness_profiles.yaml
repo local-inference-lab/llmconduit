@@ -1,0 +1,117 @@
+# Built-in harness profiles, evaluated in order; the first match wins.
+#
+# Operators extend or override this list from `control_plane.sessions.harnesses`
+# (see docs/design/sessions-and-content-store.md). A profile named like one of
+# these replaces it in place; `builtin: replace` drops the whole list.
+#
+# Facts verified 2026-09-12 against the Claude Code gateway-protocol docs,
+# codex-rs, and the pi and oh-my-pi sources. Third-party-observed values are
+# marked.
+harnesses:
+  # Our own header convention. Any harness may adopt it; pi-agent does.
+  - name: pi-agent
+    match: { header: { name: x-llm-harness, regex: '^pi-agent(/|$)' } }
+    version: { header: { name: x-llm-harness, regex: '/(.+)$' } }
+    session_id: { header: x-llm-session-id }
+    parent_session_id: { header: x-llm-parent-session-id }
+    session_kind: { header: x-llm-session-kind }
+    sub_sessions: declared
+
+  # oh-my-pi (omp). Listed before claude-code because it sends the Claude Code
+  # session header on Anthropic-protocol providers; its User-Agent is unique.
+  # On OpenAI-compatible hosts only the prompt cache key is reliable.
+  - name: oh-my-pi
+    match: { header: { name: user-agent, regex: '^omp/' } }
+    version: { header: { name: user-agent, regex: '^omp/([0-9][^ ]*)' } }
+    session_id:
+      first_of:
+        - header: x-claude-code-session-id
+        - header: session_id
+        - header: x-client-request-id
+        - body: { path: /prompt_cache_key }
+    sub_sessions: infer
+
+  # Claude Code always speaks Anthropic Messages. The session header is
+  # documented; the agent headers are added on top of it for spawned agents.
+  # The User-Agent shape is third-party-observed. metadata.user_id is a JSON
+  # document encoded as a string (legacy: user_<sha>_account_<uuid>_session_<uuid>).
+  - name: claude-code
+    match:
+      any:
+        - header: x-claude-code-session-id
+        - header: { name: user-agent, regex: '^claude-cli/' }
+        - body: { path: /metadata/user_id, regex: '"session_id"' }
+        - body: { path: /metadata/user_id, regex: '_session_[0-9a-fA-F-]{36}$' }
+    version: { header: { name: user-agent, regex: '^claude-cli/([0-9][^ ]*)' } }
+    session_id:
+      first_of:
+        - header: x-claude-code-session-id
+        - json_string: { path: /metadata/user_id, pointer: /session_id }
+        - body: { path: /metadata/user_id, regex: '_session_([0-9a-fA-F-]{36})$' }
+    sub_session_id: { header: x-claude-code-agent-id }
+    parent_session_id: { header: x-claude-code-parent-agent-id }
+    sub_sessions: declared
+
+  # Codex (codex-rs). Sub-agents share the session id, get their own thread id,
+  # and name the parent thread. client_metadata in the body mirrors the headers.
+  - name: codex
+    match:
+      any:
+        - header: { name: originator, regex: '^codex' }
+        # `codex_cli_rs/…` interactive, `codex_exec/…` for `codex exec`.
+        - header: { name: user-agent, regex: '^codex_[a-z_]+/' }
+    version: { header: { name: user-agent, regex: '^codex_[a-z_]+/([0-9][^ ]*)' } }
+    session_id:
+      first_of:
+        - header: session-id
+        - header: session_id
+        - body: { path: /client_metadata/session_id }
+    sub_session_id:
+      first_of:
+        - header: thread-id
+        - header: x-client-request-id
+        - body: { path: /client_metadata/thread_id }
+    parent_session_id:
+      first_of:
+        - header: x-codex-parent-thread-id
+        - body: { path: /client_metadata/x-codex-parent-thread-id }
+    session_kind: { header: x-openai-subagent }
+    sub_sessions: declared
+
+  # Upstream pi. Newer builds send their own User-Agent; older ones keep the
+  # OpenAI SDK default and are recognized by the affinity headers instead.
+  - name: opencode
+    # opencode (sst) sends no session identifier: sessions are inferred from
+    # the conversation prefix per client key.
+    match: { header: { name: user-agent, regex: '^opencode/' } }
+    version: { header: { name: user-agent, regex: '^opencode/([0-9][^ ]*)' } }
+    sub_sessions: infer
+  - name: pi
+    match:
+      any:
+        - header: { name: user-agent, regex: '^pi \(' }
+        - header: x-session-affinity
+    session_id:
+      first_of:
+        - header: x-session-affinity
+        - header: x-client-request-id
+        - header: session_id
+    sub_sessions: infer
+
+  # Anything else: honor the open convention and the common affinity headers.
+  - name: generic
+    match: { always: true }
+    session_id:
+      first_of:
+        - header: x-llm-session-id
+        - header: ${conversation_id_header}
+        - header: session-id
+        - header: session_id
+        - header: x-session-id
+        - header: x-session-affinity
+        - header: x-client-request-id
+        - body: { path: /prompt_cache_key }
+        - body: { path: /user }
+    parent_session_id: { header: x-llm-parent-session-id }
+    session_kind: { header: x-llm-session-kind }
+    sub_sessions: infer

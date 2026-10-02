@@ -24,7 +24,25 @@ export const queryKeys = {
   flowDetail: (id: string) => ['flows', id] as const,
   metrics: ['metrics'] as const,
   topology: ['topology'] as const,
+  providers: ['providers'] as const,
+  configuredProviders: ['configured-providers'] as const,
+  fleet: ['fleet'] as const,
+  mesh: ['mesh'] as const,
+  providerMetrics: ['provider-metrics'] as const,
   catalog: ['catalog'] as const,
+  // Durable history (sessions view + the inspector's chain diff).
+  sessions: ['history', 'sessions'] as const,
+  activeSessions: ['history', 'sessions', 'active'] as const,
+  session: (id: string) => ['history', 'sessions', id] as const,
+  requestBody: (id: string, hop: string) => ['history', 'requests', id, 'body', hop] as const,
+  throughput: ['history', 'throughput'] as const,
+  activity: ['history', 'activity'] as const,
+  historyMetrics: ['history', 'metrics'] as const,
+  me: ['me'] as const,
+  users: ['users'] as const,
+  keys: (scope: string) => ['keys', scope] as const,
+  authUsers: ['auth', 'users'] as const,
+  authApiKeys: ['auth', 'api-keys'] as const,
 } as const;
 
 export interface Connection {
@@ -57,6 +75,8 @@ export function getConnection(): Connection {
   authStore.getState().setAuthenticated(boot.authenticated);
   authStore.getState().setCsrfToken(boot.csrf_token);
   authStore.getState().setMutationsEnabled(boot.mutations_enabled);
+  authStore.getState().setUser(boot.user);
+  authStore.getState().setAuthMode(boot.auth_mode);
 
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -138,6 +158,10 @@ function invalidateForDomain(queryClient: QueryClient, domain: Domain): void {
       return;
     case 'monitor':
       // Monitor deltas feed the live store directly; no REST query mirrors them.
+      return;
+    case 'sessions':
+      // The hub tick is a push notification: refetch the active-session board.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.activeSessions });
       return;
   }
 }

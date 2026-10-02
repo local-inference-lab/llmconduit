@@ -188,6 +188,10 @@ pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
             // `openai-beta` carries feature-gating tokens; redact its value in
             // captured headers (D1 R1 #2). Also covers a JSON `openai_beta` field.
             | "openaibeta"
+            // Session cookies and proxy credentials in captured request headers.
+            | "cookie"
+            | "setcookie"
+            | "proxyauthorization"
     )
 }
 
@@ -911,6 +915,9 @@ mod tests {
             "openai_beta",
             "client_secret",
             "refresh_token",
+            "cookie",
+            "Set-Cookie",
+            "proxy-authorization",
         ] {
             assert!(is_sensitive_payload_key(key), "{key} must be sensitive");
         }

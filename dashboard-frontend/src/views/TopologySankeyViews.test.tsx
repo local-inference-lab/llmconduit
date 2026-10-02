@@ -19,7 +19,7 @@ function metrics(
   costPerMin: number,
   over: Partial<Pick<MetricsResponse, 'priced_samples' | 'cost_confidence'>> = {},
 ): MetricsResponse {
-  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' as const, ...over };
+  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, prefill_tokens_per_sec: 0, decode_tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, prefill_samples: 1, decode_samples: 1, priced_samples: 1, cost_confidence: 'estimated' as const, ...over };
   return { metrics_seq: 1, ...w, windows: { m1: w, m5: w, h1: w } };
 }
 function usage(over: Partial<Usage> = {}): Usage {

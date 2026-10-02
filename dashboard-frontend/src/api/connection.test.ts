@@ -74,7 +74,9 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // A minimal valid `metric_tick` (the per-domain validator requires the full shape).
     const w = {
       reqs_per_sec: 1, active_streams: 0, error_pct: 0, p50: 10, p95: 20, p99: 30,
-      tokens_per_sec: 5, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1,
+      tokens_per_sec: 5, prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50,
+      cost_per_min: 0, samples: 1, usage_samples: 1, prefill_samples: 1,
+      decode_samples: 1, priced_samples: 1,
       cost_confidence: 'estimated' as const,
     };
     socket.applyFrame({

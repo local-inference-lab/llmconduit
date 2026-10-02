@@ -161,6 +161,7 @@ fn format_search_results(payload: &BraveSearchResponse) -> String {
 mod tests {
     use super::BraveSearchClient;
     use crate::config::Config;
+    use crate::config::MeshConfig;
     use crate::config::UnsupportedImagePolicy;
 
     use super::BraveSearchResponse;
@@ -242,6 +243,7 @@ mod tests {
         let client = BraveSearchClient::new(
             reqwest::Client::new(),
             Config {
+                provider_metrics_targets: Vec::new(),
                 bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
                 upstream_base_url: url::Url::parse("http://127.0.0.1:8000/v1/").expect("url"),
                 upstream_api_key: None,
@@ -276,6 +278,8 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                auth: Default::default(),
+                mesh: MeshConfig::default(),
             },
         );
 
@@ -293,6 +297,7 @@ mod tests {
         let client = BraveSearchClient::new(
             reqwest::Client::new(),
             Config {
+                provider_metrics_targets: Vec::new(),
                 bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
                 upstream_base_url: url::Url::parse("http://127.0.0.1:8000/v1/").expect("url"),
                 upstream_api_key: None,
@@ -327,6 +332,8 @@ mod tests {
                 image_cache_ttl_secs: 300,
                 unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
                 price_table: std::collections::HashMap::new(),
+                auth: Default::default(),
+                mesh: MeshConfig::default(),
             },
         );
 

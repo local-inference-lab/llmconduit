@@ -5,7 +5,7 @@ import { dashboardStore, type LiveBaseline } from './dashboardStore';
 import type { MetricsResponse } from '../api/types';
 
 function metrics(seq: number, reqs: number): MetricsResponse {
-  const w = { reqs_per_sec: reqs, active_streams: 1, error_pct: 0, p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.1, samples: 5, usage_samples: 5, priced_samples: 5, cost_confidence: 'estimated' as const };
+  const w = { reqs_per_sec: reqs, active_streams: 1, error_pct: 0, p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, prefill_tokens_per_sec: 1000, decode_tokens_per_sec: 50, cost_per_min: 0.1, samples: 5, usage_samples: 5, prefill_samples: 5, decode_samples: 5, priced_samples: 5, cost_confidence: 'estimated' as const };
   return { metrics_seq: seq, ...w, windows: { m1: { ...w }, m5: { ...w }, h1: { ...w } } };
 }
 

@@ -198,6 +198,10 @@ pub struct ChunkUsage {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default)]
+    pub cost_details: Option<Value>,
+    #[serde(default)]
     pub reasoning_tokens: Option<i64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
@@ -412,6 +416,35 @@ mod tests {
             Some(
                 "{\"file_path\":\"/home/luke/.claude/projects/-home-luke-projects-demo/memory/smb_clone.md\"}"
             )
+        );
+    }
+
+    #[test]
+    fn deserializes_openrouter_usage_cost_fields() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "gen-1",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "total_tokens": 15,
+                "cost": 0.0042,
+                "cost_details": {
+                    "upstream_inference_cost": 0.0031
+                }
+            }
+        }))
+        .expect("chunk should deserialize");
+
+        let usage = chunk.usage.expect("usage");
+        assert_eq!(usage.cost, Some(0.0042));
+        assert_eq!(
+            usage
+                .cost_details
+                .as_ref()
+                .and_then(|details| details.get("upstream_inference_cost"))
+                .and_then(Value::as_f64),
+            Some(0.0031)
         );
     }
 
