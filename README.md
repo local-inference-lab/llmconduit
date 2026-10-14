@@ -7,6 +7,10 @@ requests, normalizes them, and forwards them to an upstream
 `/v1/chat/completions` server. It can also run server-side tools such as Brave
 Search.
 
+Chat Completions function tools are executed by the client, including a function
+named `web_search`. Hosted Brave Search uses the Responses `web_search` tool or
+Anthropic's typed web-search tool.
+
 ![Architecture: clients (Claude Code via Anthropic Messages, Codex/OpenAI via Responses, OpenAI chat clients) route through the HTTP router and adapters into the gateway engine, which applies per-profile shaping (roles, reasoning_effort, capabilities, parallel_tool_calls) and runs server-side tools, then forwards to OpenAI-compatible upstreams (vLLM, OpenRouter) via the upstream client with routing, failover, and cooldown; config.yaml supplies profiles and upstreams.](architecture.svg)
 
 ## Build
@@ -132,6 +136,10 @@ works and overrides the shorthand when both set the same key. When a profile
 `extends` multiple templates, the `extends` list is applied in declaration
 order: later entries override earlier ones, and the profile's own fields
 override all templates.
+
+`parallel_tool_calls` follows the same precedence for client tools, Brave Search,
+and image analysis. The gateway does not force it to `false` for server tools;
+it executes returned server-tool batches sequentially in model output order.
 
 ### Reserved `*` profile
 

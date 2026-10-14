@@ -509,23 +509,33 @@ async fn image_agent_not_leaked_in_anthropic_messages() {
 }
 
 #[tokio::test]
-async fn image_agent_keeps_parallel_tool_calls_false_upstream() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "no images visible"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    assert!(
-        requests[0].parallel_tool_calls == Some(false),
-        "parallel_tool_calls must stay false"
-    );
+async fn image_agent_preserves_parallel_tool_calls_upstream() {
+    for parallel_tool_calls in [None, Some(true), Some(false)] {
+        let upstream = MockUpstream::default();
+        upstream
+            .push_response(vec![Ok(content_chunk("chat-1", "no images visible"))])
+            .await;
+        let gateway = test_gateway_with_vision(
+            upstream.clone(),
+            MockVisionClient::default(),
+            image_agent_config(),
+        );
+        let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+        request.parallel_tool_calls = parallel_tool_calls;
+        let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+        assert!(event_names(&events).contains(&"response.completed"));
+        let requests = upstream.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].parallel_tool_calls, parallel_tool_calls);
+        assert!(
+            requests[0]
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.function.name == "analyzeImage")
+        );
+    }
 }
 
 // --- Gating ---

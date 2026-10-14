@@ -240,10 +240,8 @@ fn anthropic_max_tokens_maps_to_max_output_tokens() {
     assert_eq!(result.max_output_tokens, Some(256));
 }
 
-/// Hard rule: parallel_tool_calls is forced false regardless of caller input
-/// (AGENTS.md engine.rs:707-726). Anthropic conversion sets it false up front.
 #[test]
-fn anthropic_forces_parallel_tool_calls_false() {
+fn anthropic_omitted_parallel_tool_choice_leaves_upstream_default_unset() {
     let result = anthropic_to_responses::convert_request(anthropic(json!({
         "model": "claude-3",
         "max_tokens": 64,
@@ -472,6 +470,168 @@ fn chat_reasoning_effort_maps_to_reasoning() {
         result.reasoning.and_then(|r| r.effort).as_deref(),
         Some("high")
     );
+}
+
+#[test]
+fn chat_reasoning_only_turns_round_trip_in_order() {
+    use llmconduit::adapters::responses_to_chat::lower_request;
+
+    let request = chat(json!({
+        "model": "test",
+        "messages": [
+            {"role": "system", "content": "Return a chess action."},
+            {"role": "user", "content": "Board, legal moves, and history."},
+            {"role": "assistant", "content": null, "reasoning_content": "First analysis"},
+            {"role": "user", "content": "Continue and return the final action."},
+            {"role": "user", "content": "Remaining token budget: 10000"},
+            {"role": "assistant", "content": null, "reasoning_content": "Second analysis"},
+            {"role": "user", "content": "No final action content. Return JSON."},
+            {"role": "user", "content": "Remaining token budget: 9000"},
+            {"role": "assistant", "reasoning_content": "Third analysis"},
+            {"role": "user", "content": "Continue."},
+            {"role": "assistant", "content": "done", "reasoning_content": "Fourth analysis"},
+            {"role": "user", "content": "Invalid JSON. Return a corrected action."}
+        ]
+    }));
+    for end in 1..=request.messages.len() {
+        let mut prefix = request.clone();
+        prefix.messages.truncate(end);
+        let expected = prefix.messages.clone();
+        let canonical = chat_completions::convert_request(prefix).expect("convert");
+        let lowered = lower_request(&canonical, vec![]).expect("lower");
+        assert_eq!(lowered.messages, expected, "prefix length {end}");
+    }
+}
+
+#[test]
+fn chat_consecutive_reasoning_only_turns_keep_their_boundaries() {
+    use llmconduit::adapters::responses_to_chat::lower_request;
+
+    let request = chat(json!({
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "Think."},
+            {"role": "assistant", "content": null, "reasoning_content": "First turn"},
+            {"role": "assistant", "content": "", "reasoning_content": "Second turn"},
+            {"role": "assistant", "reasoning_content": "Third turn"},
+            {"role": "user", "content": "Continue."}
+        ]
+    }));
+    let expected = request.messages.clone();
+    let canonical = chat_completions::convert_request(request).expect("convert");
+    let lowered = lower_request(&canonical, vec![]).expect("lower");
+    assert_eq!(lowered.messages, expected);
+}
+
+#[test]
+fn chat_reasoning_only_turn_before_tool_calls_is_not_merged() {
+    use llmconduit::adapters::responses_to_chat::lower_request;
+
+    let request = chat(json!({
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "Inspect and reply."},
+            {"role": "assistant", "content": null, "reasoning_content": "Before tools"},
+            {"role": "assistant", "content": null, "reasoning_content": "Using tools", "tool_calls": [
+                {"id": "call_a", "index": 0, "type": "function", "function": {"name": "inspect", "arguments": {"query": "a"}}},
+                {"id": "call_b", "index": 1, "type": "function", "function": {"name": "inspect", "arguments": {"query": "b"}}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "assistant", "content": "Answer", "reasoning_content": "After tools"},
+            {"role": "user", "content": "Continue."}
+        ]
+    }));
+    let expected = request.messages.clone();
+    let canonical = chat_completions::convert_request(request).expect("convert");
+    let lowered = lower_request(&canonical, vec![]).expect("lower");
+    assert_eq!(lowered.messages, expected);
+}
+
+#[test]
+fn chat_assistant_text_reasoning_and_calls_round_trip_in_one_message() {
+    use llmconduit::adapters::responses_to_chat::lower_request;
+
+    for content in [serde_json::Value::Null, json!(""), json!("Looking it up.")] {
+        let request = chat(json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "Inspect and reply."},
+                {"role": "assistant", "content": "Earlier assistant turn."},
+                {"role": "assistant", "content": content, "reasoning_content": "Need both results.", "tool_calls": [
+                    {"id": "call_a", "index": 0, "type": "function", "function": {"name": "inspect", "arguments": {"query": "a"}}},
+                    {"id": "call_b", "index": 1, "type": "function", "function": {"name": "inspect", "arguments": {"query": "b"}}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+                {"role": "assistant", "content": "Answer", "reasoning_content": "Both results agree."},
+                {"role": "user", "content": "Continue."}
+            ]
+        }));
+        for end in 1..=request.messages.len() {
+            let mut prefix = request.clone();
+            prefix.messages.truncate(end);
+            let expected = prefix.messages.clone();
+            let canonical = chat_completions::convert_request(prefix).unwrap();
+            let lowered = lower_request(&canonical, vec![]).unwrap();
+            assert_eq!(lowered.messages, expected, "prefix length {end}");
+        }
+    }
+}
+
+#[test]
+fn responses_reasoning_flushes_before_non_assistant_messages_and_tool_outputs() {
+    use llmconduit::adapters::responses_to_chat::lower_request_with_image_agent_and_roles;
+    use llmconduit::config::RolesConfig;
+    use llmconduit::models::responses::ResponsesRequest;
+
+    for boundary in [
+        json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue."}]}),
+        json!({"type": "message", "role": "system", "content": [{"type": "input_text", "text": "An inline instruction."}]}),
+        json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "An inline instruction."}]}),
+        json!({"type": "function_call_output", "call_id": "call_a", "output": "Result"}),
+        json!({"type": "custom_tool_call_output", "call_id": "call_a", "output": "Result"}),
+        json!({"type": "tool_search_output", "call_id": "call_a", "status": "completed", "execution": "client", "tools": []}),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Start."}]},
+                {"type": "reasoning", "id": "r1", "summary": [], "content": [{"type": "reasoning_text", "text": "First reasoning"}], "encrypted_content": "signature_a"},
+                boundary,
+                {"type": "reasoning", "id": "r2", "summary": [], "content": [{"type": "reasoning_text", "text": "Second reasoning"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Answer"}]}
+            ]
+        })).expect("Responses request");
+        let accepting_roles: RolesConfig = serde_json::from_value(json!({"*": {}})).unwrap();
+        for roles in [None, Some(accepting_roles)] {
+            let lowered =
+                lower_request_with_image_agent_and_roles(&request, vec![], false, roles.as_ref())
+                    .expect("lower");
+            assert_eq!(lowered.messages.len(), 4, "boundary {boundary}");
+            assert_eq!(lowered.messages[1].role, "assistant");
+            assert_eq!(lowered.messages[1].content, None);
+            assert_eq!(
+                lowered.messages[1].reasoning_content.as_deref(),
+                Some("First reasoning")
+            );
+            assert_eq!(
+                lowered.messages[1]
+                    .thinking
+                    .as_ref()
+                    .unwrap()
+                    .signature
+                    .as_deref(),
+                Some("signature_a")
+            );
+            assert_eq!(
+                lowered.messages[3].reasoning_content.as_deref(),
+                Some("Second reasoning")
+            );
+            assert_eq!(lowered.messages[3].content, Some(json!("Answer")));
+            assert_eq!(lowered.messages[3].thinking, None);
+        }
+    }
 }
 
 #[test]

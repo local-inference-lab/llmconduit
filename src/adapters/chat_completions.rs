@@ -98,14 +98,13 @@ fn convert_message(message: &ChatMessage, items: &mut Vec<ResponseItem>) -> AppR
                 });
             }
             let content = chat_content_to_response_content(&message.role, message.content.as_ref());
-            if !content.is_empty() {
-                items.push(ResponseItem::Message {
-                    id: None,
-                    role: message.role.clone(),
-                    content,
-                    phase: None,
-                });
-            }
+            // Empty content still marks an assistant turn boundary for reasoning and tools.
+            items.push(ResponseItem::Message {
+                id: None,
+                role: message.role.clone(),
+                content,
+                phase: None,
+            });
             if let Some(tool_calls) = &message.tool_calls {
                 for tool_call in tool_calls {
                     items.push(chat_tool_call_to_response_item(tool_call)?);
@@ -294,15 +293,6 @@ fn convert_tools(tools: &Option<Vec<ChatTool>>) -> Vec<ToolSpec> {
 }
 
 fn convert_tool(tool: &ChatTool) -> ToolSpec {
-    if tool.kind == "function" && tool.function.name == "web_search" {
-        return ToolSpec::WebSearch {
-            external_web_access: Some(true),
-            filters: None,
-            user_location: None,
-            search_context_size: None,
-            search_content_types: None,
-        };
-    }
     ToolSpec::Function {
         name: tool.function.name.clone(),
         description: tool.function.description.clone(),

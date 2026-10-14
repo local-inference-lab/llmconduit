@@ -1332,6 +1332,46 @@ async fn request_values_override_configured_upstream_defaults_and_merge_chat_tem
 }
 
 #[tokio::test]
+async fn web_search_preserves_parallel_tool_calls_across_rounds() {
+    for parallel_tool_calls in [None, Some(true), Some(false)] {
+        let upstream = MockUpstream::default();
+        upstream
+            .push_response(vec![Ok(tool_call_chunk(
+                "chat-1",
+                "call_search",
+                "web_search",
+                "{\"query\":\"weather seattle\"}",
+            ))])
+            .await;
+        upstream
+            .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
+            .await;
+        let search = MockSearch::default();
+        let gateway = test_gateway(upstream.clone(), search.clone());
+        let mut request = base_request(vec![user_message("weather?")]);
+        request.parallel_tool_calls = parallel_tool_calls;
+        request.tools = vec![ToolSpec::WebSearch {
+            external_web_access: Some(true),
+            filters: None,
+            user_location: None,
+            search_context_size: None,
+            search_content_types: None,
+        }];
+        let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+        assert!(event_names(&events).contains(&"response.completed"));
+        assert_eq!(search.queries.lock().await.as_slice(), &["weather seattle"]);
+        let requests = upstream.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.parallel_tool_calls == parallel_tool_calls)
+        );
+        assert_eq!(requests[1].messages.last().unwrap().role, "tool");
+    }
+}
+
+#[tokio::test]
 async fn hides_web_search_loop_but_replays_internal_tool_result() {
     let upstream = MockUpstream::default();
     upstream
@@ -4593,7 +4633,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
     assert_eq!(requests.len(), 1);
     let messages = &requests[0].messages;
 
-    // M4: assistant with content does NOT merge with tool call — separate messages
+    assert_eq!(messages.iter().filter(|m| m.role == "assistant").count(), 1);
     let content_msg = messages
         .iter()
         .find(|m| m.role == "assistant" && m.content.is_some())
@@ -4604,15 +4644,11 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
             "I'll search the codebase.".to_string()
         ))
     );
-    assert!(content_msg.reasoning_content.is_some());
-    assert!(content_msg.tool_calls.is_none());
-
-    let tool_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
-        .expect("assistant message with tool_calls");
-    assert!(tool_msg.content.is_none());
-    assert_eq!(tool_msg.tool_calls.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        content_msg.reasoning_content.as_deref(),
+        Some("Let me look at the files.")
+    );
+    assert_eq!(content_msg.tool_calls.as_ref().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -8437,6 +8473,54 @@ async fn chat_completions_returns_non_streaming_json() {
 }
 
 #[tokio::test]
+async fn chat_completions_preserves_reasoning_history_across_continuations_and_repairs() {
+    for stream in [false, true] {
+        let upstream = MockUpstream::default();
+        upstream
+            .push_response(vec![Ok(content_chunk("chat-history", "answer"))])
+            .await;
+        let gateway = test_gateway(upstream.clone(), MockSearch::default());
+        let app = llmconduit::build_app_from_gateway(gateway);
+        let body = json!({
+            "model": "test",
+            "stream": stream,
+            "messages": [
+                {"role": "system", "content": "Return one action."},
+                {"role": "user", "content": "Board, legal actions, and history."},
+                {"role": "assistant", "content": null, "reasoning_content": "First analysis"},
+                {"role": "user", "content": "Continue your existing turn."},
+                {"role": "user", "content": "Remaining token budget: 10000"},
+                {"role": "assistant", "content": null, "reasoning_content": "Second analysis"},
+                {"role": "user", "content": "No final action content. Return JSON."},
+                {"role": "user", "content": "Remaining token budget: 9000"},
+                {"role": "assistant", "content": "done", "reasoning_content": "Third analysis"},
+                {"role": "user", "content": "Invalid JSON. Return a corrected action."}
+            ]
+        });
+        let expected: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let output = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(!output.is_empty());
+        let requests = upstream.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages, expected.messages, "stream={stream}");
+    }
+}
+
+#[tokio::test]
 async fn chat_completions_preserves_multimodal_content_parts() {
     let upstream = MockUpstream::default();
     upstream
@@ -8605,93 +8689,114 @@ async fn chat_completions_streams_openai_sse() {
 }
 
 #[tokio::test]
-async fn chat_completions_web_search_is_server_side_and_hidden() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_ws_1",
-            "web_search",
-            "{\"query\":\"weather seattle\"}",
-        ))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
-        .await;
-    let search = MockSearch::default();
-    let gateway = test_gateway(upstream.clone(), search.clone());
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "stream": false,
-        "messages": [
-            { "role": "user", "content": "Weather in Seattle?" }
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the web.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "query": { "type": "string" } },
-                        "required": ["query"]
-                    }
-                }
+async fn chat_completions_web_search_remains_a_client_function() {
+    for brave_enabled in [false, true] {
+        for streaming in [false, true] {
+            let upstream = MockUpstream::default();
+            let arguments = r#"{"query":"weather seattle","max_results":3}"#;
+            upstream
+                .push_response(vec![Ok(tool_call_chunk(
+                    "chat-1",
+                    "call_ws_1",
+                    "web_search",
+                    arguments,
+                ))])
+                .await;
+            let search = MockSearch::default();
+            let mut config = test_config();
+            if !brave_enabled {
+                config.brave_api_key = None;
             }
-        ]
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("read body");
-    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
-    let json: serde_json::Value = serde_json::from_str(&body_text).expect("valid json");
-    assert_eq!(json["choices"][0]["message"]["content"], "It is rainy.");
-    assert!(json["choices"][0]["message"]["tool_calls"].is_null());
-    assert!(
-        !body_text.contains("web_search"),
-        "internal web_search call leaked into Chat response: {body_text}"
-    );
-
-    assert_eq!(
-        search.queries.lock().await.as_slice(),
-        &["weather seattle".to_string()]
-    );
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[0]
-            .tools
-            .as_ref()
-            .and_then(|tools| tools.first())
-            .map(|tool| tool.function.name.as_str()),
-        Some("web_search")
-    );
-    assert_eq!(
-        requests[1]
-            .messages
-            .iter()
-            .find(|message| message.role == "tool")
-            .and_then(|message| message.content.as_ref())
-            .and_then(|content| content.as_str()),
-        Some("Search result for weather seattle")
-    );
+            let gateway = test_gateway_with_config(upstream.clone(), search.clone(), config);
+            let app = llmconduit::build_app_from_gateway(gateway);
+            let function = json!({
+                "name": "web_search",
+                "description": "Search the client's index.",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "max_results": { "type": "integer" }
+                    },
+                    "required": ["query", "max_results"],
+                    "additionalProperties": false
+                }
+            });
+            let body = json!({
+                "model": "glm-5.1",
+                "stream": streaming,
+                "messages": [{ "role": "user", "content": "Weather in Seattle?" }],
+                "tools": [{ "type": "function", "function": function }],
+                "tool_choice": "required",
+                "parallel_tool_calls": false
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            if streaming {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let events = parse_chat_sse_events(&text);
+                let calls: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+                    .flatten()
+                    .collect();
+                assert!(calls.iter().any(|call| call["id"] == "call_ws_1"));
+                assert!(
+                    calls
+                        .iter()
+                        .any(|call| call["function"]["name"] == "web_search")
+                );
+                let emitted_arguments: String = calls
+                    .iter()
+                    .filter_map(|call| call["function"]["arguments"].as_str())
+                    .collect();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&emitted_arguments).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| { event["choices"][0]["finish_reason"] == "tool_calls" })
+                );
+            } else {
+                let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                let call = &response["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["id"], "call_ws_1");
+                assert_eq!(call["function"]["name"], "web_search");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        call["function"]["arguments"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+                );
+            }
+            assert!(search.queries.lock().await.is_empty());
+            let requests = upstream.requests().await;
+            assert_eq!(requests.len(), 1);
+            let tools = requests[0].tools.as_ref().unwrap();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(serde_json::to_value(&tools[0].function).unwrap(), function);
+            assert_eq!(requests[0].tool_choice, Some(json!("required")));
+            assert_eq!(requests[0].parallel_tool_calls, Some(false));
+        }
+    }
 }
 
 #[tokio::test]

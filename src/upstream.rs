@@ -160,15 +160,11 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
     if message.starts_with("upstream chat failed with ") {
         return AttemptErrorClass::HttpStatus;
     }
-    // First-chunk read/parse failure: `stream_success_response` builds these two FIXED
-    // gateway prefixes — `"failed to parse upstream chat chunk: {err}; payload={body}"`
-    // and `"failed to read upstream SSE: {err}"`. The interpolated tail (`{err}` =
-    // serde/transport error, plus a redacted `{body}`) is strictly AFTER the prefix, so a
-    // `starts_with` on the fixed prefix is immune to payload/body content (it never
-    // reintroduces the F2 substring scan). These belong to the `Stream` taxonomy: the
-    // response began but the first chunk could not be read/parsed.
+    // Match gateway-owned prefixes before any upstream text so error envelopes,
+    // malformed chunks, and transport failures share the stream classification.
     if message.starts_with("failed to parse upstream chat chunk:")
         || message.starts_with("failed to read upstream SSE:")
+        || message.starts_with("upstream chat stream error:")
     {
         return AttemptErrorClass::Stream;
     }
@@ -4522,12 +4518,7 @@ async fn stream_success_response(
     let stream = bounded.eventsource().filter_map(|result| async move {
         match result {
             Ok(event) if event.data == "[DONE]" => None,
-            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                AppError::upstream(format!(
-                    "failed to parse upstream chat chunk: {err}; payload={}",
-                    redact_and_truncate_error_body(&event.data, 500)
-                ))
-            })),
+            Ok(event) => Some(parse_chat_sse_data(&event.data)),
             // The bounded adapter surfaces the frame-cap rejection through the
             // transport-error channel as an already-formed `AppError` (its
             // `Display` carries the cap message); other transport errors are
@@ -4653,6 +4644,33 @@ impl Drop for UpstreamTapGuard {
         // with the barrier's own close) so the writer drains + finalize resolves.
         self.capture.upstream_response_done(!self.clean);
     }
+}
+
+fn parse_chat_sse_data(data: &str) -> AppResult<ChatCompletionChunk> {
+    parse_chat_completion_chunk(data).map_err(|err| {
+        if let Ok(mut value) = serde_json::from_str::<Value>(data)
+            && let Some(error) = value.get("error").filter(|error| !error.is_null())
+        {
+            let disposition =
+                if error.get("type").and_then(Value::as_str) == Some("invalid_request_error") {
+                    FailoverDisposition::FailoverNoCooldown
+                } else {
+                    FailoverDisposition::Failover
+                };
+            crate::redaction::redact_payload_secrets_in_value(&mut value);
+            return AppError::upstream_with_disposition(
+                format!(
+                    "upstream chat stream error: {}",
+                    redact_and_truncate_error_body(&value.to_string(), 500)
+                ),
+                disposition,
+            );
+        }
+        AppError::upstream(format!(
+            "failed to parse upstream chat chunk: {err}; payload={}",
+            redact_and_truncate_error_body(data, 500)
+        ))
+    })
 }
 
 fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
@@ -5744,6 +5762,77 @@ mod tests {
             value["choices"][0]["delta"]["tool_calls"][0]["type"],
             Value::String("function".to_string())
         );
+    }
+
+    #[test]
+    fn chat_sse_errors_preserve_upstream_detail_and_classification() {
+        for (kind, disposition) in [
+            ("server_error", FailoverDisposition::Failover),
+            (
+                "invalid_request_error",
+                FailoverDisposition::FailoverNoCooldown,
+            ),
+        ] {
+            let error = super::parse_chat_sse_data(
+                &json!({
+                    "error": {
+                        "type": kind,
+                        "message": "required tool choice was not satisfied",
+                        "api_key": "private-test-key"
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+            assert!(error.message.starts_with("upstream chat stream error:"));
+            assert!(
+                error
+                    .message
+                    .contains("required tool choice was not satisfied")
+            );
+            assert!(!error.message.contains("missing field"));
+            assert!(!error.message.contains("private-test-key"));
+            assert_eq!(error.failover_disposition(), disposition);
+            assert_eq!(
+                super::classify_attempt_error(&error),
+                crate::dashboard_flow::AttemptErrorClass::Stream
+            );
+        }
+        let error = super::parse_chat_sse_data(r#"{"unexpected":true}"#).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("failed to parse upstream chat chunk:")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sse_error_frames_surface_before_or_after_content() {
+        for prefix in [
+            "",
+            "data: {\"id\":\"chat-1\",\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(wm_method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("{prefix}data: {{\"error\":{{\"type\":\"server_error\",\"message\":\"tool generation failed\"}}}}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                ))
+                .mount(&server)
+                .await;
+            let response = reqwest::get(server.uri()).await.unwrap();
+            let mut stream = super::stream_success_response(response, 4096, None)
+                .await
+                .unwrap();
+            if !prefix.is_empty() {
+                let chunk = stream.next().await.unwrap().unwrap();
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hello"));
+            }
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(error.message.starts_with("upstream chat stream error:"));
+            assert!(error.message.contains("tool generation failed"));
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[test]

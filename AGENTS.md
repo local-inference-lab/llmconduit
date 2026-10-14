@@ -100,13 +100,13 @@ Adapter direction map:
 
 These are intentional and load-bearing. Do not change without strong reason + matching test.
 
-- **`parallel_tool_calls: false` for gateway-owned server tools.** Ordinary client tools honor the typed request/profile default, but Brave Search and image-analysis loops force sequential calls. Multi-tool server turns interleave badly with replay and internal tool/result loops.
+- **Preserve `parallel_tool_calls` for every tool type.** Explicit client values win over configured upstream defaults, including Brave Search and image-analysis turns. The gateway executes returned server-tool batches sequentially without forcing an upstream call-count limit.
 - **`WEB_SEARCH_ROUNDS_HARD_CEILING = 25`** in `engine.rs:1032`, enforced regardless of config. Defense against infinite tool loops.
 - **`OPENAI_MAX_STOP_SEQUENCES = 4`** in `chat.rs:81`. Returns 400 — do not silently truncate.
 - **`API_LOG_BODY_LIMIT_BYTES` / `API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`** in `http.rs:51-52`. Don't bypass.
 - **Failover only pre-first-chunk** (`upstream.rs:407-419`). Mid-stream provider failure surfaces as error — never retry, never duplicate tokens.
 - **Routing providers are not failure fallbacks.** With explicit `upstreams`, only the selected upstream's nested `fallback_upstreams` are failover candidates. Never fail over to the next routing upstream just because the selected provider failed.
-- **`web_search` tool stripped from request when `brave_api_key` is unset.** Engine also relaxes `tool_choice` to `"auto"` when the only tool was stripped (`engine.rs:1536-1558`).
+- **Hosted `web_search` tools are stripped when `brave_api_key` is unset.** Engine also relaxes `tool_choice` to `"auto"` when the only tool was stripped. Client function tools named `web_search` retain their schemas and are returned to the client regardless of Brave configuration.
 - **Provider-side `web_search` is single-purpose.** Runtime execution supports search/query actions only; `open_page`, `find_in_page`, and unknown actions are rejected. Failed/timed-out Brave calls are injected as model-visible text so the turn can complete.
 - **Mixed provider-side and client-side tool calls are rejected.** A turn cannot hand off client tools and run Brave search in the same upstream tool-call batch (`engine.rs:1290-1357`).
 - **`response.web_search_results`** is a non-standard additive SSE event consumed only by the Anthropic converter. OpenAI clients ignore unknown events, so this stays compatible. See `engine.rs:1480-1485`.

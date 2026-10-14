@@ -2228,17 +2228,6 @@ impl Gateway {
         let capture = api_call_id
             .as_deref()
             .and_then(|id| self.turn_capture().state(id));
-        // Gateway-owned server tools run a sequential request/tool/result loop.
-        // Preserve the upstream typed/client setting for ordinary client tools,
-        // but never allow parallel calls to interleave the internal loop.
-        let parallel_tool_calls = if tool_registry.has_active_server_tool(
-            self.config.brave_api_key.is_some(),
-            vision_session.is_some(),
-        ) {
-            Some(false)
-        } else {
-            request.parallel_tool_calls
-        };
         // The profile role policy for this resolved model — the SAME config the
         // initial lowering used (`resolve_roles_config_for_resolved_model`,
         // pre-spawn). Drives the pre-send adjacency merge + repair-note shaping
@@ -2277,7 +2266,7 @@ impl Gateway {
                 current_tool_choice.clone(),
                 UpstreamRequestAdditives {
                     model: upstream_model.clone(),
-                    parallel_tool_calls,
+                    parallel_tool_calls: request.parallel_tool_calls,
                     reasoning_effort: reasoning_effort.clone(),
                     max_output_tokens: request.max_output_tokens,
                     temperature: request.temperature,
@@ -3312,7 +3301,7 @@ impl Gateway {
     /// Generic server-tool dispatcher. Classifies EVERY tool call as
     /// server-runnable or client-handed-off, rejects a mixed batch up front,
     /// then either hands all calls to the client or runs all server tools
-    /// SEQUENTIALLY (`parallel_tool_calls: false` stays forced upstream).
+    /// sequentially in the order returned by the model.
     ///
     /// A call is server-runnable when it is `web_search` and Brave is configured,
     /// OR `analyzeImage` (`ToolKind::ImageAnalysis`) and the image agent is

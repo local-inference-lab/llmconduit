@@ -47,18 +47,6 @@ impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&ToolKind> {
         self.by_name.get(name)
     }
-
-    pub(crate) fn has_active_server_tool(
-        &self,
-        web_search_active: bool,
-        image_agent_active: bool,
-    ) -> bool {
-        self.by_name.values().any(|kind| match kind {
-            ToolKind::WebSearch => web_search_active,
-            ToolKind::ImageAnalysis => image_agent_active,
-            _ => false,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -159,9 +147,23 @@ pub fn lower_request_with_image_agent_and_roles(
     let registry = build_tool_registry(&request.tools, image_agent_active)?;
     let mut pending_reasoning: Option<PendingReasoning> = None;
     for item in &request.input {
+        let ends_assistant_turn = match item {
+            ResponseItem::Message { role, .. } => role != "assistant",
+            ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. } => true,
+            _ => false,
+        };
+        if ends_assistant_turn {
+            flush_pending_reasoning(&mut messages, &mut pending_reasoning);
+        }
         match item {
             ResponseItem::Message { role, content, .. } => {
-                let text = message_content_to_chat_value(content)?;
+                let text = if role == "assistant" && content.is_empty() {
+                    None
+                } else {
+                    Some(message_content_to_chat_value(content)?)
+                };
                 let normalized_role = if roles.is_some() {
                     role.to_string()
                 } else {
@@ -177,7 +179,7 @@ pub fn lower_request_with_image_agent_and_roles(
                 };
                 messages.push(ChatMessage {
                     role: normalized_role,
-                    content: Some(text),
+                    content: text,
                     tool_call_id: None,
                     name: None,
                     reasoning_content,
@@ -333,18 +335,7 @@ pub fn lower_request_with_image_agent_and_roles(
             ResponseItem::ImageGenerationCall { .. } => {}
         }
     }
-    if let Some(reasoning) = pending_reasoning.take() {
-        let (reasoning_content, thinking) = reasoning.into_chat_parts();
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: None,
-            tool_call_id: None,
-            name: None,
-            reasoning_content,
-            thinking,
-            tool_calls: None,
-        });
-    }
+    flush_pending_reasoning(&mut messages, &mut pending_reasoning);
     if roles.is_some() {
         let mut new_messages = messages.split_off(baseline_len);
         apply_role_rules(&mut new_messages, roles)?;
@@ -886,6 +877,24 @@ fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResul
     Ok(ToolRegistry { by_name })
 }
 
+fn flush_pending_reasoning(
+    messages: &mut Vec<ChatMessage>,
+    pending_reasoning: &mut Option<PendingReasoning>,
+) {
+    if let Some(reasoning) = pending_reasoning.take() {
+        let (reasoning_content, thinking) = reasoning.into_chat_parts();
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content,
+            thinking,
+            tool_calls: None,
+        });
+    }
+}
+
 fn append_tool_call(
     messages: &mut Vec<ChatMessage>,
     call_id: String,
@@ -895,7 +904,7 @@ fn append_tool_call(
 ) {
     if let Some(last) = messages.last_mut()
         && last.role == "assistant"
-        && (last.tool_calls.is_some() || last.content.is_none())
+        && pending_reasoning.is_none()
     {
         let index = last.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
         let tool_call = ChatToolCall {
@@ -911,13 +920,6 @@ fn append_tool_call(
             existing.push(tool_call);
         } else {
             last.tool_calls = Some(vec![tool_call]);
-        }
-        if let Some(reasoning) = pending_reasoning
-            && last.reasoning_content.is_none()
-        {
-            let (reasoning_content, thinking) = reasoning.into_chat_parts();
-            last.reasoning_content = reasoning_content;
-            last.thinking = thinking;
         }
         return;
     }
@@ -1910,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_tool_call_no_merge_into_content_message() {
+    fn test_append_tool_call_preserves_content_in_same_message() {
         let mut messages = vec![ChatMessage {
             role: "assistant".to_string(),
             content: Some(Value::String("some text".to_string())),
@@ -1927,14 +1929,35 @@ mod tests {
             json!({}),
             None,
         );
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].content,
             Some(Value::String("some text".to_string()))
         );
-        assert!(messages[0].tool_calls.is_none());
-        assert!(messages[1].tool_calls.is_some());
-        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
+        assert_eq!(messages[0].tool_calls.as_ref().unwrap()[0].index, Some(0));
+    }
+
+    #[test]
+    fn tool_calls_with_intervening_reasoning_keep_both_reasoning_blocks() {
+        let mut messages = Vec::new();
+        for text in ["First analysis", "Second analysis"] {
+            append_tool_call(
+                &mut messages,
+                text.to_string(),
+                "inspect".to_string(),
+                json!({}),
+                Some(PendingReasoning::from_parts(text.to_string(), None)),
+            );
+        }
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("First analysis")
+        );
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("Second analysis")
+        );
     }
 
     // --- M2 test ---
