@@ -456,6 +456,13 @@ pub fn image_agent_config() -> Config {
             .expect("url"),
     );
     config.vision_model = Some("vision-model".to_string());
+    config.model_profiles = BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(false),
+            ..Default::default()
+        },
+    )]);
     config
 }
 
@@ -494,6 +501,7 @@ pub fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: BTreeMap::new(),
         model_routes: Vec::new(),

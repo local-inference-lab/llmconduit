@@ -65,6 +65,22 @@ use wiremock::matchers::path;
 // `tests/common`; only the assertions are below.
 // ===========================================================================
 
+fn mark_text_only(config: &mut llmconduit::config::Config, models: &[&str]) {
+    for model in models {
+        config
+            .model_profiles
+            .entry((*model).to_string())
+            .or_default()
+            .native_vision = Some(false);
+    }
+}
+
+fn text_only_config() -> llmconduit::config::Config {
+    let mut config = test_config();
+    mark_text_only(&mut config, &["glm-5.1"]);
+    config
+}
+
 #[tokio::test]
 async fn image_agent_runs_analyze_image_then_answers() {
     // Round 1: model calls analyzeImage. Round 2: model answers with the
@@ -509,6 +525,65 @@ async fn image_agent_not_leaked_in_anthropic_messages() {
 }
 
 #[tokio::test]
+async fn anthropic_images_pass_through_to_deepseek_v4_1() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["DeepSeek-V4.1-Flash"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "I see the image."))])
+        .await;
+    let gateway = test_gateway_with_vision(
+        upstream.clone(),
+        MockVisionClient::default(),
+        image_agent_config(),
+    );
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "DeepSeek-V4.1-Flash",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA=" } }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        serialized.contains("iVBORw0KGgo"),
+        "native-vision DeepSeek V4.1 must receive the Anthropic image"
+    );
+    let has_analyze = requests[0]
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
+    assert!(
+        !has_analyze,
+        "native-vision backend must not get analyzeImage"
+    );
+}
+
+#[tokio::test]
 async fn image_agent_preserves_parallel_tool_calls_upstream() {
     for parallel_tool_calls in [None, Some(true), Some(false)] {
         let upstream = MockUpstream::default();
@@ -602,11 +677,11 @@ async fn image_agent_skips_when_no_image_in_latest_turn() {
 }
 
 #[tokio::test]
-async fn image_agent_skips_for_native_vision_kimi() {
-    // The resolved model is Kimi (native-vision), so the agent must not strip;
-    // the raw image flows to the multimodal backend.
+async fn image_agent_passes_through_for_unconfigured_model() {
+    // Model ids carry no implicit capability semantics. Without an explicit
+    // text-only profile, the raw image passes through.
     let upstream = MockUpstream::default();
-    upstream.set_supported_models(["Kimi-K2.6"]).await;
+    upstream.set_supported_models(["opaque-model-id"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "I see a square."))])
         .await;
@@ -616,13 +691,13 @@ async fn image_agent_skips_for_native_vision_kimi() {
         image_agent_config(),
     );
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "Kimi-K2.6".to_string();
+    request.model = "opaque-model-id".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
         serialized.contains("iVBORw0KGgo"),
-        "native-vision Kimi must receive the raw image"
+        "an unconfigured model must receive the raw image"
     );
     let has_analyze = requests[0]
         .tools
@@ -636,18 +711,16 @@ async fn image_agent_skips_for_native_vision_kimi() {
 
 #[tokio::test]
 async fn image_agent_used_for_text_backend_with_images() {
-    // A non-Kimi text backend WITH images activates the agent (contrast to the
-    // Kimi skip test): analyzeImage is injected and bytes are stripped.
+    // An explicitly text-only backend with images activates the agent:
+    // analyzeImage is injected and bytes are stripped.
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["deepseek-v3"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
         .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
+    let mut config = image_agent_config();
+    mark_text_only(&mut config, &["deepseek-v3"]);
+    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "deepseek-v3".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -1131,6 +1204,7 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
     let base = format!("{}/v1", server.uri());
     let mut config = image_agent_config();
     config.upstreams = vec![UpstreamConfig {
+        load_balance_group: None,
         name: "primary".to_string(),
         upstream_base_url: base.parse().expect("url"),
         upstream_api_key: None,
@@ -1190,9 +1264,8 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
 
 #[tokio::test]
 async fn image_agent_passes_through_when_all_failover_candidates_native() {
-    // Round-2 #1 (safe invariant): EVERY candidate backend model is native-
-    // vision (both Kimi variants), so images pass through unstripped and no
-    // analyzeImage tool is injected.
+    // No candidate has an explicit text-only override, so images pass through
+    // unstripped and no analyzeImage tool is injected.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["Kimi-K2.6", "kimi-vl-a3b"]);
     upstream
@@ -1203,7 +1276,8 @@ async fn image_agent_passes_through_when_all_failover_candidates_native() {
         MockVisionClient::default(),
         image_agent_config(),
     );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
@@ -1223,20 +1297,18 @@ async fn image_agent_passes_through_when_all_failover_candidates_native() {
 
 #[tokio::test]
 async fn image_agent_strips_when_any_failover_candidate_is_non_native() {
-    // Round-2 #1: the primary is native (Kimi) but a fallback is a text-only
-    // model. The SAFE invariant must strip+offload (works for every backend),
-    // since the request could be served by the non-native fallback.
+    // An explicitly text-only fallback forces strip+offload because it may
+    // serve the request before the first response chunk.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["Kimi-K2.6", "deepseek-v3"]);
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "cannot see images"))])
         .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let mut config = image_agent_config();
+    mark_text_only(&mut config, &["deepseek-v3"]);
+    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
@@ -1429,9 +1501,9 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
 }
 
 #[tokio::test]
-async fn image_agent_strips_when_candidate_set_is_empty() {
-    // Round-3 #1: an EMPTY candidate set (unknown routing/catalog state) must
-    // NOT pass raw images through, even if the request model looks native.
+async fn image_agent_passes_through_when_candidate_set_is_empty() {
+    // An unavailable routing catalog provides no negative capability signal,
+    // so the gateway leaves images intact.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(Vec::<String>::new());
     upstream
@@ -1442,21 +1514,23 @@ async fn image_agent_strips_when_candidate_set_is_empty() {
         MockVisionClient::default(),
         image_agent_config(),
     );
-    // Even a Kimi-looking request model must strip when candidates are unknown.
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "empty candidate set must force strip+offload"
+        serialized.contains("iVBORw0KGgo"),
+        "empty candidate set must pass images through"
     );
     let has_analyze = requests[0]
         .tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(has_analyze, "empty candidate set must inject analyzeImage");
+    assert!(
+        !has_analyze,
+        "empty candidate set must not inject analyzeImage"
+    );
 }
 
 #[tokio::test]
@@ -1482,6 +1556,7 @@ async fn image_agent_request_native_vision_override_does_not_leak_onto_fallback(
             ..Default::default()
         },
     )]);
+    mark_text_only(&mut config, &["deepseek-v3"]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "my-vision-alias".to_string();
@@ -1548,13 +1623,9 @@ async fn image_agent_redacts_data_url_in_successful_vision_text() {
 }
 
 #[tokio::test]
-async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
-    // Round-4 #1: gating must enumerate candidates from the RESOLVED model the
-    // upstream actually receives, not the raw request model. A Kimi-LOOKING
-    // request alias whose profile `upstream_model` remaps to a TEXT backend must
-    // STRIP (the old code judged "kimi-alias" by name and wrongly passed raw
-    // images to the text backend). MockUpstream's candidate_backend_models
-    // echoes the model it is given, so the resolved model drives the decision.
+async fn image_agent_strips_when_alias_remaps_to_configured_text_backend() {
+    // Gating must inspect the resolved backend model rather than the request
+    // alias. The resolved backend explicitly opts into text-only handling.
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["deepseek-v3"]).await;
     upstream
@@ -1572,6 +1643,7 @@ async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
             ..Default::default()
         },
     )]);
+    mark_text_only(&mut config, &["deepseek-v3"]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "kimi-fast".to_string();
@@ -1582,7 +1654,7 @@ async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
         !serialized.contains("iVBORw0KGgo"),
-        "a kimi-alias remapped to a text backend must strip, not pass raw images"
+        "an alias remapped to a configured text backend must strip images"
     );
     let has_analyze = requests[0]
         .tools
@@ -1707,9 +1779,8 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
 
 #[tokio::test]
 async fn image_agent_request_native_vision_false_on_kimi_primary_strips() {
-    // Round-7 #1 (a): an explicit `native_vision:false` profile on the REQUEST
-    // model must force strip even when the primary candidate is Kimi-NAMED
-    // (which the name sniff would call native).
+    // An explicit `native_vision:false` profile on the request model forces
+    // stripping regardless of the backend model's name.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["Kimi-K2.6"]);
     upstream
@@ -1734,7 +1805,7 @@ async fn image_agent_request_native_vision_false_on_kimi_primary_strips() {
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
         !serialized.contains("iVBORw0KGgo"),
-        "native_vision:false on the request must strip even a Kimi-named primary"
+        "native_vision:false on the request must strip the primary"
     );
     let has_analyze = requests[0]
         .tools
@@ -1744,10 +1815,9 @@ async fn image_agent_request_native_vision_false_on_kimi_primary_strips() {
 }
 
 #[tokio::test]
-async fn image_agent_request_native_vision_true_on_text_named_primary_passes_through() {
-    // Round-7 #1 (b): an explicit `native_vision:true` on the REQUEST model must
-    // pass images through to a non-native-NAMED primary (when ALL candidates are
-    // native — here a single primary candidate).
+async fn image_agent_request_native_vision_true_on_primary_passes_through() {
+    // An explicit `native_vision:true` on the request model passes images
+    // through when no candidate opts into text-only handling.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["my-multimodal-v1"]);
     upstream
@@ -1806,6 +1876,7 @@ async fn image_agent_request_native_vision_true_does_not_flip_nonnative_fallback
             ..Default::default()
         },
     )]);
+    mark_text_only(&mut config, &["deepseek-v3"]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "vision-front".to_string();
@@ -1962,6 +2033,7 @@ async fn gating_table_unmatched_request_override_does_not_apply_to_default() {
             ..Default::default()
         },
     )]);
+    mark_text_only(&mut config, &["text-default-v1"]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     // Request a model NOT in the catalog → normalizes to text-default-v1.
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
@@ -2012,6 +2084,7 @@ async fn gating_table_blank_request_override_does_not_apply_to_default() {
             ..Default::default()
         },
     )]);
+    mark_text_only(&mut config, &["text-default-v1"]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     // Blank model → normalizes to text-default-v1 (the catalog default).
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
@@ -2039,8 +2112,7 @@ async fn gating_table_blank_request_override_does_not_apply_to_default() {
 
 #[tokio::test]
 async fn gating_table_genuine_resolution_native_true_passes_through() {
-    // Cell (b): request model GENUINELY resolves (exact catalog id) to a
-    // non-native-NAMED primary with native_vision:true ⇒ passthrough.
+    // Cell (b): an exact catalog id with native_vision:true passes through.
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["my-multimodal-v1"]).await;
     upstream
@@ -2071,8 +2143,7 @@ async fn gating_table_genuine_resolution_native_true_passes_through() {
 
 #[tokio::test]
 async fn gating_table_native_false_on_resolved_primary_strips() {
-    // Cell (c): native_vision:false on the genuinely-resolved primary ⇒ STRIP
-    // even when the model is Kimi-NAMED.
+    // Cell (c): native_vision:false on the resolved primary strips images.
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["Kimi-K2.6"]).await;
     upstream
@@ -2103,7 +2174,7 @@ async fn gating_table_native_false_on_resolved_primary_strips() {
 
 #[tokio::test]
 async fn gating_table_all_native_candidates_pass_through() {
-    // Cell (d): every candidate native (by name) ⇒ passthrough.
+    // Cell (d): no candidate opts into text-only handling, so images pass.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["Kimi-K2.6", "kimi-vl-a3b"]);
     upstream
@@ -2114,7 +2185,8 @@ async fn gating_table_all_native_candidates_pass_through() {
         MockVisionClient::default(),
         image_agent_config(),
     );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
@@ -2126,18 +2198,17 @@ async fn gating_table_all_native_candidates_pass_through() {
 
 #[tokio::test]
 async fn gating_table_any_nonnative_fallback_strips() {
-    // Cell (e): one non-native fallback ⇒ STRIP (all-native invariant).
+    // Cell (e): one explicitly text-only fallback forces stripping.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(["Kimi-K2.6", "deepseek-v3"]);
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
         .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let mut config = image_agent_config();
+    mark_text_only(&mut config, &["deepseek-v3"]);
+    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
@@ -2148,8 +2219,8 @@ async fn gating_table_any_nonnative_fallback_strips() {
 }
 
 #[tokio::test]
-async fn gating_table_empty_candidate_set_strips() {
-    // Cell (f): empty candidate set ⇒ STRIP (unknown state, safe default).
+async fn gating_table_empty_candidate_set_passes_through() {
+    // Cell (f): an unknown candidate set has no explicit text-only override.
     let upstream = MockUpstream::default();
     upstream.set_candidate_models(Vec::<String>::new());
     upstream
@@ -2160,15 +2231,14 @@ async fn gating_table_empty_candidate_set_strips() {
         MockVisionClient::default(),
         image_agent_config(),
     );
-    // Even a Kimi-looking request model must strip when candidates are unknown.
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "Kimi-K2.6".to_string();
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "empty candidate set ⇒ strip"
+        serialized.contains("iVBORw0KGgo"),
+        "empty candidate set ⇒ passthrough"
     );
 }
 
@@ -2233,10 +2303,9 @@ async fn gating_table_candidate_lookup_uses_own_profile_not_remap_target() {
 async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
     // Round-9 #1: the request override consults the LITERAL request model's
     // profile, not the profile of its `upstream_model` remap target. Request
-    // model `kimi-front` (native by name) sets native_vision:false on ITSELF but
-    // remaps to `kimi-native` (native_vision:true). The OLD path could let the
-    // remap target's true override displace the request's false ⇒ wrongly pass
-    // raw images. The fix must honor the request's own false ⇒ STRIP.
+    // model `kimi-front` sets native_vision:false on itself but remaps to
+    // `kimi-native` (native_vision:true). The request profile remains
+    // authoritative for the request-side override.
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["kimi-front"]).await;
     upstream
@@ -2372,7 +2441,8 @@ async fn e2b_placeholder_degrades_user_image_url() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let request = base_request(vec![user_message_with_image(
         "what is this?",
@@ -2398,7 +2468,8 @@ async fn e2b_placeholder_degrades_user_file_id_image() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let request = base_request(vec![message_with_role_and_image(
         "user",
@@ -2427,7 +2498,9 @@ async fn e2b_placeholder_degrades_tool_output_image_from_anthropic_tool_result()
     upstream
         .push_response(vec![Ok(content_chunk("chat-2", "It's 72F in Seattle."))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let mut config = test_config();
+    mark_text_only(&mut config, &["claude-3-5-sonnet-20241022"]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
@@ -2492,7 +2565,8 @@ async fn e2b_placeholder_degrades_image_in_non_user_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let request = base_request(vec![
         message_with_role_and_image(
@@ -2526,7 +2600,8 @@ async fn e2b_lowering_same_request_twice_is_byte_identical() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-2", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let request = base_request(vec![user_message_with_image(
         "describe this",
@@ -2559,7 +2634,8 @@ async fn e2b_multi_image_order_preserved_after_degrade() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let message = ResponseItem::Message {
         id: None,
@@ -2630,7 +2706,7 @@ async fn e2b_degraded_turn_does_not_write_to_replay_cache() {
     let gateway = test_gateway_with_config_and_replay_store(
         upstream.clone(),
         MockSearch::default(),
-        test_config(),
+        text_only_config(),
         replay_store.clone(),
     );
 
@@ -2685,7 +2761,7 @@ async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
     let gateway = test_gateway_with_config_and_replay_store(
         upstream.clone(),
         MockSearch::default(),
-        test_config(),
+        text_only_config(),
         replay_store.clone(),
     );
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -2792,6 +2868,7 @@ async fn e2b_reject_policy_anthropic_returns_4xx_not_502_and_skips_provider() {
     let upstream = MockUpstream::default();
     let mut config = test_config();
     config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
+    mark_text_only(&mut config, &["text-model"]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
@@ -2846,7 +2923,7 @@ async fn e2b_reject_policy_anthropic_returns_4xx_not_502_and_skips_provider() {
 #[tokio::test]
 async fn e2b_reject_policy_chat_returns_4xx_not_502_and_skips_provider() {
     let upstream = MockUpstream::default();
-    let mut config = test_config();
+    let mut config = text_only_config();
     config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
@@ -2899,7 +2976,7 @@ async fn e2b_reject_policy_chat_returns_4xx_not_502_and_skips_provider() {
 #[tokio::test]
 async fn e2b_reject_policy_responses_returns_4xx_not_502_and_skips_provider() {
     let upstream = MockUpstream::default();
-    let mut config = test_config();
+    let mut config = text_only_config();
     config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
@@ -2988,6 +3065,7 @@ async fn e2b_ac9_no_image_bytes_in_upstream_jsonl_log_for_degraded_turn() {
     // incident's exact shape. Placeholder policy is the default.
     let mut config = test_config();
     config.brave_api_key = None;
+    mark_text_only(&mut config, &["text-model"]);
     config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
     config.upstream_request_log_path = Some(log_path.clone());
     let app = llmconduit::build_app(config);
@@ -3056,7 +3134,8 @@ async fn e2b_ac9_no_image_bytes_in_failed_error_text_for_degraded_turn() {
             "upstream exploded before first token",
         ))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), text_only_config());
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;

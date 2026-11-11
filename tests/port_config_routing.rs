@@ -133,6 +133,287 @@ async fn chat_post_hits(server: &MockServer) -> usize {
 // HTTP routing tests: glob match, exact-beats-glob, no-match -> default
 // ---------------------------------------------------------------------------
 
+fn strict_config(primary: &MockServer, secondary: Option<&MockServer>) -> Config {
+    let mut config = common::test_config();
+    config.strict_routing = true;
+    config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().unwrap();
+    if let Some(secondary) = secondary {
+        config.upstreams = [primary, secondary]
+            .iter()
+            .enumerate()
+            .map(|(index, server)| llmconduit::config::UpstreamConfig {
+                load_balance_group: None,
+                name: format!("provider-{index}"),
+                upstream_base_url: format!("{}/v1/", server.uri()).parse().unwrap(),
+                upstream_api_key: None,
+                upstream_model: None,
+                upstream_chat_kwargs: Default::default(),
+                upstream_request_log_path: None,
+                fallback_upstreams: Vec::new(),
+            })
+            .collect();
+    }
+    config
+}
+
+async fn strict_request(
+    app: &axum::Router,
+    endpoint: &str,
+    model: Option<&str>,
+) -> (http::StatusCode, serde_json::Value) {
+    let mut body = match endpoint {
+        "/v1/responses" => json!({"input": "hi", "stream": false, "store": false}),
+        "/v1/completions" => json!({"prompt": "hi"}),
+        _ => {
+            json!({"messages": [{"role": "user", "content": "hi"}], "stream": false, "max_tokens": 32})
+        }
+    };
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn strict_routing_validates_models_on_all_inference_endpoints() {
+    for routing in [false, true] {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount_models_catalog(&first, &["first-model"]).await;
+        mount_models_catalog(&second, &["second-model"]).await;
+        mount_chat_target_for_model(&first, "first-model", "chat-first", "first").await;
+        mount_chat_target_for_model(&second, "second-model", "chat-second", "second").await;
+        for (server, model) in [(&first, "first-model"), (&second, "second-model")] {
+            Mock::given(method("POST"))
+                .and(path("/v1/completions"))
+                .and(body_partial_json(json!({"model": model})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"model": model})))
+                .mount(server)
+                .await;
+        }
+        let app = llmconduit::build_app(strict_config(&first, routing.then_some(&second)));
+        let endpoints = [
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/completions",
+        ];
+        for endpoint in endpoints.into_iter().chain(["/v1/messages/count_tokens"]) {
+            for model in ["typo", "FIRST_MODEL", "first model"] {
+                let (status, body) = strict_request(&app, endpoint, Some(model)).await;
+                assert_eq!(status, 400, "{routing} {endpoint} {model}: {body}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("strict_routing")
+                );
+            }
+        }
+        assert_eq!(chat_post_hits(&first).await, 0);
+        assert_eq!(chat_post_hits(&second).await, 0);
+        for endpoint in endpoints {
+            for model in [None, Some(""), Some("  \t"), Some("first-model")] {
+                let (status, body) = strict_request(&app, endpoint, model).await;
+                assert_eq!(status, 200, "{routing} {endpoint} {model:?}: {body}");
+                assert_eq!(body["model"], "first-model", "{endpoint}: {body}");
+            }
+            if routing {
+                let (status, body) = strict_request(&app, endpoint, Some("second-model")).await;
+                assert_eq!(status, 200, "{endpoint}: {body}");
+                assert_eq!(body["model"], "second-model");
+            }
+        }
+        for server in [&first, &second] {
+            let allowed = if server.uri() == first.uri() {
+                "first-model"
+            } else {
+                "second-model"
+            };
+            for request in server.received_requests().await.unwrap() {
+                if request.method.as_str() == "POST" {
+                    assert_eq!(
+                        request.body_json::<serde_json::Value>().unwrap()["model"],
+                        allowed
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn strict_routing_disables_global_and_nested_fallbacks() {
+    for routing in [false, true] {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        mount_models_catalog(&primary, &["primary-model"]).await;
+        mount_models_catalog(&secondary, &["secondary-model"]).await;
+        for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(503).set_body_json(json!({"error": "unavailable"})),
+                )
+                .mount(&primary)
+                .await;
+        }
+        mount_chat_target(&fallback, "fallback").await;
+        let mut config = strict_config(&primary, routing.then_some(&secondary));
+        let fallbacks = vec![llmconduit::config::FallbackUpstreamConfig {
+            name: "fallback".into(),
+            upstream_base_url: format!("{}/v1/", fallback.uri()).parse().unwrap(),
+            upstream_api_key: None,
+            upstream_model: Some("fallback-model".into()),
+            exposed_model: Some("fallback-alias".into()),
+            upstream_chat_kwargs: Default::default(),
+            upstream_request_log_path: None,
+        }];
+        config.fallback_upstreams = fallbacks.clone();
+        if routing {
+            config.upstreams[0].fallback_upstreams = fallbacks;
+        }
+        let (app, gateway) = llmconduit::build_app_with_gateway(config);
+        for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+            let (status, body) = strict_request(&app, endpoint, Some("primary-model")).await;
+            assert!(status.is_server_error(), "{routing} {endpoint}: {body}");
+            let (status, body) = strict_request(&app, endpoint, Some("fallback-alias")).await;
+            assert_eq!(status, 400, "{routing} {endpoint}: {body}");
+        }
+        let models = gateway
+            .upstream_client()
+            .supported_model_catalog()
+            .await
+            .unwrap();
+        assert!(models.iter().all(|model| model.id != "fallback-alias"));
+        let candidates = gateway
+            .upstream_client()
+            .backend_candidate_plan("primary-model")
+            .await;
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(candidates.candidates[0].model, "primary-model");
+        assert!(fallback.received_requests().await.unwrap().is_empty());
+        assert_eq!(chat_post_hits(&secondary).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn strict_routing_preserves_explicit_aliases_and_routes_without_catch_all_remaps() {
+    let primary = MockServer::start().await;
+    let route = MockServer::start().await;
+    mount_models_catalog(&primary, &["first-model", "second-model"]).await;
+    mount_chat_target(&primary, "primary").await;
+    mount_chat_target_for_model(&route, "route-backend", "chat-route", "route").await;
+    let config = config_from_yaml(&format!(
+        r#"
+strict_routing: true
+upstream_model: second-model
+upstreams:
+  - upstream_base_url: {}/v1/
+model_profiles:
+  alias:
+    upstream_model: second-model
+  "*":
+    upstream_model: second-model
+model_routes:
+  routed-*:
+    upstream_base_url: {}/v1/
+    upstream_model: route-backend
+"#,
+        primary.uri(),
+        route.uri()
+    ));
+    let app = llmconduit::build_app(config);
+    for (model, expected) in [
+        ("alias", "second-model"),
+        ("first-model", "first-model"),
+        ("", "first-model"),
+    ] {
+        let body = post_chat(app.clone(), model).await;
+        assert_eq!(body["model"], expected);
+    }
+    assert_eq!(
+        chat_content(&post_chat(app.clone(), "routed-name").await),
+        Some("route")
+    );
+    for model in ["typo", "ALIAS"] {
+        assert_eq!(
+            strict_request(&app, "/v1/chat/completions", Some(model))
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(chat_post_hits(&primary).await, 3);
+    assert_eq!(chat_post_hits(&route).await, 1);
+}
+
+#[tokio::test]
+async fn strict_routing_errors_when_catalog_unavailable_or_empty() {
+    for routing in [false, true] {
+        for catalog_status in [200, 503] {
+            let primary = MockServer::start().await;
+            let secondary = MockServer::start().await;
+            for server in [&primary, &secondary] {
+                Mock::given(method("GET"))
+                    .and(path("/v1/models"))
+                    .respond_with(
+                        ResponseTemplate::new(catalog_status).set_body_json(json!({"data": []})),
+                    )
+                    .mount(server)
+                    .await;
+            }
+            let app = llmconduit::build_app(strict_config(&primary, routing.then_some(&secondary)));
+            for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+                for model in ["", "unknown"] {
+                    let (status, body) = strict_request(&app, endpoint, Some(model)).await;
+                    assert!(
+                        status.is_client_error() || status.is_server_error(),
+                        "{body}"
+                    );
+                }
+            }
+            assert_eq!(chat_post_hits(&primary).await, 0);
+            assert_eq!(chat_post_hits(&secondary).await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn strict_routing_blank_selects_first_nonempty_catalog() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    mount_models_catalog(&first, &[]).await;
+    mount_models_catalog(&second, &["second-model"]).await;
+    mount_chat_target_for_model(&second, "second-model", "chat-second", "second").await;
+    let mut config = strict_config(&first, Some(&second));
+    config.model_routes = config_from_yaml(&format!(
+        "model_routes:\n  '*':\n    upstream_base_url: {}/v1/\n    upstream_model: wildcard-model\n",
+        first.uri()
+    ))
+    .model_routes;
+    let app = llmconduit::build_app(config);
+    assert_eq!(post_chat(app, "").await["model"], "second-model");
+    assert_eq!(chat_post_hits(&first).await, 0);
+}
+
 /// A glob route (`claude-opus-*`) matches a request model and routes to the
 /// configured upstream, rewriting the model to the route's `upstream_model`.
 /// (claude-relay `test_resolve_backend_supports_glob_routes`.)

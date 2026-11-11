@@ -98,11 +98,9 @@ impl ImageCache {
     /// renumbered consistently; the cache is cleared first so numbering resets
     /// per request exactly like claude-relay's stateless processing.
     ///
-    /// `gate` decides activation: the caller must have already confirmed the
-    /// latest user turn has images and the backend is not native-vision. We
-    /// renumber every user-message image (not just the latest) because the
-    /// history the client resends still contains earlier raw images that would
-    /// otherwise leak bytes upstream.
+    /// The caller must have confirmed that the latest user turn has images and
+    /// the backend profile sets `native_vision: false`. Every user-message
+    /// image is renumbered so resent history cannot bypass offload handling.
     pub fn strip_and_cache_images(&self, request: &mut ResponsesRequest, session_id: &str) {
         self.clear_session(session_id);
         let mut counter = 1usize;
@@ -232,22 +230,14 @@ fn latest_user_message_content(input: &[ResponseItem]) -> Option<&[ContentItem]>
 // runs when the G4 agent is ACTIVE, and even then only ever touches
 // `role=="user"` + `image_url` content in the process of caching+offloading an
 // image for `analyzeImage`. That leaves real gaps that reach a non-native-
-// vision upstream verbatim: the agent disabled/no `vision_url` (the field
-// incident — an image fell straight through), `tool_choice=="none"`,
-// `file_id`-only images (Anthropic `source.type=="file"`,
-// `anthropic_to_responses.rs:712`), and images sitting in a non-`user` role.
-// This pass is the true choke point: it is role-agnostic, runs regardless of
-// whether the active agent engaged, and is the LAST thing standing between a
-// canonical request and a backend that will 400 on raw image bytes (the field
-// incident's "is not a multimodal model" error, which also tripped a cooldown
-// before E2a). See `engine.rs`'s call site (after `activate_image_agent`,
-// gated on `!backend_is_native_vision`) for the policy dispatch
-// (`Placeholder` vs `Reject`).
+// vision upstream verbatim: the agent is disabled, has no `vision_url`, cannot
+// run because of `tool_choice=="none"`, or does not cover the image's shape or
+// role. The engine invokes this role-agnostic pass only for backend profiles
+// configured with `native_vision: false`.
 // ===========================================================================
 
-/// E2b: whether `part` is a residual `ContentItem::InputImage` this pass must
-/// not let reach a non-native-vision backend — ANY `InputImage`, regardless of
-/// whether `image_url`/`file_id` are populated, empty, or absent.
+/// Whether `part` is a residual `ContentItem::InputImage` for an explicitly
+/// text-only backend, regardless of whether `image_url` or `file_id` is set.
 ///
 /// Deliberately NOT gated on non-emptiness (unlike the G4 activation predicate
 /// [`latest_user_message_has_images`], which only cares whether there is a

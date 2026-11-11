@@ -535,9 +535,9 @@ fn valid_tag_name(name: &str) -> bool {
 /// E2b: policy for a residual `InputImage` (one the G4 image agent did not
 /// strip — agent inactive/disabled, `tool_choice=="none"`, a `file_id` image,
 /// a non-`user`-role image, or old history) that would otherwise reach a
-/// non-native-vision backend. `Placeholder` (the default) replaces it with an
-/// instructive text placeholder so the model self-corrects instead of the
-/// upstream 400ing on raw image bytes (the field incident this closes);
+/// backend configured with `native_vision: false`. `Placeholder` (the default)
+/// replaces it with an instructive text placeholder so the model self-corrects
+/// instead of the upstream rejecting raw image bytes;
 /// `Reject` fails the turn before dispatch with a 4xx instead. No `Drop`
 /// variant — silently discarding image content with no signal to the model or
 /// client is a defect, not a policy.
@@ -566,6 +566,9 @@ pub struct Config {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    /// Require exact model IDs or configured routes/aliases and disable failover.
+    /// Blank model names still select the first catalog model.
+    pub strict_routing: bool,
     pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
     /// Ad-hoc model routes (G7). Each route maps a request-model *name* (which
@@ -624,8 +627,8 @@ pub struct Config {
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     pub image_cache_ttl_secs: u64,
-    /// E2b: policy applied to a residual image reaching a non-native-vision
-    /// backend after G4 gating. See [`UnsupportedImagePolicy`].
+    /// Policy applied to a residual image for a profile configured with
+    /// `native_vision: false`. See [`UnsupportedImagePolicy`].
     pub unsupported_image_policy: UnsupportedImagePolicy,
     /// Per-model price table (T13/D13), keyed by SERVED model id. Drives the
     /// dashboard's flow `cost` roll-up + the Sankey cost coloring + the
@@ -784,6 +787,7 @@ fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub name: String,
+    pub load_balance_group: Option<String>,
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
@@ -995,10 +999,8 @@ pub struct PersistedModelProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_family: Option<String>,
     /// Per-profile override for whether the resolved backend can natively see
-    /// images (G4). `Some(true)` forces the image agent OFF for this profile
-    /// (the backend is multimodal); `Some(false)` forces text-only handling
-    /// even for a name the family sniff would treat as native-vision. `None`
-    /// defers to the name-based default.
+    /// images. `Some(false)` enables image offload or placeholder handling for
+    /// this profile. `Some(true)` and `None` pass images through unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
@@ -1148,6 +1150,9 @@ pub struct PersistedFallbackUpstream {
 pub struct PersistedUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Balance matching model IDs across upstreams in this group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balance_group: Option<String>,
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_api_key: Option<String>,
@@ -1185,6 +1190,8 @@ pub struct PersistedConfig {
     pub upstreams: Vec<PersistedUpstream>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    #[serde(default)]
+    pub strict_routing: bool,
     #[serde(default = "default_upstream_failure_cooldown_secs")]
     pub upstream_failure_cooldown_secs: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1332,10 +1339,7 @@ fn default_image_cache_ttl_secs() -> u64 {
     300
 }
 
-/// Default E2b residual-image policy: replace with an instructive placeholder
-/// rather than reject the turn, so an existing deployment that upgrades keeps
-/// serving `200`s (matching the pre-E2b common case) instead of newly 4xx-ing
-/// every image-bearing turn against a non-native-vision backend.
+/// Default residual-image policy for explicitly text-only profiles.
 fn default_unsupported_image_policy() -> UnsupportedImagePolicy {
     UnsupportedImagePolicy::Placeholder
 }
@@ -1353,6 +1357,7 @@ impl Default for PersistedConfig {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
@@ -1393,11 +1398,18 @@ impl Config {
         path: Option<&Path>,
         route_specs: &[String],
     ) -> Result<Self, String> {
-        let mut persisted = if let Some(path) = path {
+        let persisted = if let Some(path) = path {
             load_persisted_config(path)?
         } else {
             load_default_persisted_config()?
         };
+        Self::from_persisted_and_overrides(persisted, route_specs)
+    }
+
+    pub(crate) fn from_persisted_and_overrides(
+        mut persisted: PersistedConfig,
+        route_specs: &[String],
+    ) -> Result<Self, String> {
         apply_env_overrides(&mut persisted);
         for spec in route_specs {
             let (name, route) = parse_model_route_spec(spec)?;
@@ -1458,7 +1470,11 @@ impl Config {
             // fallbacks. Route providers (G7) all write the top-level path, so
             // this branch covers routes-only configs too.
             push_dir(self.upstream_request_log_path.as_ref());
-            for fallback in &self.fallback_upstreams {
+            for fallback in self
+                .fallback_upstreams
+                .iter()
+                .filter(|_| !self.strict_routing)
+            {
                 push_dir(fallback.upstream_request_log_path.as_ref());
             }
         } else {
@@ -1466,7 +1482,11 @@ impl Config {
             // their nested fallbacks.
             for upstream in &self.upstreams {
                 push_dir(upstream.upstream_request_log_path.as_ref());
-                for fallback in &upstream.fallback_upstreams {
+                for fallback in upstream
+                    .fallback_upstreams
+                    .iter()
+                    .filter(|_| !self.strict_routing)
+                {
                     push_dir(fallback.upstream_request_log_path.as_ref());
                 }
             }
@@ -1555,6 +1575,7 @@ impl Config {
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
             upstreams,
             fallback_upstreams,
+            strict_routing: config.strict_routing,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
             model_routes,
@@ -1599,6 +1620,17 @@ impl Config {
     }
 
     pub fn resolve_upstream_model(&self, request_model: &str) -> String {
+        if self.strict_routing {
+            let model = request_model.trim();
+            // Catch-all rewrites would hide invalid names and replace blank-model
+            // catalog selection. Only explicitly named aliases may rewrite here.
+            return self
+                .model_profiles
+                .get(model)
+                .filter(|_| !model.is_empty() && model != "*")
+                .and_then(|profile| profile.upstream_model.clone())
+                .unwrap_or_else(|| model.to_string());
+        }
         self.model_profile(request_model)
             .and_then(|profile| profile.upstream_model.clone())
             .or_else(|| self.upstream_model.clone())
@@ -2190,6 +2222,14 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
 fn parse_upstream(
     (index, provider): (usize, &PersistedUpstream),
 ) -> Result<UpstreamConfig, String> {
+    let load_balance_group = provider
+        .load_balance_group
+        .as_deref()
+        .map(|group| {
+            trim_nonempty(Some(group))
+                .ok_or_else(|| format!("upstreams[{index}].load_balance_group must not be blank"))
+        })
+        .transpose()?;
     let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
         .map_err(|err| format!("invalid upstreams[{index}].upstream_base_url: {err}"))?;
     let fallback_upstreams = provider
@@ -2205,6 +2245,7 @@ fn parse_upstream(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(UpstreamConfig {
+        load_balance_group,
         name: provider
             .name
             .as_ref()
@@ -2289,15 +2330,61 @@ pub fn load_persisted_config(path: &Path) -> Result<PersistedConfig, String> {
     }
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    parse_persisted_config(path, &contents)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConfigParseError {
+    #[error(transparent)]
+    Yaml(serde_yaml::Error),
+    #[error(transparent)]
+    Toml(toml::de::Error),
+}
+
+impl ConfigParseError {
+    pub(crate) fn reload_message(&self, contents: &str) -> String {
+        // Parser Display implementations can echo source lines and secret values.
+        let (format, location) = match self {
+            Self::Yaml(error) => (
+                "YAML",
+                error
+                    .location()
+                    .map(|location| (location.line(), location.column())),
+            ),
+            Self::Toml(error) => (
+                "TOML",
+                error
+                    .span()
+                    .and_then(|span| contents.get(..span.start))
+                    .map(|prefix| {
+                        (
+                            prefix.bytes().filter(|&byte| byte == b'\n').count() + 1,
+                            prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
+                        )
+                    }),
+            ),
+        };
+        match location {
+            Some((line, column)) => {
+                format!("invalid {format} config at line {line}, column {column}")
+            }
+            None => format!("invalid {format} config"),
+        }
+    }
+}
+
+pub(crate) fn parse_persisted_config(
+    path: &Path,
+    contents: &str,
+) -> Result<PersistedConfig, ConfigParseError> {
     // Detect format by extension (G7). `.toml` parses via the `toml` crate;
     // everything else (including `.yaml`/`.yml` and extensionless paths) keeps
     // the existing YAML path byte-identical.
     if path_is_toml(path) {
-        toml::from_str(&contents)
-            .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+        toml::from_str(contents).map_err(ConfigParseError::Toml)
     } else {
-        serde_yaml::from_str(&contents)
-            .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+        serde_yaml::from_str(contents).map_err(ConfigParseError::Yaml)
     }
 }
 
@@ -2961,6 +3048,7 @@ model_profiles:
         let config = PersistedConfig {
             upstreams: vec![PersistedUpstream {
                 name: Some(" local ".to_string()),
+                load_balance_group: Some(" local-replicas ".to_string()),
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
                 upstream_model: Some(" local-model ".to_string()),
@@ -2990,6 +3078,10 @@ model_profiles:
         assert_eq!(result.upstreams.len(), 1);
         let upstream = &result.upstreams[0];
         assert_eq!(upstream.name, "local");
+        assert_eq!(
+            upstream.load_balance_group.as_deref(),
+            Some("local-replicas")
+        );
         assert_eq!(
             upstream.upstream_base_url.as_str(),
             "http://127.0.0.1:8000/v1"
@@ -3263,6 +3355,7 @@ model_profiles:
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
@@ -3348,6 +3441,7 @@ model_profiles:
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -3524,6 +3618,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -3603,6 +3698,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -3688,6 +3784,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([
@@ -3798,6 +3895,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([
@@ -4225,6 +4323,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
@@ -4275,6 +4374,7 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(

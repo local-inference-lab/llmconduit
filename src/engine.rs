@@ -45,11 +45,14 @@ use crate::search::SearchOutcome;
 use crate::tool_delta_gate::DeltaDecision;
 use crate::tool_delta_gate::DeltaEmission;
 use crate::tool_delta_gate::ToolDeltaGate;
+use crate::upstream::MODEL_CATALOG_TTL;
 use crate::upstream::ProviderHealth;
 use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::UpstreamClient;
 use crate::upstream::UpstreamModelEntry;
 use crate::upstream::canonical_model_key;
+use crate::upstream::collect_models_response;
+use crate::upstream::extract_supported_model_catalog;
 use crate::upstream::sanitize_chat_request;
 use crate::vision::ImageCache;
 use crate::vision::VisionClient;
@@ -66,7 +69,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
+const MODEL_FALLBACK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizeCapability {
@@ -186,8 +189,8 @@ pub struct Gateway {
     /// default catalog model" WARN. Every request resolves the model TWICE (the
     /// HTTP layer to label the response, then the engine to drive the upstream
     /// call), so without throttling a persistent mismatch logs the same WARN
-    /// twice per request forever. Keyed by requested model; fires once per
-    /// catalog-TTL window, mirroring claude-relay's once-per-detection logging.
+    /// twice per request forever. Keyed by requested model; fires at most once
+    /// every five minutes, independently of catalog refreshes.
     model_fallback_warned: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     /// E1: always-on (NOT dashboard-gated) bounded counter for hallucinated
     /// unoffered tool calls, keyed `{provider, served_model, outcome}`. The
@@ -212,7 +215,7 @@ pub struct SseEvent {
 
 #[derive(Clone)]
 struct CachedUpstreamModelCatalog {
-    fetched_at: std::time::Instant,
+    fetched_at: tokio::time::Instant,
     catalog: UpstreamModelCatalog,
 }
 
@@ -897,6 +900,22 @@ impl Gateway {
         &self.config
     }
 
+    pub(crate) fn monitor_hub(&self) -> MonitorHub {
+        self.monitor.clone()
+    }
+
+    pub(crate) fn with_runtime_state_from(mut self, previous: &Self) -> Self {
+        self.abort_hub = previous.abort_hub.clone();
+        self.provider_health = previous.provider_health.clone();
+        self.unknown_tool_call_counts = previous.unknown_tool_call_counts.clone();
+        if self.config.image_cache_max_size == previous.config.image_cache_max_size
+            && self.config.image_cache_ttl_secs == previous.config.image_cache_ttl_secs
+        {
+            self.image_cache = previous.image_cache.clone();
+        }
+        self
+    }
+
     /// D13: the configured [`ModelPrice`](crate::config::ModelPrice) for `model`,
     /// keyed by the SERVED model id (exact, then case-insensitive). `None` when no
     /// price is configured — the dashboard then reports no `cost` for that flow.
@@ -915,6 +934,21 @@ impl Gateway {
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
+    }
+
+    pub(crate) async fn list_models(&self) -> AppResult<(http::StatusCode, Value, Option<String>)> {
+        let mut cache = self.upstream_model_catalog.lock().await;
+        *cache = None;
+        let response = self.upstream.list_models().await?;
+        let (status, body, etag) = collect_models_response(response).await?;
+        if status.is_success() {
+            // Model listing and inference must observe the same refreshed snapshot.
+            *cache = Some(CachedUpstreamModelCatalog {
+                fetched_at: tokio::time::Instant::now(),
+                catalog: UpstreamModelCatalog::from_entries(extract_supported_model_catalog(&body)),
+            });
+        }
+        Ok((status, body, etag))
     }
 
     pub fn tokenize_capability(&self) -> TokenizeCapability {
@@ -1000,7 +1034,7 @@ impl Gateway {
     /// time). G4 native-vision gating consumes it so a request-model
     /// `native_vision` override attaches ONLY when the request genuinely maps to
     /// the served backend (G4 round-8 #1).
-    pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
+    pub async fn resolve_request_model(&self, request_model: &str) -> AppResult<(String, bool)> {
         let configured_model = self.config.resolve_upstream_model(request_model);
         self.normalize_upstream_model(&configured_model).await
     }
@@ -1217,50 +1251,6 @@ impl Gateway {
                 .state(id)
                 .map(|state| crate::turn_capture::CaptureGuard::new(state, abort_token.clone()))
         });
-        // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
-        // the flow record's `model_requested` reflects what the CLIENT asked for (an
-        // alias / ad-hoc route / profile name), distinct from the resolved/served
-        // model the leaf records as `model_served`. Stamped onto the record via
-        // `set_normalized` below alongside the normalized canonical body.
-        let model_requested = request.model.clone();
-        let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
-        // F1c: stamp the resolved/served model onto the capture outcome metadata now
-        // that resolution has settled (absent for a turn that fails before here).
-        if let Some(guard) = &capture_guard {
-            guard.set_model_served(&resolved_model);
-        }
-        let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
-
-        // D1/E2b: minted here rather than just before the `tokio::spawn` below
-        // (its only prior use) so the E2b residual-image-degrade monitor
-        // emission further down can key off the SAME id every other event for
-        // this turn uses. Pure reordering: nothing between here and the spawn
-        // reads or depends on this value.
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
-
-        // G4/E2b: the resolved-backend native-vision decision, computed ONCE
-        // and shared between G4 gating (`activate_image_agent`, which used to
-        // recompute this itself) and the E2b residual-image pass below, so the
-        // two can never disagree about whether this backend is safe to receive
-        // raw images. Must be computed unconditionally (not just when G4's own
-        // earlier gates pass) because E2b runs regardless of whether the G4
-        // agent activated.
-        let native_vision = self
-            .backend_is_native_vision(&request.model, &resolved_model, request_genuine)
-            .await;
-
-        // G4 image-agent strip/cache seam. This runs AFTER model/profile
-        // resolution + system-prompt prefix but BEFORE replay lookup/lowering so
-        // that (a) gating sees the resolved/profiled backend, not the raw request
-        // model, and (b) replay hashes and the lowered upstream payload only ever
-        // see `[Image #N]` placeholder TEXT, never image bytes. When gating
-        // activates, `strip_and_cache_images` mutates `request` in place
-        // (images → placeholders, inject one `analyzeImage` tool + system
-        // instruction, dedup) and returns a per-turn session id; we then lower
-        // with the image agent active so `analyzeImage` classifies as the
-        // server-side tool and thread the session id to the executor.
-        let vision_session = self.activate_image_agent(&mut request, native_vision).await;
-
         // D3: a pre-spawn early return (replay baseline lookup, lowering/validation,
         // or budgeting below) must finalize the record `Failed` with the correct
         // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
@@ -1293,17 +1283,51 @@ impl Gateway {
             err
         };
 
-        // E2b residual-image safety pass: the TRUE choke point for "no raw
-        // image reaches a non-native-vision backend". `activate_image_agent`
-        // above only ever strips `role=="user"` + `image_url` in an ACTIVE
-        // turn (`vision/strip.rs:strip_and_cache_images`); this sweep is
-        // role-agnostic and runs regardless of whether that agent activated,
-        // so it also catches `file_id` images, images in a non-`user` message,
-        // `tool_choice=="none"` residuals, and old-history images the active
-        // strip never sees. It is a no-op — never even inspected — on
-        // native-vision passthrough, and never double-transforms what the
-        // active strip already rewrote to `InputText` (there is nothing left
-        // of type `InputImage` for it to find there).
+        // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
+        // the flow record's `model_requested` reflects what the CLIENT asked for (an
+        // alias / ad-hoc route / profile name), distinct from the resolved/served
+        // model the leaf records as `model_served`. Stamped onto the record via
+        // `set_normalized` below alongside the normalized canonical body.
+        let model_requested = request.model.clone();
+        let (resolved_model, request_genuine) = self
+            .resolve_request_model(&request.model)
+            .await
+            .map_err(&finalize_pre_spawn_err)?;
+        // F1c: stamp the resolved/served model onto the capture outcome metadata now
+        // that resolution has settled (absent for a turn that fails before here).
+        if let Some(guard) = &capture_guard {
+            guard.set_model_served(&resolved_model);
+        }
+        let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
+
+        // D1/E2b: minted here rather than just before the `tokio::spawn` below
+        // (its only prior use) so the E2b residual-image-degrade monitor
+        // emission further down can key off the SAME id every other event for
+        // this turn uses. Pure reordering: nothing between here and the spawn
+        // reads or depends on this value.
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+
+        // Compute the resolved backend's configured image policy once and share
+        // it between image-agent gating and residual-image handling.
+        let native_vision = self
+            .backend_is_native_vision(&request.model, &resolved_model, request_genuine)
+            .await;
+
+        // G4 image-agent strip/cache seam. This runs AFTER model/profile
+        // resolution + system-prompt prefix but BEFORE replay lookup/lowering so
+        // that (a) gating sees the resolved/profiled backend, not the raw request
+        // model, and (b) replay hashes and the lowered upstream payload only ever
+        // see `[Image #N]` placeholder TEXT, never image bytes. When gating
+        // activates, `strip_and_cache_images` mutates `request` in place
+        // (images → placeholders, inject one `analyzeImage` tool + system
+        // instruction, dedup) and returns a per-turn session id; we then lower
+        // with the image agent active so `analyzeImage` classifies as the
+        // server-side tool and thread the session id to the executor.
+        let vision_session = self.activate_image_agent(&mut request, native_vision).await;
+
+        // For profiles configured with `native_vision: false`, handle every
+        // residual image that the active agent did not rewrite, including
+        // file ids, non-user messages, and old history.
         if !native_vision {
             if self.config.unsupported_image_policy == UnsupportedImagePolicy::Reject
                 && crate::vision::has_residual_images(&request.input)
@@ -1656,11 +1680,10 @@ impl Gateway {
     ///   endpoint ⇒ nothing to offload to),
     /// - the LATEST user message carries ≥1 image (old images in history must
     ///   not re-trigger the agent),
-    /// - `native_vision` is `false` — the resolved/profiled backend is NOT
-    ///   native-vision (Kimi by name, or a profile `native_vision` override).
-    ///   Precomputed by the caller (`backend_is_native_vision`, see its
-    ///   decision table) and shared with the E2b residual-image pass that runs
-    ///   right after this returns, so the two never disagree,
+    /// - `native_vision` is `false` because a matching profile explicitly sets
+    ///   `native_vision: false`. Backends without an override receive images
+    ///   unchanged. The caller precomputes this value and shares it with the
+    ///   residual-image pass so the two paths cannot disagree,
     /// - `tool_choice` is not `"none"` (the caller forbade tools, so injecting a
     ///   mandatory tool would be a contradiction).
     async fn activate_image_agent(
@@ -1690,80 +1713,38 @@ impl Gateway {
         Some(session_id)
     }
 
-    /// Native-vision gating decision (G4). Decides whether to pass raw images
-    /// through (return `true` → skip strip/offload) or strip+offload (`false`).
+    /// Decide whether raw images pass through (`true`) or use the configured
+    /// image offload/placeholder path (`false`). Passthrough is the default;
+    /// model names are never interpreted as capability metadata.
     ///
-    /// DECISION TABLE (the single source of truth — the code below matches it
-    /// exactly; do not special-case index 0):
+    /// Every pre-first-chunk candidate must allow passthrough. A candidate is
+    /// disabled only by an explicit `native_vision: false` profile. An unknown
+    /// candidate set passes through because there is no negative capability
+    /// declaration.
     ///
-    /// ```text
-    /// (1) Candidate set = every pre-first-chunk serving backend (selected
-    ///     primary + its failover chain + routing target), enumerated from
-    ///     `resolved_model` via `backend_candidate_plan`.
-    ///     EMPTY/unknown  =>  STRIP (return false) — never fall back to a
-    ///     name-looks-native model.
-    ///
-    /// (2) For EACH candidate c (c is ALREADY the final backend model the
-    ///     provider receives — lookups are PROFILE-ONLY, NO further upstream_model
-    ///     remap, round-9 #1), native(c) =
-    ///     (2a) IF request_model GENUINELY resolves/maps to c (exact id / route /
-    ///          unique canonical key — NOT the blank/unmatched/ambiguous default
-    ///          fallback; `request_genuine`, a byproduct of the ONE
-    ///          `normalize_upstream_model` walk threaded from `stream_responses`
-    ///          since T2) AND the LITERAL request model's profile sets
-    ///          `native_vision` => that value
-    ///     (2b) ELSE c's OWN profile `native_vision` (keyed on c exactly) if set
-    ///     (2c) ELSE name-based native detection (Kimi etc.)
-    ///
-    /// (3) PASSTHROUGH iff the candidate set is non-empty AND native(c)==true for
-    ///     ALL c. Otherwise STRIP. So native_vision:false anywhere it legitimately
-    ///     applies => STRIP; any non-native/unknown candidate => STRIP.
-    /// ```
-    ///
-    /// The request override attaches to the candidate it GENUINELY maps to (the
-    /// selected primary, when the request truly resolves there), never blindly to
-    /// index 0 — a stale alias normalized to a different default backend must NOT
-    /// borrow the request's `native_vision` (round-8 #1). Fallback candidates are
-    /// always per-candidate, so the override never leaks onto a non-native
-    /// fallback (round-2/3). All native_vision lookups are profile-only on the
-    /// exact model, so a candidate's (or the request's) `upstream_model` remap
-    /// cannot make the gate judge a different model than runs (round-9 #1).
+    /// A request profile applies to the primary candidate only when model
+    /// resolution genuinely maps that request to the candidate. Fallbacks use
+    /// their own exact profiles, without applying `upstream_model` again.
     async fn backend_is_native_vision(
         &self,
         request_model: &str,
         resolved_model: &str,
         request_genuine: bool,
     ) -> bool {
-        // T2: the routing/failover layer owns the candidate set (typed
-        // `BackendCandidatePlan`), and `request_genuine` — a byproduct of the
-        // ONE `normalize_upstream_model` walk, threaded from `stream_responses`
-        // — owns the genuine-vs-default signal. The gate no longer re-derives
-        // the resolution ladder in the engine.
         let candidates = self
             .upstream
             .backend_candidate_plan(resolved_model)
             .await
             .candidates;
         if candidates.is_empty() {
-            // Cell 1: unknown candidate set ⇒ strip (works for every backend).
-            return false;
+            return true;
         }
-        // The request override (cell 2a) may attach to the SELECTED primary
-        // candidate (index 0 — the model the resolved request lands on) only when
-        // the request model GENUINELY resolves there. On a default-fallback
-        // (`request_genuine == false`) it does not map to that candidate, so the
-        // override is dropped entirely and every candidate uses per-candidate
-        // detection. This is a PROFILE-ONLY lookup on the LITERAL request model
-        // (round-9 #1): no `upstream_model` remap, so the remap TARGET's profile
-        // cannot displace the request's.
         let request_override = if request_genuine {
             self.config.profile_native_vision(request_model)
         } else {
             None
         };
         candidates.iter().enumerate().all(|(index, candidate)| {
-            // Cell 2a: request override applies ONLY to the genuinely-mapped
-            // primary candidate; cells 2b/2c for everything else.
             if index == 0
                 && let Some(native) = request_override
             {
@@ -1773,18 +1754,13 @@ impl Gateway {
         })
     }
 
-    /// Per-candidate native-vision (decision-table cells 2b/2c). `candidate_model`
-    /// is ALREADY the final backend model the provider will receive, so this is a
-    /// PROFILE-ONLY lookup on that exact model (round-9 #1): its own profile
-    /// `native_vision` with NO further `upstream_model` remap (re-remapping would
-    /// judge the remap target, a DIFFERENT model than the provider gets), else the
-    /// name sniff (Kimi). The request model's profile is NOT consulted (round-3
-    /// #2). Unknown ⇒ not native.
+    /// Return the exact candidate profile's image-passthrough policy. The model
+    /// is already the final backend model, so applying `upstream_model` again
+    /// would inspect a different model than the provider receives.
     fn candidate_is_native_vision(&self, candidate_model: &str) -> bool {
-        if let Some(native) = self.config.profile_native_vision(candidate_model) {
-            return native;
-        }
-        candidate_model.to_ascii_lowercase().contains("kimi")
+        self.config
+            .profile_native_vision(candidate_model)
+            .unwrap_or(true)
     }
 
     async fn find_replay_baseline(
@@ -3011,13 +2987,16 @@ impl Gateway {
     /// flag is a byproduct of this ONE ladder walk — not a re-derived
     /// side-channel — so G4 gating (the only `genuine` consumer) keeps a single
     /// resolution truth (T2 deleted `request_model_genuinely_resolves`).
-    async fn normalize_upstream_model(&self, model: &str) -> (String, bool) {
+    async fn normalize_upstream_model(&self, model: &str) -> AppResult<(String, bool)> {
         let catalog = match self.load_upstream_model_catalog().await {
             Ok(catalog) => catalog,
             Err(err) => {
                 tracing::warn!(model, error = %err, "failed to refresh upstream model catalog");
+                if self.config.strict_routing {
+                    return Err(err);
+                }
                 // Catalog unavailable ⇒ model flows through unchanged ⇒ genuine.
-                return (model.to_string(), true);
+                return Ok((model.to_string(), true));
             }
         };
         // Precedence (mirrors `RoutingModelCatalog::resolve`, G7; route-match
@@ -3049,12 +3028,27 @@ impl Gateway {
                     "normalized upstream model name from backend catalog"
                 );
             }
-            return (exact, true);
+            return Ok((exact, true));
         }
-        if self.config.matches_model_route(model) {
+        if (!self.config.strict_routing || !model.trim().is_empty())
+            && self.config.matches_model_route(model)
+        {
             // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
             // the route match + upstream-model rewrite. A route match is genuine.
-            return (model.to_string(), true);
+            return Ok((model.to_string(), true));
+        }
+        if self.config.strict_routing {
+            return if model.trim().is_empty() {
+                catalog.default_id().map(|id| (id, false)).ok_or_else(|| {
+                    AppError::upstream(
+                        "no models are currently available from configured upstreams",
+                    )
+                })
+            } else {
+                Err(AppError::bad_request(format!(
+                    "model {model:?} is not available with strict_routing enabled; use an exact model ID from /v1/models or a configured model alias/route"
+                )))
+            };
         }
         if let Some(canonical) = catalog.canonical_unique(model) {
             if canonical != model {
@@ -3064,7 +3058,7 @@ impl Gateway {
                     "normalized upstream model name from backend catalog"
                 );
             }
-            return (canonical, true);
+            return Ok((canonical, true));
         }
         // No exact id, ad-hoc route, or canonical-key match: fall back to the
         // first catalog model (claude-relay parity). A NON-BLANK requested model
@@ -3082,7 +3076,7 @@ impl Gateway {
                     fallback_model = %default,
                     "no model requested; using the default catalog model"
                 );
-                (default, false)
+                Ok((default, false))
             }
             Some(default) => {
                 if self.should_warn_model_fallback(model) {
@@ -3092,31 +3086,30 @@ impl Gateway {
                         "requested model is not served by any configured upstream; falling back to the default catalog model"
                     );
                 }
-                (default, false)
+                Ok((default, false))
             }
             None => {
                 // No default to collapse to (empty catalog) ⇒ the model passes
                 // through unchanged, so the request model IS the served model ⇒
                 // genuine (mirrors `RoutingModelCatalog::resolve` returning None
                 // for an empty catalog).
-                (model.to_string(), true)
+                Ok((model.to_string(), true))
             }
         }
     }
 
-    /// Rate-limit the model-fallback WARN to once per catalog-TTL window per
+    /// Rate-limit the model-fallback WARN to once every five minutes per
     /// requested model. A request resolves its model twice (HTTP label + engine
     /// dispatch), and a mismatch usually persists across many requests, so an
     /// un-throttled WARN would flood the log. Stale entries are pruned on access
     /// so the map stays bounded even under random/hostile model names.
     fn should_warn_model_fallback(&self, requested_model: &str) -> bool {
         let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(UPSTREAM_MODEL_CATALOG_TTL_SECS);
         let mut warned = self
             .model_fallback_warned
             .lock()
             .expect("model fallback warn lock poisoned");
-        warned.retain(|_, last| now.duration_since(*last) < window);
+        warned.retain(|_, last| now.duration_since(*last) < MODEL_FALLBACK_WARN_INTERVAL);
         if warned.contains_key(requested_model) {
             return false;
         }
@@ -3125,9 +3118,17 @@ impl Gateway {
     }
 
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
+        if !self.config.upstreams.is_empty() || !self.config.model_routes.is_empty() {
+            // The routing client owns freshness; a second TTL would extend stale routing.
+            return self
+                .upstream
+                .supported_model_catalog()
+                .await
+                .map(UpstreamModelCatalog::from_entries);
+        }
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            && cached.fetched_at.elapsed() < MODEL_CATALOG_TTL
         {
             return Ok(cached.catalog.clone());
         }
@@ -3137,7 +3138,7 @@ impl Gateway {
         let entries = self.upstream.supported_model_catalog().await?;
         let catalog = UpstreamModelCatalog::from_entries(entries);
         *cache = Some(CachedUpstreamModelCatalog {
-            fetched_at: std::time::Instant::now(),
+            fetched_at: tokio::time::Instant::now(),
             catalog: catalog.clone(),
         });
         Ok(catalog)

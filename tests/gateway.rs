@@ -663,6 +663,7 @@ async fn uses_configured_upstream_model_override() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
@@ -752,6 +753,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
@@ -791,7 +793,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
     assert_eq!(requests[0].model, "deepseek-r1-distill-qwen-32b");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reuses_cached_upstream_model_catalog_across_requests() {
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["glm-5.1"]).await;
@@ -829,6 +831,181 @@ async fn reuses_cached_upstream_model_catalog_across_requests() {
     assert_eq!(requests[0].model, "glm-5.1");
     assert_eq!(requests[1].model, "glm-5.1");
     assert_eq!(upstream.supported_model_queries().await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn model_catalog_refresh_expires_after_one_second() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["model-before"]).await;
+    let mut config = test_config();
+    config.strict_routing = true;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    assert_eq!(
+        gateway.resolve_request_model("").await.unwrap(),
+        ("model-before".to_string(), false)
+    );
+    upstream.set_supported_models(["model-after"]).await;
+    tokio::time::advance(std::time::Duration::from_millis(999)).await;
+    assert_eq!(
+        gateway.resolve_request_model("").await.unwrap(),
+        ("model-before".to_string(), false)
+    );
+    assert_eq!(upstream.supported_model_queries().await, 1);
+
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    assert_eq!(
+        gateway.resolve_request_model("").await.unwrap(),
+        ("model-after".to_string(), false)
+    );
+    assert!(gateway.resolve_request_model("model-before").await.is_err());
+    assert_eq!(upstream.supported_model_queries().await, 2);
+}
+
+async fn assert_model_catalog_refresh(routing: bool, refresh_models: bool) {
+    let server = MockServer::start().await;
+    let catalog = Arc::new(StdMutex::new(json!({
+        "object": "list",
+        "data": [{"id": "model-before", "max_model_len": 8192}]
+    })));
+    let models = catalog.clone();
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(models.lock().unwrap().clone())
+        })
+        .mount(&server)
+        .await;
+    let models = catalog.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let model = models.lock().unwrap()["data"][0]["id"].clone();
+            if body["model"] != model {
+                return ResponseTemplate::new(404)
+                    .set_body_json(json!({"error": {"message": "model does not exist"}}));
+            }
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-refresh",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": model},
+                        "finish_reason": "stop"
+                    }]
+                })]))
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.strict_routing = true;
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().unwrap();
+    if routing {
+        config.upstreams = vec![UpstreamConfig {
+            load_balance_group: None,
+            name: "swappable".to_string(),
+            upstream_base_url: config.upstream_base_url.clone(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstream_request_log_path: None,
+            fallback_upstreams: Vec::new(),
+        }];
+    }
+    let (app, gateway) = llmconduit::build_app_with_gateway(config);
+    for (index, model) in ["model-before", "model-after"].into_iter().enumerate() {
+        let context_limit = if index == 0 { 8192 } else { 16384 };
+        *catalog.lock().unwrap() = json!({
+            "object": "list",
+            "data": [{"id": model, "max_model_len": context_limit}]
+        });
+        if refresh_models {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["data"],
+                json!([{"id": model, "max_model_len": context_limit}])
+            );
+        } else if index > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "stream": false,
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            status.as_u16(),
+            200,
+            "routing={routing}, refresh_models={refresh_models}: {body}"
+        );
+        assert_eq!(body["model"], model);
+        assert_eq!(body["choices"][0]["message"]["content"], model);
+        if routing {
+            let plan = gateway
+                .upstream_client()
+                .backend_candidate_plan(model)
+                .await;
+            assert_eq!(plan.candidates[0].model, model);
+            assert_eq!(plan.candidates[0].context_limit, Some(context_limit));
+        }
+    }
+    assert!(gateway.resolve_request_model("model-before").await.is_err());
+    assert_eq!(
+        gateway.resolve_request_model("").await.unwrap(),
+        ("model-after".to_string(), false)
+    );
+}
+
+#[tokio::test]
+async fn model_catalog_refresh_is_immediate_when_models_are_listed() {
+    for routing in [false, true] {
+        assert_model_catalog_refresh(routing, true).await;
+    }
+}
+
+#[tokio::test]
+async fn model_catalog_refresh_reaches_inference_within_one_second() {
+    for routing in [false, true] {
+        assert_model_catalog_refresh(routing, false).await;
+    }
 }
 
 #[tokio::test]
@@ -1106,6 +1283,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
@@ -1168,6 +1346,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::from([(
                 "Kimi-K2.6".to_string(),
@@ -3163,6 +3342,7 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -3241,6 +3421,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -3325,6 +3506,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -3412,6 +3594,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -3504,6 +3687,7 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -7296,6 +7480,7 @@ fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -7707,6 +7892,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            load_balance_group: None,
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -7724,6 +7910,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             }],
         },
         UpstreamConfig {
+            load_balance_group: None,
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -7801,6 +7988,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            load_balance_group: None,
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -7810,6 +7998,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
+            load_balance_group: None,
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -7904,6 +8093,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            load_balance_group: None,
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -7913,6 +8103,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
+            load_balance_group: None,
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8026,6 +8217,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
     config.upstream_failure_cooldown_secs = 3600;
     config.upstreams = vec![
         UpstreamConfig {
+            load_balance_group: None,
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8043,6 +8235,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             }],
         },
         UpstreamConfig {
+            load_balance_group: None,
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8145,6 +8338,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
     let mut config = test_config();
     config.upstream_failure_cooldown_secs = 3600;
     config.upstreams = vec![UpstreamConfig {
+        load_balance_group: None,
         name: "first".to_string(),
         upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -10472,6 +10666,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),

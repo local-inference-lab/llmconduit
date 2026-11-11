@@ -42,6 +42,26 @@ use llmconduit::config::write_persisted_config;
 // Unit tests: route parsing + precedence + CLI + TOML + template_family guard
 // ---------------------------------------------------------------------------
 
+#[test]
+fn strict_routing_defaults_off_and_round_trips() {
+    assert!(!PersistedConfig::default().strict_routing);
+    assert!(!config_from_yaml("{}").strict_routing);
+    for enabled in [false, true] {
+        let yaml: PersistedConfig =
+            serde_yaml::from_str(&format!("strict_routing: {enabled}\n")).unwrap();
+        let toml: PersistedConfig =
+            toml::from_str(&format!("strict_routing = {enabled}\n")).unwrap();
+        assert_eq!(yaml, toml);
+        assert_eq!(
+            Config::from_persisted(&yaml).unwrap().strict_routing,
+            enabled
+        );
+        let serialized = serde_yaml::to_string(&yaml).unwrap();
+        let restored: PersistedConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(restored, yaml);
+    }
+}
+
 /// claude-relay `test_parse_model_route_cli_spec`: `NAME=URL,UPSTREAM_MODEL`
 /// parses into a route with the URL and upstream model.
 #[test]

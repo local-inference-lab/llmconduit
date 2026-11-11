@@ -125,6 +125,14 @@ Profiles are considered against the resolved catalog model, the configured upstr
 
 `upstreams: [...]` switches the app to model-routing mode. `/v1/models` exposes the ordered union of primary upstream model catalogs plus fallback `exposed_model` aliases. Exact model id wins; normalized alias routing uses `canonical_model_key` and only succeeds when it maps to one unique id. Blank/missing/unavailable/ambiguous models default to the first model in the first non-empty provider catalog.
 
+`strict_routing: true` disables global and nested fallback providers (including
+their exposed aliases), canonical-key model guessing, and unknown-model defaulting.
+Nonblank names require exact catalog IDs, exact named profile aliases, or configured
+model routes; invalid names return 400. Blank/missing names still select the first
+model in the first non-empty primary catalog. Global and `"*"` profile model rewrites
+are ignored in strict mode; named profile aliases, model routes, and per-provider
+model rewrites remain available. Strict validation also covers `/v1/completions`.
+
 ## Testing
 
 - Integration tests: `tests/gateway.rs` (one file, ~5700 lines, 79 `#[tokio::test]` functions). Use `MockUpstream` (`tests/gateway.rs:51-99`) for in-process gateway tests, `MockSearch` for Brave behavior, `PendingChunkUpstream` for cancellation, or wiremock for HTTP-level routing/failover/proxy behavior.
@@ -158,8 +166,7 @@ Profiles are considered against the resolved catalog model, the configured upstr
 - `/health` returns `{"status":"healthy"}` and `/` returns `{"status":"ok"}`. There is no `/healthz` route.
 - `/v1/completions` is a raw upstream proxy with header filtering. In routing mode it resolves the request body `model`, including exposed fallback aliases.
 - `MonitorHub::disabled()` is a no-op used when `--with-debug-ui` is off — production has zero monitor overhead, don't add unconditional broadcast sends.
-- `UpstreamModelCatalog` caches `/v1/models` for 300s (`engine.rs:56`). Tests that depend on catalog changes need to construct a fresh `Gateway`.
-- `RoutingUpstreamClient` also caches the union model catalog for 300s (`upstream.rs:32`). Tests that change provider catalogs need a fresh router/client or must account for the cache.
+- Model catalogs used for inference have a one-second TTL (`upstream::MODEL_CATALOG_TTL`). In routing mode, `Gateway` reads the routing client's catalog without a second TTL; single/failover mode caches in `Gateway`. `GET /v1/models` always fetches fresh data and updates inference's catalog. Refresh is on access, and upstream request latency is additional. Cache timestamps use `tokio::time::Instant` so tests can advance time deterministically.
 - `RawOutput` writes every SSE event whose name ends with `.delta` and has a string `delta`, including reasoning/refusal/tool-argument deltas; raw mode suppresses tracing output to keep stdout clean.
 - Anthropic `/v1/messages` stream-shape invariants (one terminal `message_delta`, signed `thinking` blocks, etc.) are asserted by `src/adapters/responses_to_anthropic/conformance.rs` — `pub`, not `#[cfg(test)]`, so integration crates reach it at `llmconduit::adapters::responses_to_anthropic::conformance::{assert_stream_conformant, assert_sse_conformant, Surface}`. A `thinking` block's `signature_delta` is the real upstream one when present, else a synthetic `llmconduit-synthetic-v1:<sha256>` marker (`SYNTHETIC_SIGNATURE_PREFIX`, `models/anthropic.rs`) — stripped on Anthropic ingress (`anthropic_to_responses.rs`) so a client echo-back is never replayed upstream as a genuine signature.
 - Dashboard (T13): `/v1/completions` is a raw passthrough and is NOT instrumented by the FlowStore on purpose (it bypasses the engine); the FlowStore whitelist is `/v1/responses`,`/v1/messages`,`/v1/chat/completions` only.

@@ -958,6 +958,7 @@ fn snapshot_message(
 /// `Authorization` on a `WebSocket`).
 pub async fn dashboard_ws(
     State(gateway): State<Arc<Gateway>>,
+    source: Option<axum::Extension<crate::reload::GatewaySource>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
@@ -977,7 +978,9 @@ pub async fn dashboard_ws(
         );
     };
     upgrade
-        .on_upgrade(move |socket| dashboard_socket(socket, gateway, exp))
+        .on_upgrade(move |socket| {
+            dashboard_socket(socket, gateway, exp, source.map(|source| source.0))
+        })
         .into_response()
 }
 
@@ -987,7 +990,12 @@ pub async fn dashboard_ws(
 /// monitor broadcast, the periodic metric tick, and the topology poller — all racing
 /// the cookie-`exp` close timer so nothing is delivered past expiry.
 /// `session_exp == u64::MAX` (dev-open) yields an effectively-infinite timer.
-async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
+async fn dashboard_socket(
+    socket: WebSocket,
+    mut gateway: Arc<Gateway>,
+    session_exp: u64,
+    source: Option<crate::reload::GatewaySource>,
+) {
     let flow_store = gateway.flow_store().clone();
     let mut monitor_rx = gateway.subscribe_monitor();
     let snapshot = gateway.debug_snapshot();
@@ -1151,6 +1159,11 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 }
             }
             _ = metric_ticker.tick() => {
+                let mut prices_changed = false;
+                if let Some(current) = source.as_ref().and_then(|source| source.gateway()) {
+                    prices_changed = current.price_table() != gateway.price_table();
+                    gateway = current;
+                }
                 // Atomic view + seq (D7b R2 finding 2): pair the tile body with its own
                 // ring cursor. `active_streams` is sampled AT tick time from the live
                 // FlowStore — the honest in-flight count for THIS frame.
@@ -1161,7 +1174,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 // changed (a request started/ended mid-flight, which does NOT bump the
                 // ring seq). Without the active-count clause, an in-flight count change
                 // never reaches the strip until the next finalize.
-                if seq != last_metrics_seq || active != last_active {
+                if seq != last_metrics_seq || active != last_active || prices_changed {
                     last_metrics_seq = seq;
                     last_active = active;
                     // Stamp a STRICTLY-MONOTONIC metrics-domain cursor: the real view

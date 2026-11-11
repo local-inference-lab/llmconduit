@@ -181,6 +181,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstreams: existing.upstreams.clone(),
         fallback_upstreams: existing.fallback_upstreams.clone(),
         upstream_failure_cooldown_secs: existing.upstream_failure_cooldown_secs,
+        strict_routing: existing.strict_routing,
         model_profile_templates: existing.model_profile_templates.clone(),
         model_profiles: existing.model_profiles.clone(),
         model_routes: existing.model_routes.clone(),

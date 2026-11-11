@@ -51,6 +51,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
 # D6 AbortHub: `CancellationToken` for server-side flow kill. Race-free `cancelled()`
 # future (no lost-wakeup, unlike a hand-rolled `Notify`) composed alongside every
 # engine `tx.closed()` client-hangup select. Already a transitive dep; the `rt` feature
@@ -80,7 +81,6 @@ pretty_assertions = "1"
 # handshake test (`axum::serve` + a raw upgrade request) that exercises the
 # `/dashboard/ws` cookie+Origin auth gate end-to-end (D7b).
 tokio = { version = "1", features = ["test-util", "net", "io-util"] }
-tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 # D5: criterion benches the zero-cost `MetricsLayer::disabled()` path (no work, no
 # lock) vs the enabled record path, and per-domain seq updates under contention.

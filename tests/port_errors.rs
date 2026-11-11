@@ -339,6 +339,7 @@ mod integration {
             upstream_chat_kwargs: serde_json::Map::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            strict_routing: false,
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),

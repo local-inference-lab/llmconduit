@@ -34,7 +34,6 @@ use crate::models::responses::ResponsesRequest;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
-use crate::upstream::collect_models_response;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
@@ -1392,7 +1391,7 @@ async fn post_responses(
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&request.model).await.0;
+    let served = gateway.resolve_request_model(&request.model).await?.0;
     let wants_stream = request.stream;
     let stream = gateway
         .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
@@ -1621,7 +1620,7 @@ async fn handle_count_tokens(
 
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
-    let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    let resolved_model = gateway.resolve_request_model(&original_model).await?.0;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
         .config()
@@ -1685,7 +1684,7 @@ async fn post_chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway.resolve_request_model(&request.model).await?.0;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -1712,6 +1711,25 @@ async fn post_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<Response> {
+    let body = if gateway.config().strict_routing {
+        let mut request: Value = serde_json::from_slice(&body)
+            .map_err(|err| AppError::bad_request(format!("invalid request body: {err}")))?;
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| AppError::bad_request("request body must be a JSON object"))?;
+        let requested = match object.get("model") {
+            None => "",
+            Some(Value::String(model)) => model.as_str(),
+            Some(_) => return Err(AppError::bad_request("model must be a string")),
+        };
+        let model = gateway.resolve_request_model(requested).await?.0;
+        object.insert("model".into(), Value::String(model));
+        Bytes::from(
+            serde_json::to_vec(&request).map_err(|err| AppError::internal(err.to_string()))?,
+        )
+    } else {
+        body
+    };
     let response = gateway
         .upstream_client()
         .proxy_completions(headers, body)
@@ -1725,7 +1743,7 @@ async fn handle_post_messages(
     api_call_id: Option<String>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway.resolve_request_model(&request.model).await?.0;
     let wants_stream = request.stream;
     let suppress_reasoning = !matches!(
         request.thinking.as_ref(),
@@ -2185,8 +2203,7 @@ async fn get_models(
     State(gateway): State<Arc<Gateway>>,
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
-    let response = gateway.upstream_client().list_models().await?;
-    let (status, body, etag) = collect_models_response(response).await?;
+    let (status, body, etag) = gateway.list_models().await?;
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {

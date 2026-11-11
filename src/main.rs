@@ -1,6 +1,5 @@
 use clap::Parser;
 use llmconduit::AppOptions;
-use llmconduit::build_app_with_gateway_and_options;
 use llmconduit::cli::Cli;
 use llmconduit::cli::Commands;
 use llmconduit::cli::resolve_config_path;
@@ -8,6 +7,7 @@ use llmconduit::cli::run_configure_flow;
 use llmconduit::config::Config;
 use llmconduit::log_rotation::spawn_cleanup;
 use llmconduit::raw::RawOutput;
+use llmconduit::reload::ReloadableApp;
 use llmconduit::request_log::analyze_request_log;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -50,32 +50,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model_route,
         }) => {
             let path = resolve_config_path(config)?;
-            let config = Config::from_env_file_and_routes(Some(&path), &model_route)?;
-            let bind_addr = config.bind_addr;
-            run_debug_log_cleanup(&config);
-            let (app, gateway) = build_app_with_gateway_and_options(
-                config,
+            let app = ReloadableApp::load(
+                path.clone(),
+                model_route,
                 raw.then(RawOutput::stdout),
                 app_options,
-            );
+            )
+            .await?;
+            let gateway = app.gateway();
+            let bind_addr = gateway.config().bind_addr;
+            run_debug_log_cleanup(gateway.config());
             let listener = TcpListener::bind(bind_addr).await?;
             log_listening(bind_addr);
             log_debug_ui_status(&gateway, app_options, bind_addr);
             tracing::info!("using config file {}", path.display());
-            axum::serve(listener, app).await?;
+            drop(gateway);
+            axum::serve(listener, app.router()).await?;
             Ok(())
         }
         None => {
             let path = resolve_config_path(None)?;
-            let config = Config::from_env_and_file(Some(&path))?;
-            let bind_addr = config.bind_addr;
-            run_debug_log_cleanup(&config);
-            let (app, gateway) = build_app_with_gateway_and_options(config, None, app_options);
+            let app = ReloadableApp::load(path.clone(), Vec::new(), None, app_options).await?;
+            let gateway = app.gateway();
+            let bind_addr = gateway.config().bind_addr;
+            run_debug_log_cleanup(gateway.config());
             let listener = TcpListener::bind(bind_addr).await?;
             log_listening(bind_addr);
             log_debug_ui_status(&gateway, app_options, bind_addr);
             tracing::info!("using config file {}", path.display());
-            axum::serve(listener, app).await?;
+            drop(gateway);
+            axum::serve(listener, app.router()).await?;
             Ok(())
         }
     }

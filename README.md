@@ -53,12 +53,74 @@ upstreams:
 ```
 
 When `upstreams` is configured, llmconduit exposes the ordered union of the
-primary upstream model catalogs. If a request omits `model`, passes a blank
+primary upstream model catalogs. By default, if a request omits `model`, passes a blank
 model, or requests a model that is not currently available, llmconduit uses the
 first model from the first upstream with a catalog entry. Requested model names
 are normalized against the catalogs, so aliases such as different case or
 punctuation route to the exact model id exposed by the backend. If multiple
-upstreams expose the same model id, the first upstream wins.
+upstreams expose the same model id, the first upstream wins unless it belongs
+to a load balancing group.
+
+To serve one model through multiple servers behind the same llmconduit endpoint,
+assign the servers the same `load_balance_group`:
+
+```yaml
+bind_addr: "127.0.0.1:4000"
+upstreams:
+  - name: "replica-0"
+    upstream_base_url: "http://127.0.0.1:8000/v1"
+    load_balance_group: "local-model"
+  - name: "replica-1"
+    upstream_base_url: "http://127.0.0.1:8001/v1"
+    load_balance_group: "local-model"
+```
+
+Model routing first resolves a provider and an exact backend model ID. If that
+provider belongs to a group, llmconduit chooses the member with the fewest
+outstanding requests among members advertising that same ID. Equal loads rotate
+between members. A request counts from dispatch through stream completion or
+cancellation, including time waiting for the first chunk. Counts are local to
+this llmconduit process; they do not include traffic sent directly to a backend.
+Launch each model server separately and configure it to advertise the same model ID.
+
+Groups apply to Responses, Chat Completions, Anthropic Messages, token counting,
+and legacy Completions. A single-member group uses the same dispatch path.
+Members keep their own credentials, defaults, logging, and nested fallbacks.
+Primaries in failure cooldown are skipped when a healthy primary is available;
+if every primary is cooling, members with available nested fallbacks may serve.
+Failures within a request use only the selected member's nested fallbacks, before
+the first chunk; they do not retry another group member. Strict routing permits
+balancing the resolved model while continuing to disable nested fallbacks.
+Ungrouped providers, fallback aliases, and `model_routes` retain their existing
+routing behavior. Existing provider metrics identify the selected server.
+
+`GET /v1/models` fetches a fresh upstream catalog and updates the catalog used
+for inference. Without a model-list request, inference refreshes its catalog
+on the first access after one second; routing does not add a second cache TTL.
+Refresh latency also includes the upstream `/v1/models` request time.
+
+Enable strict routing in the config with:
+
+```yaml
+strict_routing: true
+```
+
+This setting defaults to `false` and applies to Responses, Chat Completions,
+Anthropic Messages, and legacy Completions, with either a single upstream or
+multiple routing upstreams. In strict mode:
+
+- A nonblank model must match an exact catalog ID, an explicitly named
+  `model_profiles` alias with `upstream_model`, or a configured `model_routes`
+  entry. Unknown names and implicit case/punctuation aliases return HTTP 400.
+  Configured routes retain their case-insensitive name/glob matching.
+- An omitted, empty, or whitespace-only model selects the first model from the
+  first non-empty primary catalog. An unavailable or empty catalog returns an
+  error when no model can be resolved.
+- Global and nested `fallback_upstreams` are disabled, including their
+  `exposed_model` aliases. A selected provider's failure is returned to the client.
+- The top-level `upstream_model` and the `"*"` profile's model rewrite are ignored;
+  use an exact named profile alias or model route for intentional rewrites.
+  Per-provider `upstream_model` mappings still apply after a valid selection.
 
 Optional nested fallback providers:
 
@@ -379,11 +441,14 @@ of the primary upstream:
 image_agent_enabled: true
 vision_url: "http://127.0.0.1:8001/v1"
 vision_model: "Qwen3-VL"
+model_profiles:
+  text-only-model:
+    native_vision: false
 ```
 
-Any image that still reaches a backend without native vision support (whether or not
-the agent above is active, e.g. no `vision_url` configured) is degraded instead of
-forwarded raw:
+Images pass through unchanged unless the resolved backend profile explicitly sets
+`native_vision: false`. Any image that remains after offload gating for such a
+profile is degraded or rejected according to this policy:
 
 ```yaml
 # placeholder (default): replace the image in place with an instructive text note so
@@ -407,6 +472,26 @@ Useful flags:
 ```
 
 The gateway listens on `http://127.0.0.1:4000` by default.
+
+Config file changes reload automatically for both `start` and the default
+invocation. The file is checked every 500 ms and must remain unchanged across
+two checks before applying it; ordinary saves and atomic file replacements
+are supported for YAML and TOML. Environment overrides and `--model-route`
+arguments retain their precedence on every reload.
+
+Each HTTP request uses one complete configuration, including upstream clients,
+model catalogs, profiles, tools, and body limits. In-flight requests and inference
+WebSockets finish with their original configuration. Successful reloads reset
+replay/model caches and provider cooldowns; dashboard history, metrics, sessions,
+and cancellation of active requests are preserved. Image caches are preserved
+unless their capacity or TTL changes.
+
+Invalid, empty, unreadable, or deleted config files leave the active configuration
+in place and produce a warning. Correcting the file resumes reload automatically.
+Changes to `bind_addr` or `debug_log_max_age_hours` require a restart and reject
+the entire reload. Log cleanup runs only at startup. Dashboard auth environment
+settings and command-line flags also require a restart. Successful reloads log
+`configuration reloaded` (logging remains suppressed in `--raw` mode).
 
 ## Codex
 

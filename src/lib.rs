@@ -17,6 +17,7 @@ pub mod monitor;
 pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
+pub mod reload;
 pub mod replay;
 pub mod request_log;
 pub mod search;
@@ -94,29 +95,53 @@ pub fn build_app_with_gateway_and_options(
     raw_output: Option<RawOutput>,
     options: AppOptions,
 ) -> (axum::Router, Arc<Gateway>) {
+    let (app, gateway) = build_app_generation(config, raw_output, options, None);
+    if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
+        gateway.spawn_provider_health_publisher();
+        crate::metrics::spawn_snapshot_task(
+            gateway.metrics().clone(),
+            gateway.flow_store().clone(),
+            gateway.provider_health_publisher(),
+            gateway.monitor_hub(),
+        );
+    }
+    (app, gateway)
+}
+
+pub(crate) fn build_app_generation(
+    config: Config,
+    raw_output: Option<RawOutput>,
+    options: AppOptions,
+    previous: Option<&Gateway>,
+) -> (axum::Router, Arc<Gateway>) {
     let http_client = reqwest::Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .build()
         .expect("reqwest client");
     let replay_store = ReplayStore::new(config.max_replay_entries);
-    let monitor = if options.with_debug_ui {
+    let monitor = if let Some(previous) = previous {
+        previous.monitor_hub()
+    } else if options.with_debug_ui {
         MonitorHub::new(512)
     } else {
         MonitorHub::disabled()
     };
     // D1 dashboard FlowStore: enabled only when the debug UI is on, mirroring the
     // monitor's zero-overhead `disabled()` split.
-    let flow_store = if options.with_debug_ui {
+    let flow_store = if let Some(previous) = previous {
+        previous.flow_store().clone()
+    } else if options.with_debug_ui {
         crate::dashboard_flow::DashboardFlowStore::new()
     } else {
         crate::dashboard_flow::DashboardFlowStore::disabled()
     };
     // D5 MetricsLayer: enabled only when the debug UI is on (same zero-overhead
-    // `disabled()` split). Attached to the Gateway via `with_metrics`; the 5 s
-    // coordinated snapshot task is spawned below (on a live runtime) under the same
-    // gate, so production runs no ring/histogram/snapshot work.
-    let metrics = if options.with_debug_ui {
+    // `disabled()` split). The app owner starts the coordinated snapshot task
+    // under the same gate, so production runs no ring/histogram/snapshot work.
+    let metrics = if let Some(previous) = previous {
+        previous.metrics().clone()
+    } else if options.with_debug_ui {
         crate::metrics::MetricsLayer::new()
     } else {
         crate::metrics::MetricsLayer::disabled()
@@ -125,9 +150,12 @@ pub fn build_app_with_gateway_and_options(
     // constructed regardless of `--with-debug-ui` (works even when the debug
     // UI/dashboard is off). `disabled()` is a zero-op sink (no thread, no
     // alloc, no fs) when `turn_capture_dir` is unset.
-    let turn_capture = match config.turn_capture_dir.clone() {
-        Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
-        None => crate::turn_capture::TurnCapture::disabled(),
+    let turn_capture = match (previous, config.turn_capture_dir.clone()) {
+        (Some(previous), dir) if previous.config().turn_capture_dir == dir => {
+            previous.turn_capture().clone()
+        }
+        (_, Some(dir)) => crate::turn_capture::TurnCapture::enabled(dir),
+        (_, None) => crate::turn_capture::TurnCapture::disabled(),
     };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
@@ -173,6 +201,7 @@ pub fn build_app_with_gateway_and_options(
                 let fallback_providers = provider
                     .fallback_upstreams
                     .iter()
+                    .filter(|_| !config.strict_routing)
                     .map(|fallback| {
                         FailoverUpstreamProvider::new(
                             fallback.name.clone(),
@@ -195,6 +224,7 @@ pub fn build_app_with_gateway_and_options(
                     fallback_providers,
                     Duration::from_secs(config.upstream_failure_cooldown_secs),
                 )
+                .with_load_balance_group(provider.load_balance_group.clone())
             })
             .collect();
         // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
@@ -221,18 +251,17 @@ pub fn build_app_with_gateway_and_options(
                 route.upstream_model.clone(),
             ));
         }
-        Arc::new(RoutingUpstreamClient::with_routes(
-            providers,
-            route_providers,
-            route_specs,
-        ))
+        Arc::new(
+            RoutingUpstreamClient::with_routes(providers, route_providers, route_specs)
+                .with_strict_routing(config.strict_routing),
+        )
     } else {
         let primary_upstream = make_upstream_client(
             config.upstream_base_url.clone(),
             config.upstream_api_key.clone(),
             config.upstream_request_log_path.clone(),
         );
-        if config.fallback_upstreams.is_empty() {
+        if config.strict_routing || config.fallback_upstreams.is_empty() {
             // D2: the BARE leaf is the engine's upstream directly — no routing/
             // failover layer owns the `provider` serving field, so mark this leaf to
             // synthesize `provider = "primary"`.
@@ -279,52 +308,34 @@ pub fn build_app_with_gateway_and_options(
     // a non-loopback bind without a token + validated https origin REFUSES to
     // register the protected routes (logged), unless `ALLOW_INSECURE=1`.
     let bind_addr = config.bind_addr;
-    let (dashboard_auth, register_protected_routes) = if options.with_debug_ui {
+    let (dashboard_auth, register_protected_routes) = if let Some(previous) = previous {
+        let auth = previous.dashboard_auth();
+        let registered = auth.is_some();
+        (auth, registered)
+    } else if options.with_debug_ui {
         build_dashboard_auth(bind_addr)
     } else {
         (None, false)
     };
 
-    // D5: capture cheap `Clone` handles BEFORE the originals move into `Gateway::new`
-    // so the 5 s coordinated snapshot task can own them (each is an `Arc`-backed
-    // handle; `disabled()` ones no-op). The snapshot task reads the FlowStore THEN
-    // the MetricsLayer (the fixed lock order) + one topology `Arc` + the monitor seq.
-    let snapshot_flow_store = flow_store.clone();
-    let snapshot_metrics = metrics.clone();
-    let snapshot_monitor = monitor.clone();
-    let gateway = Arc::new(
-        Gateway::new(
-            config,
-            replay_store,
-            upstream,
-            search,
-            vision,
-            image_cache,
-            monitor,
-            raw_output,
-            flow_store,
-        )
-        .with_dashboard_auth(dashboard_auth)
-        .with_metrics(metrics)
-        .with_turn_capture(turn_capture),
-    );
-    // D4: spawn the topology-health publication task ONLY when the debug UI is on,
-    // so production keeps the zero-overhead path (no 1 s tick). Guard on a live
-    // tokio runtime so a non-async embedder that enables the debug UI does not
-    // panic in `tokio::spawn` (the `main.rs` server path always has one).
-    if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
-        gateway.spawn_provider_health_publisher();
-        // D5: spawn the 5 s coordinated body-free snapshot task (same gate + live-
-        // runtime guard). It takes the single FlowStore→Metrics critical section,
-        // captures one topology `Arc` (D4's publisher), and pushes a body-free cut
-        // onto the bounded ring every 5 s.
-        crate::metrics::spawn_snapshot_task(
-            snapshot_metrics,
-            snapshot_flow_store,
-            gateway.provider_health_publisher(),
-            snapshot_monitor,
-        );
-    }
+    let gateway = Gateway::new(
+        config,
+        replay_store,
+        upstream,
+        search,
+        vision,
+        image_cache,
+        monitor,
+        raw_output,
+        flow_store,
+    )
+    .with_dashboard_auth(dashboard_auth)
+    .with_metrics(metrics)
+    .with_turn_capture(turn_capture);
+    let gateway = Arc::new(match previous {
+        Some(previous) => gateway.with_runtime_state_from(previous),
+        None => gateway,
+    });
     let router_options = RouterOptions {
         with_debug_ui: options.with_debug_ui,
         register_protected_routes,

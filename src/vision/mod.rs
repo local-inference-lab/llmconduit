@@ -23,7 +23,7 @@
 //!   home to the E2b role-agnostic residual-image pass
 //!   ([`degrade_residual_images`]/[`has_residual_images`]) that runs at the
 //!   engine layer regardless of whether the agent above activated, so no raw
-//!   `InputImage` reaches a non-native-vision backend.
+//!   `InputImage` reaches a backend configured with `native_vision: false`.
 //! - [`client`] — the [`VisionClient`] seam, [`VisionRequest`]/[`VisionOutcome`],
 //!   and the production [`ReqwestVisionClient`].
 //!

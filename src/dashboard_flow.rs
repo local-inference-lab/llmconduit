@@ -56,13 +56,16 @@ const FLOW_TTL_MS: u128 = crate::monitor::DEBUG_HISTORY_RETENTION_MS;
 /// store is back under quota; the record survives as a body-free summary.
 const DEFAULT_SUMMARY_QUOTA_BYTES: usize = 64 * 1024 * 1024;
 
-/// Hard cap on a single captured body (inbound/normalized/upstream). The streaming
-/// serializer stops writing once it has emitted this many bytes, so peak retained
-/// body memory is O(CAP) regardless of the configured inbound request-body cap (default 10 MiB).
-const BODY_CAP: usize = 128 * 1024;
+/// Hard cap on a single captured body (inbound/normalized/upstream). Sized above
+/// the default inbound request-body cap (10 MiB) so a captured body is complete
+/// for any request the gateway accepts by default; the debug UI derives its
+/// upstream-request transcript from this capture, so a smaller cap silently cuts
+/// message text there. Total retained bytes stay bounded by the summary-byte quota.
+const BODY_CAP: usize = 32 * 1024 * 1024;
 /// Per-retained-scalar-string cap: bounds every dynamic string the record keeps
 /// (body scalars, headers, ids, method, uri, models, target, terminal reason).
-const SCALAR_CAP: usize = 4 * 1024;
+/// Equal to the body cap so no string inside a within-cap body is ever cut.
+pub(crate) const SCALAR_CAP: usize = BODY_CAP;
 
 /// Gap 05 — env flag that opts INTO upstream RESPONSE/ERROR-body capture. SEPARATE
 /// from the debug-UI gate (which arms request-body capture): even with the dashboard
@@ -3488,19 +3491,19 @@ mod tests {
         // SCALAR_CAP AND counted in `live_summary_bytes`, so their bytes can trip
         // the quota and evict an older body. A small quota makes the scalar bytes —
         // not bodies — the decisive contribution.
-        // Quota 16 KiB: api_0's ~10 KiB body fits; api_1's ~12 KiB of CAPPED scalars
-        // (3 x SCALAR_CAP) fit on their own; but api_0.body + api_1.scalars exceeds
-        // the quota, so the counted scalars force api_0's BODY to be shed while api_1
-        // (under-quota by itself) survives.
+        // Quota 256 KiB: api_0's ~200 KiB body fits; api_1's 192 KiB of scalars
+        // (3 x 64 KiB, each within SCALAR_CAP and fully counted) fit on their own;
+        // but api_0.body + api_1.scalars exceeds the quota, so the counted scalars
+        // force api_0's BODY to be shed while api_1 (under-quota by itself) survives.
         let store = DashboardFlowStore {
             enabled: true,
             response_capture_enabled: false,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
-            summary_quota_bytes: 16 * 1024,
+            summary_quota_bytes: 256 * 1024,
         };
-        // api_0: a ~10 KiB body (JSON array of many short strings; none individually
+        // api_0: a ~200 KiB body (JSON array of many short strings; none individually
         // capped, so the captured body is genuinely large), no large scalars.
-        let array_body = format!("{{\"a\":[{}]}}", vec!["\"xx\""; 2000].join(","));
+        let array_body = format!("{{\"a\":[{}]}}", vec!["\"xx\""; 40_000].join(","));
         store.open(
             "api_0".to_string(),
             "POST".to_string(),

@@ -367,6 +367,7 @@ fn config_for(server_uri: &str) -> Config {
         upstream_chat_kwargs: serde_json::Map::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        strict_routing: false,
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
@@ -489,6 +490,7 @@ async fn preflight_routing_caps_against_provider_context_window() {
 
     let mut config = config_for(&server.uri());
     config.upstreams = vec![llmconduit::config::UpstreamConfig {
+        load_balance_group: None,
         name: "routed".to_string(),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,

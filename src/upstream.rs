@@ -41,6 +41,9 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
+mod balance;
+use balance::{LoadBalancer, Reservation};
+
 /// Consecutive-failure count at or above which a cooling provider is reported
 /// `Down` (vs. transiently `Cooling`). A provider that has failed this many
 /// times in a row AND is still inside its cooldown window is shown as hard-down
@@ -367,7 +370,7 @@ pub struct UpstreamModelEntry {
     pub context_limit: Option<i64>,
 }
 
-const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
+pub(crate) const MODEL_CATALOG_TTL: Duration = Duration::from_secs(1);
 
 /// One pre-first-chunk serving backend: its FINAL model id (after any
 /// routing/route/exposed-alias + per-provider `upstream_model` rewrite — no
@@ -392,8 +395,8 @@ pub struct BackendCandidate {
 /// ENGINE-side (a byproduct of `normalize_upstream_model`, not a re-derived
 /// ladder; see `backend_is_native_vision`).
 ///
-/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): the gate
-/// treats it as strip+offload, budgeting no-ops.
+/// Empty `candidates` means the candidate set is unknown. Image handling then
+/// defaults to passthrough, while context budgeting no-ops.
 #[derive(Debug, Clone)]
 pub struct BackendCandidatePlan {
     pub candidates: Vec<BackendCandidate>,
@@ -446,9 +449,8 @@ pub trait UpstreamClient: Send + Sync {
     /// `upstream_model` rewrite (G4 review #2 + round-2 #1). This enumerates the
     /// full candidate set — the primary AND all eligible failover providers (and
     /// the routing target) — because failover happens before the first chunk, so
-    /// the model that ultimately serves may be any of them. Native-vision gating
-    /// uses the SAFE invariant over this set (passthrough only if EVERY candidate
-    /// is native-vision), so it can never disagree with the provider that serves.
+    /// the model that ultimately serves may be any of them. Image passthrough is
+    /// disabled if any candidate explicitly sets `native_vision: false`.
     ///
     /// Default impl: thin projection over
     /// [`backend_candidate_plan`](Self::backend_candidate_plan) — the single
@@ -577,6 +579,7 @@ pub struct FailoverUpstreamClient {
 #[derive(Debug, Clone)]
 pub struct RoutingUpstreamProvider {
     name: String,
+    load_balance_group: Option<String>,
     primary_client: ReqwestUpstreamClient,
     primary_upstream_model: Option<String>,
     fallback_exposed_models: Vec<RoutingFallbackExposedModel>,
@@ -620,7 +623,13 @@ impl RoutingUpstreamProvider {
             primary_upstream_model,
             fallback_exposed_models,
             client: FailoverUpstreamClient::new(providers, cooldown),
+            load_balance_group: None,
         }
+    }
+
+    pub fn with_load_balance_group(mut self, group: Option<String>) -> Self {
+        self.load_balance_group = group;
+        self
     }
 
     /// The effective backend model of one of this routing provider's nested
@@ -700,6 +709,8 @@ impl ModelRouteSpec {
 #[derive(Debug, Clone)]
 pub struct RoutingUpstreamClient {
     providers: Vec<RoutingUpstreamProvider>,
+    balance: LoadBalancer,
+    strict_routing: bool,
     /// Synthetic providers backing ad-hoc model routes (G7), indexed by
     /// `ModelRouteSpec::route_provider_index`. Kept separate from catalog
     /// `providers` so routes never enter the `/v1/models` union.
@@ -717,12 +728,13 @@ pub struct RoutingUpstreamClient {
 
 #[derive(Debug, Clone)]
 struct CachedRoutingModelCatalog {
-    fetched_at: Instant,
+    fetched_at: tokio::time::Instant,
     catalog: RoutingModelCatalog,
 }
 
 #[derive(Debug, Clone, Default)]
 struct RoutingModelCatalog {
+    strict_routing: bool,
     provider_catalogs: Vec<RoutingProviderModelCatalog>,
     union_entries: Vec<Value>,
     union_ids: Vec<String>,
@@ -2376,12 +2388,90 @@ impl RoutingUpstreamClient {
         routes: Vec<ModelRouteSpec>,
     ) -> Self {
         Self {
+            balance: LoadBalancer::new(providers.len()),
             providers,
             route_providers,
             routes,
+            strict_routing: false,
             catalog: Arc::new(AsyncMutex::new(None)),
             catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
         }
+    }
+
+    pub fn with_strict_routing(mut self, strict_routing: bool) -> Self {
+        self.strict_routing = strict_routing;
+        self
+    }
+
+    fn balanced_candidates(
+        &self,
+        catalog: &RoutingModelCatalog,
+        candidate: &RoutingModelCandidate,
+    ) -> Vec<RoutingModelCandidate> {
+        let group = self.providers[candidate.provider_index]
+            .load_balance_group
+            .as_deref();
+        if !matches!(candidate.target, RoutingModelTarget::Primary) || group.is_none() {
+            return vec![candidate.clone()];
+        }
+        catalog
+            .provider_catalogs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.providers[*index].load_balance_group.as_deref() == group)
+            .flat_map(|(_, provider)| &provider.candidates)
+            .filter(|other| {
+                matches!(other.target, RoutingModelTarget::Primary)
+                    && other.model_id == candidate.model_id
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn reserve_provider(
+        &self,
+        catalog: &RoutingModelCatalog,
+        mut candidate: RoutingModelCandidate,
+    ) -> (RoutingModelCandidate, Option<Reservation>) {
+        if !matches!(candidate.target, RoutingModelTarget::Primary)
+            || self.providers[candidate.provider_index]
+                .load_balance_group
+                .is_none()
+        {
+            return (candidate, None);
+        }
+        let members = self.balanced_candidates(catalog, &candidate);
+        // Prefer healthy primaries before using a member's nested fallback chain.
+        let mut available: Vec<_> = members
+            .iter()
+            .filter(|member| {
+                self.providers[member.provider_index]
+                    .client
+                    .provider_is_available(0)
+            })
+            .map(|member| member.provider_index)
+            .collect();
+        if available.is_empty() {
+            available = members
+                .iter()
+                .filter(|member| {
+                    !self.providers[member.provider_index]
+                        .client
+                        .available_provider_indices()
+                        .is_empty()
+                })
+                .map(|member| member.provider_index)
+                .collect();
+        }
+        if available.is_empty() {
+            // Keep the dispatch counted if its cooldown expires before the chain checks it.
+            available.push(candidate.provider_index);
+        }
+        let reservation = self.balance.reserve(&available);
+        if let Some(reservation) = &reservation {
+            candidate.provider_index = reservation.provider;
+        }
+        (candidate, reservation)
     }
 
     /// Look up a synthetic route provider by index, mapping an out-of-range
@@ -2423,15 +2513,24 @@ impl RoutingUpstreamClient {
     }
 
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
+        self.load_catalog_with_refresh(false).await
+    }
+
+    async fn load_catalog_with_refresh(
+        &self,
+        force_refresh: bool,
+    ) -> AppResult<RoutingModelCatalog> {
         let mut cache = self.catalog.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+        if !force_refresh
+            && let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed() < MODEL_CATALOG_TTL
         {
             return Ok(cached.catalog.clone());
         }
+        *cache = None;
         let catalog = self.refresh_catalog().await?;
         *cache = Some(CachedRoutingModelCatalog {
-            fetched_at: Instant::now(),
+            fetched_at: tokio::time::Instant::now(),
             catalog: catalog.clone(),
         });
         Ok(catalog)
@@ -2528,6 +2627,7 @@ impl RoutingUpstreamClient {
             .expect("routing catalog meta lock poisoned") = meta;
 
         Ok(RoutingModelCatalog {
+            strict_routing: self.strict_routing,
             provider_catalogs,
             union_entries,
             union_ids,
@@ -2578,6 +2678,10 @@ impl RoutingModelCatalog {
                     },
                     MatchKind::Route,
                 ));
+            }
+
+            if self.strict_routing {
+                return None;
             }
 
             // 4. Unique canonical-key catalog match.
@@ -2631,6 +2735,16 @@ impl RoutingModelCatalog {
                     candidate.clone()
                 })
             })
+    }
+
+    fn resolution_error(&self, requested_model: &str) -> AppError {
+        if self.strict_routing && !requested_model.trim().is_empty() {
+            AppError::bad_request(format!(
+                "model {requested_model:?} is not available with strict_routing enabled; use an exact model ID from /v1/models or a configured model route"
+            ))
+        } else {
+            AppError::upstream("no models are currently available from configured upstreams")
+        }
     }
 
     fn union_body(&self) -> Value {
@@ -2881,23 +2995,9 @@ impl UpstreamClient for RoutingUpstreamClient {
             .await
     }
 
-    /// Typed backend-candidate plan using the SAME route/catalog resolution as
-    /// `stream_chat_completion` (G4 review #2 + round-2 #1). Each candidate
-    /// carries its per-provider context limit for G3 budgeting (T9); the
-    /// `genuine` signal is engine-side (see `BackendCandidatePlan`).
-    ///
-    /// A route resolves to one backend model (route providers are synthetic
-    /// single-model upstreams with no `/v1/models` context window ⇒ `None`).
-    /// A catalog match dispatches to a routing provider: the PRIMARY target may
-    /// fail over across that provider's whole nested failover chain (so all of
-    /// its candidate models count), while a fallback/exposed-alias target serves
-    /// only that single provider's model. Per-provider context limits come from
-    /// the routing catalog's `context_limit_by_id` (populated from the SAME
-    /// `/v1/models` snapshot as the candidate ids); nested-failover models not
-    /// in this provider's catalog carry `None` (G3 no-ops for them, same as
-    /// pre-T9). A catalog-load failure or empty catalog yields an empty candidate
-    /// set, which the safe invariant treats as "unknown → strip+offload" and
-    /// budgeting treats as no-op.
+    /// Include every backend eligible for the resolved model, across its load
+    /// balancing group and nested fallback chains. Only a primary's own catalog
+    /// establishes its context limit; fallback and ad-hoc route limits are unknown.
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let Ok(catalog) = self.load_catalog().await else {
             return BackendCandidatePlan {
@@ -2915,62 +3015,44 @@ impl UpstreamClient for RoutingUpstreamClient {
                 context_limit: None,
             }],
             RoutingResolution::Catalog(candidate) => {
-                let Some(provider) = self.providers.get(candidate.provider_index) else {
-                    return BackendCandidatePlan {
-                        candidates: Vec::new(),
-                    };
-                };
-                // Per-provider context limits come from the SELECTED routing
-                // provider's primary `/v1/models` snapshot. They are keyed by
-                // the primary's OWN model ids, so the limit is authoritative
-                // ONLY for the primary's own model (`candidate.model_id`).
-                // Nested-failover / exposed-fallback models are served by OTHER
-                // upstreams whose `/v1/models` is not loaded here; looking them
-                // up in the primary's map could borrow the WRONG window when an
-                // id coincidentally matches, so they carry `None` (G3 no-ops for
-                // them — T9 R2 HIGH fix).
-                let primary_limits =
-                    &catalog.provider_catalogs[candidate.provider_index].context_limit_by_id;
-                let primary_limit = primary_limits.get(&candidate.model_id).copied();
-                match candidate.target {
-                    // Primary: the whole nested failover chain may serve. Only
-                    // Primary: the whole nested failover chain may serve. Only
-                    // the chain's FIRST candidate (index 0 — the selected
-                    // provider's own model, whose `/v1/models` snapshot populates
-                    // `primary_limits`) carries `primary_limit`. All later chain
-                    // candidates are nested-failover models served by OTHER
-                    // upstreams whose `/v1/models` is not loaded here ⇒ `None`
-                    // (G3 no-ops for them — never borrow the primary's window for
-                    // a different provider, even if the model id matches). This
-                    // is provider-identity scoping, not model-string scoping
-                    // (T9 R3 HIGH fix).
-                    RoutingModelTarget::Primary => provider
-                        .client
-                        .candidate_backend_models(&candidate.model_id)
-                        .await
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, model)| BackendCandidate {
-                            context_limit: (index == 0).then_some(primary_limit).flatten(),
-                            model,
-                        })
-                        .collect(),
-                    // Fallback/exposed-alias: served by a nested failover
-                    // provider whose own `/v1/models` is not loaded here ⇒ None
-                    // (G3 no-ops; the failover provider's window is unknown at
-                    // this layer, so no false cap / no wrong-window borrow).
-                    RoutingModelTarget::Fallback {
-                        failover_provider_index,
-                    } => {
-                        let model = provider
-                            .failover_provider_model(failover_provider_index)
-                            .unwrap_or_else(|| candidate.model_id.clone());
-                        vec![BackendCandidate {
-                            context_limit: None,
-                            model,
-                        }]
+                let mut candidates = Vec::new();
+                for candidate in self.balanced_candidates(&catalog, &candidate) {
+                    let provider = &self.providers[candidate.provider_index];
+                    let primary_limit = catalog.provider_catalogs[candidate.provider_index]
+                        .context_limit_by_id
+                        .get(&candidate.model_id)
+                        .copied();
+                    match candidate.target {
+                        RoutingModelTarget::Primary => {
+                            candidates.extend(
+                                provider
+                                    .client
+                                    .candidate_backend_models(&candidate.model_id)
+                                    .await
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, model)| BackendCandidate {
+                                        model,
+                                        // Only the primary's own catalog establishes its context limit.
+                                        context_limit: (index == 0)
+                                            .then_some(primary_limit)
+                                            .flatten(),
+                                    }),
+                            );
+                        }
+                        RoutingModelTarget::Fallback {
+                            failover_provider_index,
+                        } => {
+                            candidates.push(BackendCandidate {
+                                model: provider
+                                    .failover_provider_model(failover_provider_index)
+                                    .unwrap_or(candidate.model_id),
+                                context_limit: None,
+                            });
+                        }
                     }
                 }
+                candidates
             }
         };
         BackendCandidatePlan { candidates }
@@ -3020,13 +3102,9 @@ impl UpstreamClient for RoutingUpstreamClient {
             );
             err
         })?;
-        let (resolution, match_kind) = catalog.resolve(&backend.request.model).ok_or_else(|| {
-            tracing::warn!(
-                requested_model = %backend.request.model,
-                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
-            );
-            AppError::upstream("no models are currently available from configured upstreams")
-        })?;
+        let (resolution, match_kind) = catalog
+            .resolve(&backend.request.model)
+            .ok_or_else(|| catalog.resolution_error(&backend.request.model))?;
         if let RoutingResolution::Route {
             route_provider_index,
             model_id,
@@ -3047,6 +3125,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         let RoutingResolution::Catalog(resolution) = resolution else {
             unreachable!("route resolution handled above");
         };
+        let (resolution, reservation) = self.reserve_provider(&catalog, resolution);
         let provider = self
             .providers
             .get(resolution.provider_index)
@@ -3060,7 +3139,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         if let Some(serving) = &routed_request.serving {
             serving.set_route(provider.name.clone());
         }
-        match resolution.target {
+        let stream = match resolution.target {
             RoutingModelTarget::Primary => {
                 provider
                     .client
@@ -3079,7 +3158,11 @@ impl UpstreamClient for RoutingUpstreamClient {
                     )
                     .await
             }
-        }
+        }?;
+        Ok(match reservation {
+            Some(reservation) => reservation.stream(stream),
+            None => stream,
+        })
     }
 
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
@@ -3105,6 +3188,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         let RoutingResolution::Catalog(resolution) = resolution else {
             unreachable!("route resolution handled above");
         };
+        let (resolution, _reservation) = self.reserve_provider(&catalog, resolution);
         let provider = self
             .providers
             .get(resolution.provider_index)
@@ -3126,7 +3210,7 @@ impl UpstreamClient for RoutingUpstreamClient {
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
-        let catalog = self.load_catalog().await?;
+        let catalog = self.load_catalog_with_refresh(true).await?;
         json_response(catalog.union_body())
     }
 
@@ -3137,13 +3221,9 @@ impl UpstreamClient for RoutingUpstreamClient {
     ) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
         let requested_model = proxy_body_model(&body).unwrap_or_default();
-        let (resolution, match_kind) = catalog.resolve(&requested_model).ok_or_else(|| {
-            tracing::warn!(
-                requested_model = %requested_model,
-                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
-            );
-            AppError::upstream("no models are currently available from configured upstreams")
-        })?;
+        let (resolution, match_kind) = catalog
+            .resolve(&requested_model)
+            .ok_or_else(|| catalog.resolution_error(&requested_model))?;
         if let RoutingResolution::Route {
             route_provider_index,
             model_id,
@@ -3157,6 +3237,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         let RoutingResolution::Catalog(resolution) = resolution else {
             unreachable!("route resolution handled above");
         };
+        let (resolution, reservation) = self.reserve_provider(&catalog, resolution);
         let provider = self
             .providers
             .get(resolution.provider_index)
@@ -3170,7 +3251,7 @@ impl UpstreamClient for RoutingUpstreamClient {
             match_kind,
         );
         let body = proxy_body_with_model(body, &resolution.model_id);
-        match resolution.target {
+        let response = match resolution.target {
             RoutingModelTarget::Primary => provider.client.proxy_completions(headers, body).await,
             RoutingModelTarget::Fallback {
                 failover_provider_index,
@@ -3180,7 +3261,11 @@ impl UpstreamClient for RoutingUpstreamClient {
                     .proxy_completions_from_provider(failover_provider_index, headers, body)
                     .await
             }
-        }
+        }?;
+        Ok(match reservation {
+            Some(reservation) => reservation.response(response),
+            None => response,
+        })
     }
 
     async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
@@ -4829,7 +4914,7 @@ fn single_model_entry(model: &str) -> Value {
 /// string entries are ids with no context length; object entries take their
 /// `id` and, if present, the first positive context-length field. Entries
 /// without an `id` are skipped.
-fn extract_supported_model_catalog(body: &Value) -> Vec<UpstreamModelEntry> {
+pub(crate) fn extract_supported_model_catalog(body: &Value) -> Vec<UpstreamModelEntry> {
     model_entries_from_body(body)
         .iter()
         .filter_map(|entry| match entry {
@@ -8583,15 +8668,14 @@ mod tests {
     }
 
     /// F3 (round-1 review): an attempt's `provider`/`model` scalars are `cap_scalar`-bounded
-    /// (≤ 4 KiB) when recorded onto the shared `ServingToken`, so the bounded copy is what
-    /// later rides the `FlowRecord` AND the evict-safe terminal payload. An over-cap string
-    /// is truncated before retention; the store's `SCALAR_CAP` invariant cannot be bypassed
-    /// via the attempt trace.
+    /// (≤ `SCALAR_CAP`) when recorded onto the shared `ServingToken`, so the bounded copy is
+    /// what later rides the `FlowRecord` AND the evict-safe terminal payload. An over-cap
+    /// string is truncated before retention; the store's `SCALAR_CAP` invariant cannot be
+    /// bypassed via the attempt trace.
     #[test]
     fn serving_token_caps_attempt_scalar_strings() {
         use crate::dashboard_flow::AttemptStatus;
-        // 4 KiB cap (mirrors dashboard_flow::SCALAR_CAP, which is module-private).
-        const SCALAR_CAP: usize = 4 * 1024;
+        use crate::dashboard_flow::SCALAR_CAP;
         let token = super::ServingToken::default();
         token.record_attempt(crate::dashboard_flow::Attempt {
             provider: Some("p".repeat(SCALAR_CAP * 2)),
@@ -8632,6 +8716,7 @@ mod resolve_match_kind_tests {
         let mut ids_by_key = HashMap::new();
         ids_by_key.insert(canonical_model_key(model), vec![candidate.clone()]);
         RoutingModelCatalog {
+            strict_routing: false,
             provider_catalogs: vec![RoutingProviderModelCatalog {
                 candidates: vec![candidate],
                 context_limit_by_id: HashMap::new(),
@@ -8684,8 +8769,23 @@ mod resolve_match_kind_tests {
     }
 
     #[test]
+    fn strict_routing_catalog_accepts_exact_and_blank_but_rejects_implicit_aliases() {
+        let mut catalog = catalog_serving("served-model");
+        catalog.strict_routing = true;
+        for model in ["served-model", "", "  "] {
+            let (resolution, _) = catalog.resolve(model).expect("valid selection");
+            assert_eq!(resolved_id(&resolution), "served-model");
+        }
+        for model in ["SERVED_MODEL", "unknown"] {
+            assert!(catalog.resolve(model).is_none());
+            assert_eq!(catalog.resolution_error(model).status.as_u16(), 400);
+        }
+    }
+
+    #[test]
     fn empty_catalog_resolves_to_none() {
         let empty = RoutingModelCatalog {
+            strict_routing: false,
             provider_catalogs: Vec::new(),
             union_entries: Vec::new(),
             union_ids: Vec::new(),
