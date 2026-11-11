@@ -1084,6 +1084,76 @@ async fn replays_reasoning_into_follow_up_request() {
 }
 
 #[tokio::test]
+async fn replay_preserves_additional_tools_from_cached_prefix() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "first answer"))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "second answer"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut first_request = base_request(vec![
+        ResponseItem::AdditionalTools {
+            id: Some("at_tools".to_string()),
+            role: "developer".to_string(),
+            tools: vec![ToolSpec::Namespace {
+                name: "functions".to_string(),
+                description: "Runtime tools.".to_string(),
+                tools: vec![NamespaceToolSpec::Function {
+                    name: "wait".to_string(),
+                    description: "Wait for an active operation.".to_string(),
+                    strict: false,
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"cell_id": {"type": "string"}},
+                        "required": ["cell_id"]
+                    }),
+                }],
+            }],
+        },
+        user_message("first turn"),
+    ]);
+    first_request.store = true;
+    let first_events = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(first_request.clone())
+            .await
+            .expect("first stream"),
+    )
+    .await;
+
+    let mut second_input = first_request.input;
+    second_input.extend(done_items(&first_events));
+    second_input.push(user_message("second turn"));
+    let mut second_request = base_request(second_input);
+    second_request.store = true;
+    let _ = collect_stream(
+        gateway
+            .stream_responses(second_request)
+            .await
+            .expect("second stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].messages.len(), 3);
+    assert_eq!(
+        requests[1]
+            .tools
+            .as_ref()
+            .expect("replayed turn retains tools")
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wait"]
+    );
+}
+
+#[tokio::test]
 async fn forwards_configured_upstream_chat_kwargs() {
     let upstream = MockUpstream::default();
     upstream
